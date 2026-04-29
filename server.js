@@ -13,6 +13,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const http = require('http');
 const WebSocket = require('ws');
+const crypto = require('crypto');
 
 const connectDB = require('./config/db');
 const { errorHandler, asyncHandler } = require('./middleware/errorHandlerEnhanced');
@@ -35,6 +36,8 @@ const twilioRoutes = require('./routes/twilio');
 const voicePreviewRoutes = require('./routes/voicePreview');
 const campaignRoutes = require('./routes/campaigns');
 const storageRoutes = require('./routes/storage');
+const superAdminRoutes = require('./routes/superAdmin');
+const crmRoutes = require('./routes/crm');
 
 // WebSocket
 const { setupVoiceSession } = require('./websocket/voiceSession');
@@ -76,6 +79,15 @@ if (process.env.NODE_ENV === 'development') {
 } else {
   app.use(morgan('combined'));
 }
+
+// ─── Request Correlation ID ─────────────────────────────────────────────────
+app.use((req, res, next) => {
+  const incomingId = req.headers['x-request-id'];
+  const requestId = (typeof incomingId === 'string' && incomingId.trim()) || crypto.randomUUID();
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+  next();
+});
 
 // ─── Global Rate Limiting ───────────────────────────────────────────────────
 app.use('/api/', globalLimiter);
@@ -130,6 +142,8 @@ app.use('/api/recordings', storageRoutes);
 app.use('/api/call-flows', callFlowRoutes);
 const knowledgeBaseRoutes = require('./routes/knowledgeBase');
 app.use('/api/knowledge-base', knowledgeBaseRoutes);
+app.use('/api/super-admin', superAdminRoutes);
+app.use('/api/crm', crmRoutes);
 
 // TTS Voice list (public - no auth needed)
 app.get('/api/voices', (req, res) => {
@@ -156,6 +170,13 @@ const PORT = process.env.PORT || 5000;
 
 const startServer = async () => {
   try {
+    if (
+      process.env.NODE_ENV === 'production' &&
+      process.env.JWT_SECRET === 'vaaniai_super_secret_jwt_key_change_in_production_2024'
+    ) {
+      throw new Error('Refusing to start in production with default JWT_SECRET');
+    }
+
     await connectDB().then(() => {
       server.listen(PORT, () => {
         console.log('');

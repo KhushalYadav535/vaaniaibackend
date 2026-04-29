@@ -49,6 +49,18 @@ router.get('/', async (req, res, next) => {
   }
 });
 
+// @route   GET /api/calls/active
+router.get('/active', async (req, res, next) => {
+  try {
+    const activeCalls = await CallLog.find({ userId: req.user._id, status: 'ongoing' })
+      .populate('agentId', 'name')
+      .sort('-startTime');
+    res.json({ success: true, activeCalls });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // @route   GET /api/calls/:id
 router.get('/:id', async (req, res, next) => {
   try {

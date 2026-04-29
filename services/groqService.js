@@ -8,6 +8,59 @@ const Groq = require('groq-sdk');
 class GroqService {
   constructor() {
     this.clients = new Map(); // Cache clients per API key
+    this.breaker = {
+      failures: 0,
+      openedAt: 0,
+    };
+  }
+
+  getTimeoutMs() {
+    return Number(process.env.GROQ_TIMEOUT_MS || 8000);
+  }
+
+  getCircuitFailureThreshold() {
+    return Number(process.env.GROQ_CIRCUIT_FAILURE_THRESHOLD || 5);
+  }
+
+  getCircuitResetMs() {
+    return Number(process.env.GROQ_CIRCUIT_RESET_MS || 20000);
+  }
+
+  isCircuitOpen() {
+    if (!this.breaker.openedAt) return false;
+    const resetMs = this.getCircuitResetMs();
+    if (Date.now() - this.breaker.openedAt > resetMs) {
+      this.breaker.openedAt = 0;
+      this.breaker.failures = 0;
+      return false;
+    }
+    return true;
+  }
+
+  onRequestSuccess() {
+    this.breaker.failures = 0;
+    this.breaker.openedAt = 0;
+  }
+
+  onRequestFailure() {
+    this.breaker.failures += 1;
+    if (this.breaker.failures >= this.getCircuitFailureThreshold()) {
+      this.breaker.openedAt = Date.now();
+    }
+  }
+
+  async withTimeout(promise, timeoutMs, label = 'groq_request') {
+    let timeoutHandle;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => {
+          timeoutHandle = setTimeout(() => reject(new Error(`${label}_timeout`)), timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
   }
 
   getClient(apiKey) {
@@ -24,6 +77,10 @@ class GroqService {
    * Generate LLM response (non-streaming)
    */
   async generateResponse({ messages, model = 'llama-3.1-8b-instant', temperature = 0.7, apiKey, tools = null }) {
+    if (this.isCircuitOpen()) {
+      throw new Error('groq_circuit_open');
+    }
+
     const client = this.getClient(apiKey);
     const start = Date.now();
 
@@ -39,14 +96,24 @@ class GroqService {
       options.tool_choice = 'auto';
     }
 
-    const completion = await client.chat.completions.create(options);
+    try {
+      const completion = await this.withTimeout(
+        client.chat.completions.create(options),
+        this.getTimeoutMs(),
+        'groq_completion'
+      );
 
-    const message = completion.choices[0]?.message;
-    const text = message?.content || '';
-    const toolCalls = message?.tool_calls || [];
-    const latencyMs = Date.now() - start;
+      const message = completion.choices[0]?.message;
+      const text = message?.content || '';
+      const toolCalls = message?.tool_calls || [];
+      const latencyMs = Date.now() - start;
 
-    return { text, toolCalls, latencyMs, model, message };
+      this.onRequestSuccess();
+      return { text, toolCalls, latencyMs, model, message };
+    } catch (error) {
+      this.onRequestFailure();
+      throw error;
+    }
   }
 
   /**
@@ -54,15 +121,30 @@ class GroqService {
    * Returns async generator of text chunks
    */
   async *generateStreamResponse({ messages, model = 'llama-3.1-8b-instant', temperature = 0.7, apiKey }) {
+    if (this.isCircuitOpen()) {
+      throw new Error('groq_circuit_open');
+    }
+
     const client = this.getClient(apiKey);
 
-    const stream = await client.chat.completions.create({
-      messages,
-      model,
-      temperature,
-      max_tokens: 500,
-      stream: true,
-    });
+    let stream;
+    try {
+      stream = await this.withTimeout(
+        client.chat.completions.create({
+          messages,
+          model,
+          temperature,
+          max_tokens: 500,
+          stream: true,
+        }),
+        this.getTimeoutMs(),
+        'groq_stream_start'
+      );
+      this.onRequestSuccess();
+    } catch (error) {
+      this.onRequestFailure();
+      throw error;
+    }
 
     for await (const chunk of stream) {
       const text = chunk.choices[0]?.delta?.content || '';

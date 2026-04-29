@@ -32,6 +32,8 @@ const notificationService = require('../services/notificationService');
 const ragService = require('../services/ragService');
 const CallFlow = require('../models/CallFlow');
 const callFlowEngine = require('../services/callFlowEngine');
+const webhookDispatcher = require('../services/webhookDispatcher');
+const ttsService = require('../services/ttsService');
 
 // Track active sessions
 const activeSessions = new Map();
@@ -41,6 +43,7 @@ function setupVoiceSession(wss) {
     const sessionId = uuidv4();
     let session = {
       id: sessionId,
+      traceId: sessionId,
       ws,
       userId: null,
       agent: null,
@@ -54,6 +57,20 @@ function setupVoiceSession(wss) {
       status: 'connected',
       currentGenerationId: null, // Track current AI generation
       fullAudioBuffer: [], // Accumulate audio for recording
+      latency: {
+        turnStartedAt: null,
+        llmStartedAt: null,
+        firstTextChunkAt: null,
+        firstAudioAt: null,
+      },
+      callLogWriteQueue: Promise.resolve(),
+      prefersBinaryAudio: false,
+      sttUnavailable: false,
+      audioIngressWindowStartedAt: Date.now(),
+      audioIngressBytesInWindow: 0,
+      droppedAudioChunks: 0,
+      warnedBackpressureAt: 0,
+      sttRetryAttempted: false,
     };
 
     activeSessions.set(sessionId, session);
@@ -62,8 +79,12 @@ function setupVoiceSession(wss) {
     // Send ready ping
     safeSend(ws, { type: 'connected', sessionId });
 
-    ws.on('message', async (rawData) => {
+    ws.on('message', async (rawData, isBinary) => {
       try {
+        if (isBinary) {
+          await handleAudioChunkBinary(session, rawData);
+          return;
+        }
         const message = JSON.parse(rawData.toString());
         await handleMessage(session, message);
       } catch (error) {
@@ -97,6 +118,11 @@ async function handleMessage(session, message) {
       await handleAudioChunk(session, message);
       break;
 
+    case 'mic_config':
+      // Browser reports actual AudioContext sample rate — reinitialize Deepgram with correct config
+      await handleMicConfig(session, message);
+      break;
+
     case 'end_audio':
       // User stopped speaking - process accumulated audio
       await handleAudioEnd(session);
@@ -120,8 +146,101 @@ async function handleMessage(session, message) {
   }
 }
 
+async function handleMicConfig(session, message) {
+  const { sampleRate, encoding = 'linear16', channels = 1 } = message;
+  if (!sampleRate || !session.agent || !session.enableStt) return;
+
+  const configuredRate = Number(process.env.DEEPGRAM_SAMPLE_RATE || 48000);
+  const configuredEncoding = process.env.DEEPGRAM_ENCODING || 'linear16';
+
+  console.log(`[MicConfig] Browser: ${encoding}@${sampleRate}Hz | Deepgram configured: ${configuredEncoding}@${configuredRate}Hz`);
+
+  // If the rates already match, DON'T reinitialize — the handleInit connection is already
+  // open and working. Reinitializing would close it and drop audio during reconnect.
+  if (sampleRate === configuredRate && encoding === configuredEncoding) {
+    console.log(`[MicConfig] Rates match — keeping existing Deepgram connection ✅`);
+    safeSend(session.ws, { type: 'status', message: `🎙️ STT ready (${sampleRate}Hz)` });
+    return;
+  }
+
+  // Rates mismatch — need to reinitialize with correct rate
+  console.log(`[MicConfig] Rate mismatch — reinitializing Deepgram connection...`);
+
+  if (session.deepgramConn) {
+    try { session.deepgramConn.finish(); } catch (_) {}
+    session.deepgramConn = null;
+  }
+
+  session.sttUnavailable = false;
+  session.sttRetryAttempted = false;
+
+  const deepgramKey = session.userSettings?.deepgramKey || process.env.DEEPGRAM_API_KEY;
+  const sttLanguage = session.agent.language || 'en';
+
+  // Temporarily override env vars for this connection
+  const origEncoding = process.env.DEEPGRAM_ENCODING;
+  const origSampleRate = process.env.DEEPGRAM_SAMPLE_RATE;
+  const origChannels = process.env.DEEPGRAM_CHANNELS;
+  const origMode = process.env.DEEPGRAM_AUDIO_INPUT_MODE;
+
+  process.env.DEEPGRAM_ENCODING = encoding;
+  process.env.DEEPGRAM_SAMPLE_RATE = String(sampleRate);
+  process.env.DEEPGRAM_CHANNELS = String(channels);
+  process.env.DEEPGRAM_AUDIO_INPUT_MODE = 'raw';
+
+  session.deepgramConn = deepgramService.createLiveConnection({
+    apiKey: deepgramKey,
+    language: sttLanguage,
+    backgroundDenoising: session.agent.advanced?.backgroundDenoising || 'default',
+    onTranscript: async ({ transcript, isFinal, speechFinal }) => {
+      safeSend(session.ws, { type: 'transcript', text: transcript, isFinal: false, role: 'user' });
+
+      const sensitivity = session.agent.advanced?.interruptionSensitivity ?? 0.5;
+      const interruptThreshold = Math.max(1, Math.round(15 * (1 - sensitivity)));
+      if (transcript.length >= interruptThreshold) {
+        safeSend(session.ws, { type: 'interrupt' });
+      }
+
+      if (isFinal && speechFinal && transcript.trim().length > 0) {
+        if (session.isProcessing) return;
+        session.isProcessing = true;
+        session.latency.turnStartedAt = Date.now();
+        session.latency.llmStartedAt = null;
+        session.latency.firstTextChunkAt = null;
+        session.latency.firstAudioAt = null;
+        try {
+          await processTranscript(session, transcript);
+        } catch (e) {
+          console.error('Error processing mic_config live transcript:', e);
+          session.isProcessing = false;
+        }
+      }
+    },
+    onError: (err) => {
+      console.error('[MicConfig] Deepgram error after mic_config:', err.message);
+      session.sttUnavailable = true;
+      safeSend(session.ws, { type: 'error', message: `STT error: ${err.message}` });
+    },
+    onClose: (closeInfo) => {
+      if (closeInfo?.code && closeInfo.code !== 1000) {
+        console.log(`[MicConfig] Deepgram closed: code=${closeInfo.code}`);
+      }
+    },
+  });
+
+  // Restore env vars
+  process.env.DEEPGRAM_ENCODING = origEncoding;
+  process.env.DEEPGRAM_SAMPLE_RATE = origSampleRate;
+  process.env.DEEPGRAM_CHANNELS = origChannels;
+  process.env.DEEPGRAM_AUDIO_INPUT_MODE = origMode;
+
+  console.log(`[MicConfig] Deepgram reinitialized: ${encoding}@${sampleRate}Hz`);
+  safeSend(session.ws, { type: 'status', message: `🎙️ STT ready (${sampleRate}Hz)` });
+}
+
+
 async function handleInit(session, message) {
-  const { agentId, token } = message;
+  const { agentId, token, preferBinaryAudio, enableStt = true, skipPostCallAnalysis = false } = message;
 
   // Verify JWT token
   let decoded;
@@ -142,6 +261,9 @@ async function handleInit(session, message) {
   session.userId = user._id;
   session.agent = agent;
   session.userSettings = user.settings || {};
+  session.prefersBinaryAudio = !!preferBinaryAudio;
+  session.enableStt = enableStt !== false;
+  session.skipPostCallAnalysis = !!skipPostCallAnalysis;
   session.status = 'ready';
   
   if (agent.workflowId) {
@@ -157,56 +279,128 @@ async function handleInit(session, message) {
   const memory = await UserMemory.findOne({ userId: user._id, phone: userPhone });
   session.memory = memory;
 
-  // Set up live Deepgram Connection for continuous transcription
-  const deepgramKey = session.userSettings?.deepgramKey || process.env.DEEPGRAM_API_KEY;
-  if (!deepgramKey) {
-    throw new Error('No Deepgram API key configured. Live voice requires Deepgram.');
-  }
+  if (session.enableStt) {
+    // Set up live Deepgram Connection for continuous transcription
+    const deepgramKey = session.userSettings?.deepgramKey || process.env.DEEPGRAM_API_KEY;
+    if (!deepgramKey) {
+      throw new Error('⚠️ No Deepgram API key configured. Please add DEEPGRAM_API_KEY to your .env file. Get $200 free credits at https://deepgram.com');
+    }
+    
+    // Validate API key format - Deepgram supports two formats:
+    // Legacy: 40-char hex (e.g. 7ee245f531db82f59df59ecae82f906f5eac89e1)
+    // New: sk-xxx format
+    if (deepgramKey.length < 20) {
+      console.warn('⚠️ Deepgram API key appears to be too short. Please check your .env configuration.');
+      safeSend(session.ws, {
+        type: 'status',
+        message: '⚠️ Deepgram API key appears invalid. Please check your configuration.',
+      });
+    }
 
-  // Use the agent's configured language for STT (hindi = 'hi', english = 'en', multilingual = 'multi')
-  const sttLanguage = agent.language || 'en';
-  console.log(`🌐 Agent language: ${sttLanguage}`);
+    // Use the agent's configured language for STT (hindi = 'hi', english = 'en', multilingual = 'multi')
+    const sttLanguage = agent.language || 'en';
+    console.log(`🌐 Agent language: ${sttLanguage}`);
 
   session.deepgramConn = deepgramService.createLiveConnection({
-    apiKey: deepgramKey,
-    language: sttLanguage,
-    backgroundDenoising: agent.advanced?.backgroundDenoising || 'default',
-    onTranscript: async ({ transcript, isFinal, speechFinal }) => {
-      // Send interim updates
-      safeSend(session.ws, {
-         type: 'transcript',
-         text: transcript,
-         isFinal: false,
-         role: 'user',
-      });
-
-      // Interruption logic driven by agent's interruptionSensitivity (0 = hard to interrupt, 1 = easily interrupted)
-      // If sensitivity is 1, interrupt immediately (threshold 1 char)
-      // If sensitivity is 0, require more characters before interrupting (threshold 15 chars)
-      const sensitivity = agent.advanced?.interruptionSensitivity ?? 0.5;
-      const interruptThreshold = Math.max(1, Math.round(15 * (1 - sensitivity)));
-      
-      if (transcript.length >= interruptThreshold) {
-         safeSend(session.ws, { type: 'interrupt' });
-      }
-
-      // If sentence ended, process it!
-      if (isFinal && speechFinal && transcript.trim().length > 0) {
-        if (session.isProcessing) return; // Prevent overlapping requests
-        session.isProcessing = true;
-        
-        try {
-          await processTranscript(session, transcript);
-        } catch (e) {
-          console.error("Error processing live transcript:", e);
-          session.isProcessing = false;
+      apiKey: deepgramKey,
+      language: sttLanguage,
+      backgroundDenoising: agent.advanced?.backgroundDenoising || 'default',
+      onTranscript: async ({ transcript, isFinal, speechFinal }) => {
+        // ── GUARD: Skip all processing while agent is speaking TTS ──────────
+        // Without this, mic echo of TTS → Deepgram transcribes it → silence timer
+        // fires → agent responds to its own voice (echo loop)
+        if (session.agentSpeaking) {
+          if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
+          session._lastSttTranscript = ''; // discard echoed TTS audio transcript
+          return;
         }
+
+        // Always forward interim results to show live speech in UI
+        safeSend(session.ws, {
+           type: 'transcript',
+           text: transcript,
+           isFinal: false,
+           role: 'user',
+        });
+
+        // Interruption logic (only when user genuinely speaks, not echo)
+        const sensitivity = agent.advanced?.interruptionSensitivity ?? 0.5;
+        const interruptThreshold = Math.max(1, Math.round(15 * (1 - sensitivity)));
+        if (transcript.length >= interruptThreshold) {
+           safeSend(session.ws, { type: 'interrupt' });
+        }
+
+        // Track latest transcript for silence-timer fallback
+        if (transcript.trim().length > 0) {
+          session._lastSttTranscript = transcript;
+        }
+
+        // ─── Path 1: Deepgram speech_final (works when account supports it) ───
+        if (isFinal && speechFinal && transcript.trim().length > 0) {
+          if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
+          if (session.isProcessing) return;
+          session.isProcessing = true;
+          session.latency.turnStartedAt = Date.now();
+          session.latency.llmStartedAt = null;
+          session.latency.firstTextChunkAt = null;
+          session.latency.firstAudioAt = null;
+          console.log(`[STT] speech_final triggered: "${transcript}"`);
+          try {
+            await processTranscript(session, transcript);
+          } catch (e) {
+            console.error("Error processing live transcript:", e);
+            session.isProcessing = false;
+          }
+          return;
+        }
+
+        // ─── Path 2: Client-side silence timer (900ms fallback) ───────────────
+        // Used when Deepgram doesn't send speech_final (account tier restriction)
+        if (session._silenceTimer) clearTimeout(session._silenceTimer);
+        session._silenceTimer = setTimeout(async () => {
+          session._silenceTimer = null;
+          if (session.agentSpeaking) return; // Double-check: skip if TTS started during wait
+          const pending = session._lastSttTranscript;
+          if (!pending || pending.trim().length < 2) return;
+          if (session.isProcessing) return;
+          session._lastSttTranscript = '';
+          session.isProcessing = true;
+          session.latency.turnStartedAt = Date.now();
+          session.latency.llmStartedAt = null;
+          session.latency.firstTextChunkAt = null;
+          session.latency.firstAudioAt = null;
+          console.log(`[STT] silence-timer triggered: "${pending}"`);
+          try {
+            await processTranscript(session, pending);
+          } catch (e) {
+            console.error("Error processing silence-timer transcript:", e);
+            session.isProcessing = false;
+          }
+        }, 1500); // 1500ms of no new transcript = speech ended (900ms was too short, cuts mid-sentence)
+
+      },
+    onError: (err) => {
+      session.sttUnavailable = true;
+      safeSend(session.ws, {
+        type: 'error',
+        message: `Deepgram Error: ${err?.message || 'Live transcription unavailable'}`,
+      });
+      safeSend(session.ws, {
+        type: 'status',
+        message: 'STT temporarily unavailable. You can continue in text mode.',
+      });
+      trySttFallbackReconnect(session, deepgramKey);
+    },
+    onClose: (closeInfo) => {
+      if (closeInfo && closeInfo.code && closeInfo.code !== 1000) {
+        safeSend(session.ws, {
+          type: 'status',
+          message: `STT connection closed (code ${closeInfo.code}).`,
+        });
       }
     },
-    onError: (err) => {
-      safeSend(session.ws, { type: 'error', message: 'Deepgram Error: ' + err.message });
-    }
-  });
+    });
+  }
 
   // Create initial call log
   const callLog = await CallLog.create({
@@ -258,9 +452,9 @@ async function handleInit(session, message) {
       
       // Add to history
       session.history.push({ role: 'assistant', content: firstMessageText, timestamp: new Date() });
-      await CallLog.findByIdAndUpdate(session.callLogId, {
+      queueCallLogUpdate(session, {
         $push: { transcript: { role: 'assistant', content: firstMessageText } }
-      });
+      }, 'first_message_flow');
 
       safeSend(session.ws, { 
         type: 'response_text', 
@@ -281,9 +475,9 @@ async function handleInit(session, message) {
       session.history.push({ role: 'assistant', content: text, timestamp: new Date() });
 
       // Update call log
-      await CallLog.findByIdAndUpdate(session.callLogId, {
+      queueCallLogUpdate(session, {
         $push: { transcript: { role: 'assistant', content: text } }
-      });
+      }, 'first_message_standard');
 
       // Send text first with ambient noise config
       safeSend(session.ws, { 
@@ -315,14 +509,27 @@ async function handleInit(session, message) {
 }
 
 async function handleAudioChunk(session, message) {
-  if (!session.agent || !session.deepgramConn) return;
+  if (!session.agent || !session.deepgramConn || session.sttUnavailable) return;
 
   // Stream directly to deepgram
   const audioData = Buffer.from(message.data, 'base64');
+  if (!allowAudioIngress(session, audioData.length)) return;
   try {
     session.deepgramConn.send(audioData);
   } catch (e) {
     console.error("Failed to send chunk to deepgram:", e);
+  }
+}
+
+async function handleAudioChunkBinary(session, rawData) {
+  if (!session.agent || !session.deepgramConn || session.sttUnavailable) return;
+
+  try {
+    const audioData = Buffer.isBuffer(rawData) ? rawData : Buffer.from(rawData);
+    if (!allowAudioIngress(session, audioData.length)) return;
+    session.deepgramConn.send(audioData);
+  } catch (e) {
+    console.error("Failed to send binary chunk to deepgram:", e);
   }
 }
 
@@ -338,6 +545,10 @@ async function handleTextInput(session, text) {
   if (session.isProcessing) return;
 
   session.isProcessing = true;
+  session.latency.turnStartedAt = Date.now();
+  session.latency.llmStartedAt = null;
+  session.latency.firstTextChunkAt = null;
+  session.latency.firstAudioAt = null;
   await processTranscript(session, text.trim());
 }
 
@@ -364,7 +575,8 @@ async function processTranscript(session, transcript) {
           text: backchannel,
           voiceId: session.agent.voice?.voiceId,
           speed: 1.2, // Slightly faster for backchannels
-          apiKey: session.userSettings.ttsKey || process.env.ELEVENLABS_API_KEY
+          apiKey: session.userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
+          provider: session.agent.voice?.provider || 'edge-tts',
         });
         if (audio) sendAudioBuffer(session, audio);
       }
@@ -380,11 +592,9 @@ async function processTranscript(session, transcript) {
     session.history.push({ role: 'user', content: transcript, timestamp: new Date() });
 
     // Update call log
-    if (session.callLogId) {
-      await CallLog.findByIdAndUpdate(session.callLogId, {
-        $push: { transcript: { role: 'user', content: transcript } }
-      });
-    }
+    queueCallLogUpdate(session, {
+      $push: { transcript: { role: 'user', content: transcript } }
+    }, 'user_transcript');
 
     // 🔴 REAL-TIME SENTIMENT ANALYSIS (non-blocking)
     // Run sentiment classification in background — don't block the LLM pipeline
@@ -457,6 +667,7 @@ async function processTranscript(session, transcript) {
           const audioBuffer = await ttsService.textToSpeech({
             text: transferMsg,
             voiceId: session.agent.voice?.voiceId || 'en-US-JennyNeural',
+            provider: session.agent.voice?.provider || 'edge-tts',
           });
           if (audioBuffer && audioBuffer.length > 0) {
             sendAudioBuffer(session, audioBuffer);
@@ -473,6 +684,7 @@ async function processTranscript(session, transcript) {
     if (!session.sentimentHistory) session.sentimentHistory = [];
 
     safeSend(session.ws, { type: 'status', message: '💭 AI is thinking...' });
+    session.latency.llmStartedAt = Date.now();
 
     // Fetch RAG context if agent has a Knowledge Base
     let ragContext = '';
@@ -512,6 +724,11 @@ async function processTranscript(session, transcript) {
       }
 
       if (chunk.type === 'chunk') {
+        if (!session.latency.firstTextChunkAt) {
+          session.latency.firstTextChunkAt = Date.now();
+          emitLatencyMetrics(session, 'first_text_chunk');
+        }
+
         // Send this sentence's text and audio immediately
         safeSend(session.ws, {
           type: 'response_text_chunk',
@@ -556,6 +773,7 @@ async function processTranscript(session, transcript) {
             const audioBuffer = await ttsService.textToSpeech({
               text: transferMsg,
               voiceId: session.agent.voice?.voiceId || 'en-US-JennyNeural',
+              provider: session.agent.voice?.provider || 'edge-tts',
             });
             if (audioBuffer && audioBuffer.length > 0) sendAudioBuffer(session, audioBuffer);
           } catch (e) {}
@@ -585,11 +803,9 @@ async function processTranscript(session, transcript) {
     session.history.push({ role: 'assistant', content: fullResponseText, timestamp: new Date() });
 
     // Update call log
-    if (session.callLogId) {
-      await CallLog.findByIdAndUpdate(session.callLogId, {
-        $push: { transcript: { role: 'assistant', content: fullResponseText } }
-      });
-    }
+    queueCallLogUpdate(session, {
+      $push: { transcript: { role: 'assistant', content: fullResponseText } }
+    }, 'assistant_transcript');
 
     // Send final response text for UI consistency
     safeSend(session.ws, {
@@ -632,6 +848,7 @@ async function handleEndSession(session, reason = 'user_hangup') {
   const duration = Math.round((endTime - new Date(session.startTime)) / 1000);
 
   if (session.callLogId) {
+    await flushCallLogWriteQueue(session);
     const finalCallLog = await CallLog.findByIdAndUpdate(session.callLogId, {
       status: 'completed',
       endTime,
@@ -640,7 +857,7 @@ async function handleEndSession(session, reason = 'user_hangup') {
     }, { new: true });
 
     // Background analysis
-    if (finalCallLog && finalCallLog.transcript.length > 0) {
+    if (!session.skipPostCallAnalysis && finalCallLog && finalCallLog.transcript.length > 0) {
       voicePipeline.analyzeCall(finalCallLog.transcript).then(async (analysis) => {
         if (analysis) {
           // Save enhanced analysis fields
@@ -665,24 +882,40 @@ async function handleEndSession(session, reason = 'user_hangup') {
             const UserMemory = require('../models/UserMemory');
             const userPhone = session.callParams?.from || 'test_user';
             
-            let memory = await UserMemory.findOne({ userId: session.userId, phone: userPhone });
-            if (!memory) {
-              memory = new UserMemory({ userId: session.userId, phone: userPhone, facts: [] });
+            const newFacts = Object.entries(analysis.extractedData).map(([key, value]) => ({
+              content: `${key}: ${value}`,
+              category: 'extracted',
+            }));
+            if (newFacts.length > 0) {
+              await UserMemory.findOneAndUpdate(
+                { userId: session.userId, phone: userPhone },
+                {
+                  $push: {
+                    facts: {
+                      $each: newFacts,
+                      $slice: -20,
+                    },
+                  },
+                },
+                { upsert: true, new: true, setDefaultsOnInsert: true }
+              );
             }
-
-            // Add new facts from extracted data
-            Object.entries(analysis.extractedData).forEach(([key, value]) => {
-              memory.facts.push({ content: `${key}: ${value}`, category: 'extracted' });
-            });
-            
-            // Keep only last 20 facts
-            if (memory.facts.length > 20) memory.facts = memory.facts.slice(-20);
-            
-            await memory.save();
             console.log(`[Memory Updated] User: ${userPhone}`);
           }
           
           console.log(`[Analysis Complete] Session: ${session.id}`);
+
+          // 🔗 POST-CALL WEBHOOK (n8n / Zapier / Custom Backend)
+          // Fire after analysis so payload includes summary, sentiment, extractedData
+          try {
+            const freshCallLog = await CallLog.findById(session.callLogId);
+            if (freshCallLog) {
+              webhookDispatcher.dispatch(freshCallLog, session.agent, session.userSettings)
+                .catch(e => console.error('[Webhook Dispatch Error]', e.message));
+            }
+          } catch (e) {
+            console.error('[Webhook] Failed to load call log for dispatch:', e.message);
+          }
 
           // 📱 POST-CALL NOTIFICATIONS (SMS/WhatsApp)
           // Trigger after analysis so we have summary data
@@ -746,13 +979,203 @@ function sendAudioBuffer(session, buffer) {
     session.fullAudioBuffer.push(buffer);
   }
 
-  // Send the entire buffer as one base64 string to avoid padding issues with chunks
-  safeSend(session.ws, {
-    type: 'audio',
-    data: buffer.toString('base64'),
-  });
+  // Mark agent as speaking — mutes STT processing to prevent echo loop
+  // (mic picking up TTS audio → Deepgram transcribes it → agent responds to itself)
+  session.agentSpeaking = true;
+
+  const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
+  if (session.ws.bufferedAmount > maxBufferedBytes) {
+    const now = Date.now();
+    if (now - session.warnedBackpressureAt > 3000) {
+      session.warnedBackpressureAt = now;
+      safeSend(session.ws, {
+        type: 'status',
+        message: 'Network slow: optimizing response delivery...',
+      });
+    }
+    return;
+  }
+
+  if (session.prefersBinaryAudio) {
+    safeSendBinary(session.ws, buffer);
+  } else {
+    // Backward-compatible JSON/base64 audio for existing clients
+    safeSend(session.ws, {
+      type: 'audio',
+      data: buffer.toString('base64'),
+    });
+  }
+
+  if (!session.latency.firstAudioAt) {
+    session.latency.firstAudioAt = Date.now();
+    emitLatencyMetrics(session, 'first_audio');
+  }
   
   safeSend(session.ws, { type: 'audio_end' });
+
+  // After audio_end, give 500ms for TTS to finish playing on frontend
+  // before allowing STT to process again (accounts for network + playback delay)
+  if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
+  session._agentSpeakingTimer = setTimeout(() => {
+    session.agentSpeaking = false;
+    session._lastSttTranscript = ''; // Clear any echo that accumulated during TTS
+  }, 1500);
+}
+
+
+function safeSendBinary(ws, buffer) {
+  try {
+    if (ws.readyState === 1) { // OPEN
+      ws.send(buffer, { binary: true });
+    }
+  } catch (e) {
+    // Ignore send errors on closed connections
+  }
+}
+
+function emitLatencyMetrics(session, stage = 'update') {
+  const now = Date.now();
+  const turnStartedAt = session.latency?.turnStartedAt;
+  const llmStartedAt = session.latency?.llmStartedAt;
+  const firstTextChunkAt = session.latency?.firstTextChunkAt;
+  const firstAudioAt = session.latency?.firstAudioAt;
+
+  if (!turnStartedAt) return;
+
+  safeSend(session.ws, {
+    type: 'latency_metrics',
+    stage,
+    traceId: session.traceId,
+    turnId: session.currentGenerationId,
+    timestamp: now,
+    metrics: {
+      stt_to_pipeline_ms: llmStartedAt ? Math.max(0, llmStartedAt - turnStartedAt) : null,
+      stt_to_first_text_ms: firstTextChunkAt ? Math.max(0, firstTextChunkAt - turnStartedAt) : null,
+      stt_to_first_audio_ms: firstAudioAt ? Math.max(0, firstAudioAt - turnStartedAt) : null,
+      ws_buffered_amount: session.ws?.bufferedAmount || 0,
+      dropped_audio_chunks: session.droppedAudioChunks || 0,
+      transport: session.prefersBinaryAudio ? 'binary' : 'base64',
+    },
+  });
+}
+
+function queueCallLogUpdate(session, update, label = 'call_log_update') {
+  if (!session?.callLogId) return;
+
+  session.callLogWriteQueue = session.callLogWriteQueue
+    .then(() => CallLog.findByIdAndUpdate(session.callLogId, update))
+    .catch((err) => {
+      console.error(`[CallLog Queue Error] ${label}:`, err.message);
+    });
+}
+
+async function flushCallLogWriteQueue(session) {
+  if (!session?.callLogWriteQueue) return;
+
+  const timeoutMs = Number(process.env.CALL_LOG_FLUSH_TIMEOUT_MS || 1500);
+  await Promise.race([
+    session.callLogWriteQueue,
+    new Promise((resolve) => setTimeout(resolve, timeoutMs)),
+  ]).catch(() => {});
+}
+
+function allowAudioIngress(session, chunkBytes) {
+  const maxChunkBytes = Number(process.env.MAX_AUDIO_CHUNK_BYTES || 256 * 1024);
+  const maxBytesPerSecond = Number(process.env.MAX_AUDIO_BYTES_PER_SECOND || 512 * 1024);
+  const now = Date.now();
+
+  if (chunkBytes > maxChunkBytes) {
+    session.droppedAudioChunks += 1;
+    return false;
+  }
+
+  if (now - session.audioIngressWindowStartedAt >= 1000) {
+    session.audioIngressWindowStartedAt = now;
+    session.audioIngressBytesInWindow = 0;
+  }
+
+  if (session.audioIngressBytesInWindow + chunkBytes > maxBytesPerSecond) {
+    session.droppedAudioChunks += 1;
+    if (session.droppedAudioChunks % 20 === 1) {
+      safeSend(session.ws, {
+        type: 'status',
+        message: 'Audio rate limited briefly to keep call stable.',
+      });
+    }
+    return false;
+  }
+
+  session.audioIngressBytesInWindow += chunkBytes;
+  return true;
+}
+
+function trySttFallbackReconnect(session, deepgramKey) {
+  if (!session?.agent || !session?.ws) return;
+  if (session.sttRetryAttempted) return;
+
+  const fallbackLanguage = process.env.STT_FALLBACK_LANGUAGE || 'multi';
+  const currentLanguage = session.agent.language || 'en';
+  
+  // Always allow fallback if current language is problematic
+  if (currentLanguage === fallbackLanguage && currentLanguage !== 'hi') return;
+
+  session.sttRetryAttempted = true;
+  session.sttUnavailable = false;
+
+  try {
+    if (session.deepgramConn) {
+      try { session.deepgramConn.finish(); } catch (_) {}
+    }
+  } catch (_) {}
+
+  console.log(`[STT Fallback] Retrying with language: ${fallbackLanguage} (was: ${currentLanguage})`);
+  
+  safeSend(session.ws, {
+    type: 'status',
+    message: `🔄 Retrying STT with fallback language (${fallbackLanguage}) for better compatibility...`,
+  });
+
+  session.deepgramConn = deepgramService.createLiveConnection({
+    apiKey: deepgramKey,
+    language: fallbackLanguage,
+    backgroundDenoising: session.agent.advanced?.backgroundDenoising || 'default',
+    onTranscript: async ({ transcript, isFinal, speechFinal }) => {
+      safeSend(session.ws, {
+        type: 'transcript',
+        text: transcript,
+        isFinal: false,
+        role: 'user',
+      });
+
+      const sensitivity = session.agent.advanced?.interruptionSensitivity ?? 0.5;
+      const interruptThreshold = Math.max(1, Math.round(15 * (1 - sensitivity)));
+      if (transcript.length >= interruptThreshold) {
+        safeSend(session.ws, { type: 'interrupt' });
+      }
+
+      if (isFinal && speechFinal && transcript.trim().length > 0) {
+        if (session.isProcessing) return;
+        session.isProcessing = true;
+        session.latency.turnStartedAt = Date.now();
+        session.latency.llmStartedAt = null;
+        session.latency.firstTextChunkAt = null;
+        session.latency.firstAudioAt = null;
+        try {
+          await processTranscript(session, transcript);
+        } catch (e) {
+          console.error('Error processing fallback live transcript:', e);
+          session.isProcessing = false;
+        }
+      }
+    },
+    onError: (err) => {
+      session.sttUnavailable = true;
+      safeSend(session.ws, {
+        type: 'error',
+        message: `Fallback STT Error: ${err?.message || 'unavailable'}`,
+      });
+    },
+  });
 }
 
 module.exports = { setupVoiceSession };

@@ -1,4 +1,6 @@
 const groqService = require('./groqService');
+const axios = require('axios');
+
 
 class CallFlowEngine {
   /**
@@ -130,13 +132,50 @@ class CallFlowEngine {
           break;
 
         case 'api':
-          // Basic API request simulation
+          // Actual API request implementation
           try {
-             // In a real scenario, use axios. For now, we will mock or use basic fetch
              console.log(`[FlowEngine] Calling API: ${node.data.url}`);
-             // state.variables['api_result'] = ...
+             const method = (node.data.method || 'GET').toUpperCase();
+             const url = this.replaceVariables(node.data.url, state.variables);
+             
+             // Parse headers if provided
+             let headers = {};
+             if (node.data.headers) {
+               try {
+                 headers = typeof node.data.headers === 'string' ? JSON.parse(node.data.headers) : node.data.headers;
+               } catch(e) {}
+             }
+
+             // Parse body if provided (for POST/PUT)
+             let data = null;
+             if (node.data.body && ['POST', 'PUT', 'PATCH'].includes(method)) {
+               try {
+                 const bodyStr = this.replaceVariables(node.data.body, state.variables);
+                 data = JSON.parse(bodyStr);
+               } catch(e) {
+                 data = this.replaceVariables(node.data.body, state.variables);
+               }
+             }
+
+             const response = await axios({
+               method,
+               url,
+               headers,
+               data,
+               timeout: 5000
+             });
+
+             // Store result in variables
+             const resultVar = node.data.resultVariable || 'api_result';
+             state.variables[resultVar] = response.data;
+             state.variables[`${resultVar}_status`] = response.status;
+             
+             console.log(`[FlowEngine] API Success. Saved to ${resultVar}`);
           } catch (e) {
-             console.error(e);
+             console.error('[FlowEngine] API Call Failed:', e.message);
+             const resultVar = node.data.resultVariable || 'api_result';
+             state.variables[resultVar] = null;
+             state.variables[`${resultVar}_error`] = e.message;
           }
           state.activeNodeId = this.getNextNodeId(callFlow, node.id);
           break;

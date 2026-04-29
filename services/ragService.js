@@ -22,6 +22,10 @@ if (typeof global.Path2D === 'undefined') {
 const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
 
 class RAGService {
+  constructor() {
+    this.contextCache = new Map();
+  }
+
 
   /**
    * Chunk text into overlapping segments
@@ -218,7 +222,9 @@ class RAGService {
       .slice(0, topK);
 
     // If we got results, optionally rerank with Groq for better quality
-    if (topChunks.length > 1 && topChunks.length <= 5) {
+    const disableRerank = String(process.env.RAG_DISABLE_RERANK || 'false').toLowerCase() === 'true';
+    const minWordsForRerank = Number(process.env.RAG_MIN_WORDS_FOR_RERANK || 4);
+    if (!disableRerank && queryWords.length >= minWordsForRerank && topChunks.length > 1 && topChunks.length <= 5) {
       try {
         return await this.rerankWithGroq(query, topChunks, topK);
       } catch (e) {
@@ -357,16 +363,29 @@ class RAGService {
    */
   async getContextForQuery(query, knowledgeBaseId) {
     if (!knowledgeBaseId) return '';
+    const minChars = Number(process.env.RAG_MIN_QUERY_CHARS || 12);
+    const cacheTtlMs = Number(process.env.RAG_CONTEXT_CACHE_TTL_MS || 15000);
+    const normalizedQuery = (query || '').trim().toLowerCase();
+    if (!normalizedQuery || normalizedQuery.length < minChars) return '';
+
+    const cacheKey = `${knowledgeBaseId}:${normalizedQuery}`;
+    const cached = this.contextCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < cacheTtlMs) {
+      return cached.value;
+    }
 
     try {
-      const chunks = await this.searchRelevantChunks(query, knowledgeBaseId, 3);
+      const topK = Number(process.env.RAG_TOP_K || 3);
+      const chunks = await this.searchRelevantChunks(normalizedQuery, knowledgeBaseId, topK);
       if (chunks.length === 0) return '';
 
       const contextStr = chunks
         .map((c, i) => `[Source ${i + 1}]: ${c.text}`)
         .join('\n\n');
 
-      return `\n[Knowledge Base Context — Use this information to answer the user's questions accurately]:\n${contextStr}\n`;
+      const value = `\n[Knowledge Base Context — Use this information to answer the user's questions accurately]:\n${contextStr}\n`;
+      this.contextCache.set(cacheKey, { value, ts: Date.now() });
+      return value;
     } catch (e) {
       console.error('RAG context error:', e.message);
       return '';

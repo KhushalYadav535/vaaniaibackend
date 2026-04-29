@@ -17,7 +17,8 @@ router.put('/', async (req, res, next) => {
     const allowedKeys = [
       'groqKey', 'openaiKey', 'geminiKey', 'deepgramKey',
       'elevenLabsKey', 'twilioAccountSid', 'twilioAuthToken',
-      'twilioPhoneNumber', 'twilioWhatsAppNumber', 'preferredLlm', 'preferredTts'
+      'twilioPhoneNumber', 'twilioWhatsAppNumber', 'preferredLlm', 'preferredTts',
+      'postCallWebhookUrl', 'webhookSecret',
     ];
 
     const updates = {};

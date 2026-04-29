@@ -24,7 +24,7 @@ const userSchema = new mongoose.Schema({
   },
   role: {
     type: String,
-    enum: ['user', 'admin'],
+    enum: ['user', 'admin', 'super_admin'],
     default: 'user',
   },
   // API Keys stored per user (encrypted in real prod, plain for dev)
@@ -40,6 +40,9 @@ const userSchema = new mongoose.Schema({
     twilioWhatsAppNumber: { type: String, default: '' }, // e.g. 'whatsapp:+14155238886'
     preferredLlm: { type: String, default: 'groq' },
     preferredTts: { type: String, default: 'edge-tts' }, // free by default
+    // Webhook / n8n Integration
+    postCallWebhookUrl: { type: String, default: '' }, // n8n / Zapier / custom webhook URL
+    webhookSecret: { type: String, default: '' },      // Optional HMAC secret for verification
   },
   createdAt: { type: Date, default: Date.now },
 });

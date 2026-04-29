@@ -14,9 +14,9 @@ class TtsService {
    * Convert text to speech audio buffer
    * Returns: Buffer containing MP3 audio
    */
-  async textToSpeech({ text, voiceId = 'en-US-JennyNeural', speed = 1.0, pitch = 0, apiKey = null }) {
-    // If apiKey is provided, it's likely an ElevenLabs key
-    if (apiKey || process.env.ELEVENLABS_API_KEY) {
+  async textToSpeech({ text, voiceId = 'en-US-JennyNeural', speed = 1.0, pitch = 0, apiKey = null, provider = 'edge-tts' }) {
+    // Respect selected provider. Use ElevenLabs only when explicitly requested.
+    if (provider === 'eleven-labs' && (apiKey || process.env.ELEVENLABS_API_KEY)) {
       try {
         return await this.elevenLabsTTS(text, voiceId, apiKey || process.env.ELEVENLABS_API_KEY);
       } catch (e) {
@@ -27,7 +27,7 @@ class TtsService {
     // Default to Edge TTS (Free)
     try {
       const path = require('path');
-      const fs = require('fs');
+      const fs = require('fs/promises');
       const os = require('os');
 
       const rate = `${speed >= 1 ? '+' : ''}${Math.round((speed - 1) * 100)}%`;
@@ -42,8 +42,9 @@ class TtsService {
       const tmpFile = path.join(os.tmpdir(), `tts_${Date.now()}_${Math.floor(Math.random()*1000)}.mp3`);
       
       await tts.ttsPromise(text, tmpFile);
-      const audio = fs.readFileSync(tmpFile);
-      fs.unlinkSync(tmpFile);
+      const audio = await fs.readFile(tmpFile);
+      // Best-effort cleanup; don't fail TTS response if temp cleanup fails.
+      fs.unlink(tmpFile).catch(() => {});
       
       return audio;
     } catch (e) {

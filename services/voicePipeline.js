@@ -9,6 +9,38 @@ const toolExecutor = require('./toolExecutor');
 const KnowledgeBase = require('../models/KnowledgeBase');
 
 class VoicePipeline {
+  getGroqFallbackModels(primaryModel = 'llama-3.1-8b-instant') {
+    const envList = (process.env.GROQ_FALLBACK_MODELS || '')
+      .split(',')
+      .map(m => m.trim())
+      .filter(Boolean);
+    const defaults = ['llama-3.1-8b-instant', 'llama-3.3-70b-versatile', 'mixtral-8x7b-32768'];
+    const ordered = [primaryModel, ...envList, ...defaults];
+    return [...new Set(ordered)];
+  }
+
+  async generateGroqResponseWithFallback({ messages, model, temperature, apiKey, tools = null }) {
+    const candidates = this.getGroqFallbackModels(model);
+    let lastError = null;
+
+    for (const candidate of candidates) {
+      try {
+        return await groqService.generateResponse({
+          messages,
+          model: candidate,
+          temperature,
+          apiKey,
+          tools,
+        });
+      } catch (err) {
+        lastError = err;
+        console.warn(`[LLM Fallback] Groq model failed: ${candidate} -> ${err.message}`);
+      }
+    }
+
+    throw lastError || new Error('all_groq_models_failed');
+  }
+
   /**
    * Process a text input through LLM → TTS
    * Used when we already have transcribed text
@@ -35,6 +67,7 @@ class VoicePipeline {
     // Determine which LLM to use
     const llmProvider = agent.llm?.provider || 'groq';
     const llmModel = agent.llm?.model || 'llama-3.1-8b-instant';
+    const voiceProvider = agent.voice?.provider || 'edge-tts';
     const apiKey = userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY;
 
     // Generate LLM response (supports tool calling loop)
@@ -65,7 +98,7 @@ class VoicePipeline {
           llmResponse = { text: "Custom LLM failed.", latencyMs: 0, toolCalls: [] };
         }
       } else if (llmProvider === 'groq' || !userSettings.openaiKey) {
-        llmResponse = await groqService.generateResponse({
+        llmResponse = await this.generateGroqResponseWithFallback({
           messages,
           model: llmModel,
           temperature: agent.temperature || 0.7,
@@ -139,6 +172,7 @@ class VoicePipeline {
         text: responseText,
         voiceId,
         speed,
+        provider: voiceProvider,
       });
     } catch (ttsError) {
       console.error('TTS failed:', ttsError.message);
@@ -188,11 +222,17 @@ class VoicePipeline {
 
     const llmProvider = agent.llm?.provider || 'groq';
     const llmModel = agent.llm?.model || 'llama-3.1-8b-instant';
+    const voiceProvider = agent.voice?.provider || 'edge-tts';
     const voiceId = agent.voice?.voiceId || 'en-US-JennyNeural';
     const speed = agent.voice?.speed || 1.0;
 
     let fullResponseText = '';
     let currentSentence = '';
+    let hasSpokenFirstChunk = false;
+    let hasEmittedAnyChunk = false;
+    const fastFirstChunkMode = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
+    const firstChunkCharThreshold = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 36);
+    const firstChunkMaxWords = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 8);
     
     // Check for Dynamic Knowledge (RAG 2.0)
     let dynamicKnowledge = '';
@@ -209,7 +249,7 @@ class VoicePipeline {
     const toolInstructions = agent.webhooks?.length > 0 ? 
       `\n[Tool Instructions]: You can call these tools if needed: ${agent.webhooks.map(w => w.name).join(', ')}. Format: <TOOL>function_name(args)</TOOL>` : '';
 
-    const systemPrompt = this.buildSystemPrompt(agent, memory) + dynamicKnowledge + toolInstructions + emotionPrompt;
+    const systemPrompt = this.buildSystemPrompt(agent, memory, ragContext) + dynamicKnowledge + toolInstructions + emotionPrompt;
     messages[0].content = systemPrompt;
 
     // Inject Filler Word to reduce perceived latency
@@ -222,6 +262,7 @@ class VoicePipeline {
         voiceId,
         speed,
         apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
+        provider: voiceProvider,
       });
 
       yield {
@@ -248,90 +289,174 @@ class VoicePipeline {
         }
       })();
     } else {
-      tokenStream = groqService.generateStreamResponse({
+      const candidateModels = this.getGroqFallbackModels(llmModel);
+      let streamCreated = false;
+      let lastErr = null;
+
+      for (const modelCandidate of candidateModels) {
+        try {
+          tokenStream = groqService.generateStreamResponse({
+            messages,
+            model: modelCandidate,
+            temperature: agent.temperature || 0.7,
+            apiKey: userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
+          });
+          streamCreated = true;
+          break;
+        } catch (err) {
+          lastErr = err;
+          console.warn(`[LLM Stream Fallback] ${modelCandidate} failed -> ${err.message}`);
+        }
+      }
+
+      if (!streamCreated) {
+        throw lastErr || new Error('all_groq_stream_models_failed');
+      }
+    }
+
+    try {
+      for await (const token of tokenStream) {
+        fullResponseText += token;
+        currentSentence += token;
+
+        // Tool Execution Logic (Vapi/Retell style)
+        if (fullResponseText.includes('<TOOL>') && fullResponseText.includes('</TOOL>')) {
+          const toolMatch = fullResponseText.match(/<TOOL>(.*?)<\/TOOL>/);
+          if (toolMatch) {
+            const toolCallStr = toolMatch[1]; // e.g. "get_stock_price({symbol: 'AAPL'})"
+            const name = toolCallStr.split('(')[0];
+            const argsStr = toolCallStr.match(/\((.*?)\)/)?.[1] || '{}';
+            
+            try {
+              const args = JSON.parse(argsStr.replace(/'/g, '"'));
+              const toolResult = await toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent });
+              
+              if (toolResult.result && toolResult.result.__transferToAgentId) {
+                yield {
+                  type: 'transfer_agent',
+                  agentId: toolResult.result.__transferToAgentId,
+                  reason: toolResult.result.reason
+                };
+                return; // Stop current stream
+              }
+
+              // Add tool result back to conversation context and restart generation
+              // (Simplified: for now we just append result to prompt and continue)
+              console.log(`[Tool Executed] Result:`, toolResult);
+              fullResponseText = fullResponseText.replace(toolMatch[0], ` [Result: ${JSON.stringify(toolResult)}] `);
+            } catch (e) {
+              console.error('Tool parsing failed:', e.message);
+            }
+          }
+        }
+
+        // Fast-first-chunk: speak early before punctuation to reduce time-to-first-audio.
+        if (
+          fastFirstChunkMode &&
+          !hasSpokenFirstChunk &&
+          currentSentence.trim().length >= firstChunkCharThreshold
+        ) {
+          const words = currentSentence.trim().split(/\s+/).filter(Boolean);
+          const firstChunkText = words.slice(0, firstChunkMaxWords).join(' ').trim();
+          const remainder = words.slice(firstChunkMaxWords).join(' ').trim();
+
+          if (firstChunkText.length > 0) {
+            const audioBuffer = await ttsService.textToSpeech({
+              text: firstChunkText,
+              voiceId,
+              speed,
+              apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
+              provider: voiceProvider,
+            });
+
+            yield {
+              type: 'chunk',
+              text: firstChunkText,
+              audio: audioBuffer,
+            };
+
+            hasSpokenFirstChunk = true;
+            hasEmittedAnyChunk = true;
+            currentSentence = remainder ? `${remainder} ` : '';
+          }
+        }
+
+        // Check if we have a complete sentence (., !, ?, or \n)
+        if (/[.!?\n]/.test(token) && currentSentence.trim().length > 5) {
+          const sentenceToSpeak = currentSentence.trim();
+          currentSentence = '';
+
+          // Generate TTS for this sentence
+          const audioBuffer = await ttsService.textToSpeech({
+            text: sentenceToSpeak,
+            voiceId,
+            speed,
+            apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
+            provider: voiceProvider,
+          });
+
+          yield {
+            type: 'chunk',
+            text: sentenceToSpeak,
+            audio: audioBuffer,
+          };
+          hasEmittedAnyChunk = true;
+        }
+      }
+
+      // Process any remaining text
+      if (currentSentence.trim().length > 0) {
+        const audioBuffer = await ttsService.textToSpeech({
+          text: currentSentence.trim(),
+          voiceId,
+          speed,
+          apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
+          provider: voiceProvider,
+        });
+
+        yield {
+          type: 'chunk',
+          text: currentSentence.trim(),
+          audio: audioBuffer,
+        };
+        hasEmittedAnyChunk = true;
+      }
+
+      yield {
+        type: 'final',
+        fullText: fullResponseText,
+      };
+    } catch (streamErr) {
+      if (hasEmittedAnyChunk) {
+        throw streamErr;
+      }
+
+      // Stream startup timeout fallback: switch to non-stream response instead of failing the turn.
+      const fallbackResponse = await this.generateGroqResponseWithFallback({
         messages,
         model: llmModel,
         temperature: agent.temperature || 0.7,
         apiKey: userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
       });
-    }
-
-    for await (const token of tokenStream) {
-      fullResponseText += token;
-      currentSentence += token;
-
-      // Tool Execution Logic (Vapi/Retell style)
-      if (fullResponseText.includes('<TOOL>') && fullResponseText.includes('</TOOL>')) {
-        const toolMatch = fullResponseText.match(/<TOOL>(.*?)<\/TOOL>/);
-        if (toolMatch) {
-          const toolCallStr = toolMatch[1]; // e.g. "get_stock_price({symbol: 'AAPL'})"
-          const name = toolCallStr.split('(')[0];
-          const argsStr = toolCallStr.match(/\((.*?)\)/)?.[1] || '{}';
-          
-          try {
-            const args = JSON.parse(argsStr.replace(/'/g, '"'));
-            const toolResult = await toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent });
-            
-            if (toolResult.result && toolResult.result.__transferToAgentId) {
-              yield {
-                type: 'transfer_agent',
-                agentId: toolResult.result.__transferToAgentId,
-                reason: toolResult.result.reason
-              };
-              return; // Stop current stream
-            }
-
-            // Add tool result back to conversation context and restart generation
-            // (Simplified: for now we just append result to prompt and continue)
-            console.log(`[Tool Executed] Result:`, toolResult);
-            fullResponseText = fullResponseText.replace(toolMatch[0], ` [Result: ${JSON.stringify(toolResult)}] `);
-          } catch (e) {
-            console.error('Tool parsing failed:', e.message);
-          }
-        }
-      }
-
-      // Check if we have a complete sentence (., !, ?, or \n)
-      if (/[.!?\n]/.test(token) && currentSentence.trim().length > 5) {
-        const sentenceToSpeak = currentSentence.trim();
-        currentSentence = '';
-
-        // Generate TTS for this sentence
-        const audioBuffer = await ttsService.textToSpeech({
-          text: sentenceToSpeak,
-          voiceId,
-          speed,
-          apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
-        });
-
-        yield {
-          type: 'chunk',
-          text: sentenceToSpeak,
-          audio: audioBuffer,
-        };
-      }
-    }
-
-    // Process any remaining text
-    if (currentSentence.trim().length > 0) {
-      const audioBuffer = await ttsService.textToSpeech({
-        text: currentSentence.trim(),
+      const fallbackText = (fallbackResponse?.text || 'I am here to help.').trim();
+      const fallbackAudio = await ttsService.textToSpeech({
+        text: fallbackText,
         voiceId,
         speed,
         apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
+        provider: voiceProvider,
       });
 
       yield {
         type: 'chunk',
-        text: currentSentence.trim(),
-        audio: audioBuffer,
+        text: fallbackText,
+        audio: fallbackAudio,
+      };
+      yield {
+        type: 'final',
+        fullText: fallbackText,
       };
     }
-
-    yield {
-      type: 'final',
-      fullText: fullResponseText,
-    };
   }
 
   /**
@@ -534,30 +659,33 @@ class VoicePipeline {
    */
   buildSystemPrompt(agent, memory = null, ragContext = '') {
     let prompt = `
-      You are a helpful AI voice agent named ${agent.name}.
-      Description: ${agent.description || 'A professional voice assistant.'}
+[ROLE AND INSTRUCTIONS]
+You are a helpful AI voice agent named ${agent.name}.
+Description: ${agent.description || 'A professional voice assistant.'}
 
-      ${agent.systemPrompt}
+[AGENT SPECIFIC RULES / SYSTEM PROMPT]
+=== MUST FOLLOW THESE RULES STRICTLY ===
+${agent.systemPrompt}
+======================================
 
-      CRITICAL RULES FOR VOICE:
-      1. Your responses will be spoken aloud via Text-to-Speech. Keep them concise and conversational.
-      2. NEVER use markdown like asterisks (**), dashes (-), or hashes (#). Use plain text only.
-      3. Use natural pauses and phrasing.
-      4. Always respond in the language: ${agent.language || 'en'}.
-    `;
+[CRITICAL VOICE RULES]
+1. Your responses will be spoken aloud via Text-to-Speech. Keep them conversational and concise.
+2. NEVER use markdown like asterisks (**), dashes (-), or hashes (#). Use plain text only.
+3. Use natural pauses and phrasing.
+4. Always respond in the language: ${agent.language || 'en'}.
+`;
 
     if (agent.transferToAgentId) {
-      prompt += `\n      5. If the user asks to be transferred to a different department, or needs specialized help you cannot provide, use the "transfer_to_agent" tool with agentId "${agent.transferToAgentId}".`;
+      prompt += `\n5. If the user asks to be transferred to a different department, or needs specialized help you cannot provide, use the "transfer_to_agent" tool with agentId "${agent.transferToAgentId}".`;
     }
 
     prompt += `\n
-      Current Date: ${new Date().toDateString()}
+Current Date: ${new Date().toDateString()}
 
-      [Strict Rules]:
-      1. Be concise. Use short sentences (Vapi/Retell style).
-      2. If you don't know something, say you'll check.
-      3. Never use markdown formatting (bold, italics, lists) in speech.
-    `;
+[Strict Restrictions]:
+1. If you don't know something, say you'll check.
+2. Never use markdown formatting (bold, italics, lists) in speech.
+`;
 
     // Add User Memory (Pichli baatein)
     if (memory && memory.facts?.length > 0) {
@@ -567,7 +695,7 @@ class VoicePipeline {
 
     // Add RAG Context
     if (ragContext) {
-      prompt += ragContext;
+      prompt += `\n[Knowledge Base Context]:\n${ragContext}`;
     }
 
     return prompt;
@@ -611,9 +739,10 @@ class VoicePipeline {
     else if (lang === 'en-IN') defaultVoiceId = 'en-IN-NeerjaNeural';
 
     const voiceId = agent.voice?.voiceId || defaultVoiceId;
+    const provider = agent.voice?.provider || 'edge-tts';
 
     try {
-      const audioBuffer = await ttsService.textToSpeech({ text, voiceId });
+      const audioBuffer = await ttsService.textToSpeech({ text, voiceId, provider });
       return { text, audioBuffer };
     } catch (error) {
       return { text, audioBuffer: Buffer.alloc(0) };

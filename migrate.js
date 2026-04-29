@@ -1,7 +1,7 @@
 const mongoose = require('mongoose');
 
 const LOCAL_URI = 'mongodb://localhost:27017/vaaniai';
-const REMOTE_URI = 'mongodb://admin:vJUm4yLOD8eUZsBqtdGJYU47JsJFe8rO@213.210.37.237:32768/vaaniai?authSource=admin';
+const REMOTE_URI = 'mongodb://admin:vJUm4yLOD8eUZsBqtdGJYU47JsJFe8rO@213.210.37.237:32768/vaanidb?authSource=admin';
 
 async function migrate() {
   console.log('Connecting to local DB...');

@@ -38,6 +38,8 @@ const campaignRoutes = require('./routes/campaigns');
 const storageRoutes = require('./routes/storage');
 const superAdminRoutes = require('./routes/superAdmin');
 const crmRoutes = require('./routes/crm');
+const widgetRoutes = require('./routes/widget');
+const path = require('path');
 
 // WebSocket
 const { setupVoiceSession } = require('./websocket/voiceSession');
@@ -57,18 +59,27 @@ console.log('🔌 WebSocket server ready on /ws/voice');
 // ─── Middleware ─────────────────────────────────────────────────────────────
 app.use(helmet({
   crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: false,
+  crossOriginOpenerPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
 
 app.use(cors({
-  origin: [
-    process.env.FRONTEND_URL || 'http://localhost:3000',
-    'http://localhost:3001',
-    'http://localhost:3002',
-    /\.yourdomain\.com$/,  // Add your domain here
-  ],
+  origin: true, // Allow all origins for widget support
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
+// Serve static files (widget.js etc.)
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.js')) {
+      res.setHeader('Content-Type', 'application/javascript');
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+    }
+  }
 }));
 
 app.use(express.json({ limit: '10mb' }));
@@ -144,6 +155,7 @@ const knowledgeBaseRoutes = require('./routes/knowledgeBase');
 app.use('/api/knowledge-base', knowledgeBaseRoutes);
 app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/crm', crmRoutes);
+app.use('/api/widget', widgetRoutes);
 
 // TTS Voice list (public - no auth needed)
 app.get('/api/voices', (req, res) => {

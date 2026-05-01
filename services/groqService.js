@@ -88,7 +88,7 @@ class GroqService {
       messages,
       model,
       temperature,
-      max_tokens: 500, // Keep responses concise for voice
+      max_tokens: 1024,
     };
 
     if (tools && tools.length > 0) {
@@ -134,7 +134,7 @@ class GroqService {
           messages,
           model,
           temperature,
-          max_tokens: 500,
+          max_tokens: 1024,
           stream: true,
         }),
         this.getTimeoutMs(),

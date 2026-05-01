@@ -254,9 +254,15 @@ async function handleInit(session, message) {
   const user = await User.findById(decoded.id);
   if (!user) throw new Error('User not found');
 
-  // Load agent
-  const agent = await Agent.findOne({ _id: agentId, userId: user._id });
-  if (!agent) throw new Error('Agent not found or not authorized');
+  // Load agent - widget tokens include agentId and bypass ownership check
+  let agent;
+  if (decoded.type === 'widget') {
+    agent = await Agent.findOne({ _id: decoded.agentId, status: 'active' });
+    if (!agent) throw new Error('Agent not found or inactive');
+  } else {
+    agent = await Agent.findOne({ _id: agentId, userId: user._id });
+    if (!agent) throw new Error('Agent not found or not authorized');
+  }
 
   session.userId = user._id;
   session.agent = agent;
@@ -306,12 +312,73 @@ async function handleInit(session, message) {
       language: sttLanguage,
       backgroundDenoising: agent.advanced?.backgroundDenoising || 'default',
       onTranscript: async ({ transcript, isFinal, speechFinal }) => {
-        // ── GUARD: Skip all processing while agent is speaking TTS ──────────
-        // Without this, mic echo of TTS → Deepgram transcribes it → silence timer
-        // fires → agent responds to its own voice (echo loop)
+        // ── Interruption detection: if user speaks while agent is talking ──
         if (session.agentSpeaking) {
-          if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
-          session._lastSttTranscript = ''; // discard echoed TTS audio transcript
+          const sensitivity = agent.advanced?.interruptionSensitivity ?? 0.5;
+          const interruptThreshold = Math.max(2, Math.round(12 * (1 - sensitivity)));
+
+          // Only interrupt if the user actually said something meaningful (not mic echo)
+          if (transcript.trim().length >= interruptThreshold) {
+            console.log(`[Interrupt] User spoke during agent TTS: "${transcript.trim().substring(0, 60)}"`);
+
+            // 1. Cancel current generation so LLM stream loop exits
+            session.currentGenerationId = uuidv4();
+
+            // 2. Clear agentSpeaking so new processing can start
+            session.agentSpeaking = false;
+            if (session._agentSpeakingTimer) { clearTimeout(session._agentSpeakingTimer); session._agentSpeakingTimer = null; }
+
+            // 3. Reset processing flag — the old pipeline will exit via generationId mismatch
+            session.isProcessing = false;
+
+            // 4. Tell client to stop playing any queued audio immediately
+            safeSend(session.ws, { type: 'interrupt' });
+            safeSend(session.ws, { type: 'clear_audio' });
+
+            // 5. Treat this transcript as the new user turn
+            session._lastSttTranscript = transcript;
+
+            // If this is a final/speechFinal, process immediately
+            if (isFinal && speechFinal && transcript.trim().length > 0) {
+              if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
+              session.isProcessing = true;
+              session.latency.turnStartedAt = Date.now();
+              session.latency.llmStartedAt = null;
+              session.latency.firstTextChunkAt = null;
+              session.latency.firstAudioAt = null;
+              console.log(`[STT] Interrupt speech_final: "${transcript}"`);
+              try {
+                await processTranscript(session, transcript);
+              } catch (e) {
+                console.error('Error processing interrupt transcript:', e);
+                session.isProcessing = false;
+              }
+              return;
+            }
+
+            // Otherwise start silence timer for this interrupted input
+            if (session._silenceTimer) clearTimeout(session._silenceTimer);
+            session._silenceTimer = setTimeout(async () => {
+              session._silenceTimer = null;
+              const pending = session._lastSttTranscript;
+              if (!pending || pending.trim().length < 2) return;
+              if (session.isProcessing) return;
+              session._lastSttTranscript = '';
+              session.isProcessing = true;
+              session.latency.turnStartedAt = Date.now();
+              session.latency.llmStartedAt = null;
+              session.latency.firstTextChunkAt = null;
+              session.latency.firstAudioAt = null;
+              console.log(`[STT] Interrupt silence-timer: "${pending}"`);
+              try {
+                await processTranscript(session, pending);
+              } catch (e) {
+                console.error('Error processing interrupt silence-timer transcript:', e);
+                session.isProcessing = false;
+              }
+            }, 900);
+          }
+          // Whether we interrupted or not, don't fall through to normal processing
           return;
         }
 
@@ -322,13 +389,6 @@ async function handleInit(session, message) {
            isFinal: false,
            role: 'user',
         });
-
-        // Interruption logic (only when user genuinely speaks, not echo)
-        const sensitivity = agent.advanced?.interruptionSensitivity ?? 0.5;
-        const interruptThreshold = Math.max(1, Math.round(15 * (1 - sensitivity)));
-        if (transcript.length >= interruptThreshold) {
-           safeSend(session.ws, { type: 'interrupt' });
-        }
 
         // Track latest transcript for silence-timer fallback
         if (transcript.trim().length > 0) {
@@ -354,12 +414,11 @@ async function handleInit(session, message) {
           return;
         }
 
-        // ─── Path 2: Client-side silence timer (900ms fallback) ───────────────
-        // Used when Deepgram doesn't send speech_final (account tier restriction)
+        // ─── Path 2: Client-side silence timer fallback ───────────────
         if (session._silenceTimer) clearTimeout(session._silenceTimer);
         session._silenceTimer = setTimeout(async () => {
           session._silenceTimer = null;
-          if (session.agentSpeaking) return; // Double-check: skip if TTS started during wait
+          if (session.agentSpeaking) return;
           const pending = session._lastSttTranscript;
           if (!pending || pending.trim().length < 2) return;
           if (session.isProcessing) return;
@@ -376,7 +435,7 @@ async function handleInit(session, message) {
             console.error("Error processing silence-timer transcript:", e);
             session.isProcessing = false;
           }
-        }, 1500); // 1500ms of no new transcript = speech ended (900ms was too short, cuts mid-sentence)
+        }, 1200);
 
       },
     onError: (err) => {
@@ -724,6 +783,12 @@ async function processTranscript(session, transcript) {
       }
 
       if (chunk.type === 'chunk') {
+        // Re-check after async TTS — user may have interrupted during TTS generation
+        if (session.currentGenerationId !== generationId) {
+          console.log(`[Interrupt] Aborting chunk send for old generation: ${generationId}`);
+          return;
+        }
+
         if (!session.latency.firstTextChunkAt) {
           session.latency.firstTextChunkAt = Date.now();
           emitLatencyMetrics(session, 'first_text_chunk');
@@ -739,7 +804,6 @@ async function processTranscript(session, transcript) {
 
         let audioToPlay = chunk.audio;
         if (!audioToPlay && session.callFlow && chunk.text) {
-           // CallFlow engine yields text chunks without TTS, so we generate TTS here
            const ttsService = require('../services/ttsService');
            try {
               audioToPlay = await ttsService.textToSpeech({
@@ -750,6 +814,12 @@ async function processTranscript(session, transcript) {
            } catch (e) {
               console.error('[Flow TTS Error]', e);
            }
+        }
+
+        // Final interrupt check before sending audio
+        if (session.currentGenerationId !== generationId) {
+          console.log(`[Interrupt] Aborting audio send for old generation: ${generationId}`);
+          return;
         }
 
         if (audioToPlay && audioToPlay.length > 0) {
@@ -902,7 +972,50 @@ async function handleEndSession(session, reason = 'user_hangup') {
             }
             console.log(`[Memory Updated] User: ${userPhone}`);
           }
-          
+
+          // 📋 AUTO-CREATE CRM LEAD from extracted data
+          // If the call extracted a name + phone, automatically create a lead in CRM
+          try {
+            const ed = analysis.extractedData || {};
+            const leadName = ed.name || '';
+            const leadPhone = ed.phone || '';
+
+            if (leadName && leadPhone) {
+              const Lead = require('../models/Lead');
+
+              // Avoid duplicates: check if a lead with same phone already exists for this user
+              const existingLead = await Lead.findOne({ userId: session.userId, phone: leadPhone });
+
+              if (!existingLead) {
+                await Lead.create({
+                  userId: session.userId,
+                  agentId: session.agent?._id,
+                  callLogId: session.callLogId,
+                  name: leadName,
+                  phone: leadPhone,
+                  email: ed.email || '',
+                  interest: analysis.customerIntent || ed.company || '',
+                  status: 'Warm',
+                  value: '',
+                  notes: analysis.summary || '',
+                });
+                console.log(`[CRM] Lead auto-created: ${leadName} (${leadPhone})`);
+              } else {
+                // Update existing lead notes with latest call summary
+                await Lead.findByIdAndUpdate(existingLead._id, {
+                  $set: {
+                    notes: analysis.summary || existingLead.notes,
+                    ...(ed.email && { email: ed.email }),
+                    ...(ed.company && { interest: ed.company }),
+                  },
+                });
+                console.log(`[CRM] Lead updated: ${leadName} (${leadPhone})`);
+              }
+            }
+          } catch (leadErr) {
+            console.error('[CRM] Auto lead creation error:', leadErr.message);
+          }
+
           console.log(`[Analysis Complete] Session: ${session.id}`);
 
           // 🔗 POST-CALL WEBHOOK (n8n / Zapier / Custom Backend)

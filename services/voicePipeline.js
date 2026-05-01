@@ -658,44 +658,36 @@ class VoicePipeline {
    * Build system prompt for the agent
    */
   buildSystemPrompt(agent, memory = null, ragContext = '') {
-    let prompt = `
-[ROLE AND INSTRUCTIONS]
-You are a helpful AI voice agent named ${agent.name}.
-Description: ${agent.description || 'A professional voice assistant.'}
+    const lang = agent.language || 'en';
+    const langInstruction = lang === 'en' ? 'English' : lang === 'hi' ? 'Hindi' : lang === 'hi-Latn' ? 'Hinglish (Hindi in Roman script)' : lang === 'multi' ? 'the same language the user speaks in' : lang;
 
-[AGENT SPECIFIC RULES / SYSTEM PROMPT]
-=== MUST FOLLOW THESE RULES STRICTLY ===
+    let prompt = `You are "${agent.name}", a live AI voice agent on a phone call. Your personality, role, and behavior are defined ENTIRELY by the instructions below. You must follow them as your highest priority.
+
+## YOUR INSTRUCTIONS (FOLLOW EXACTLY):
 ${agent.systemPrompt}
-======================================
 
-[CRITICAL VOICE RULES]
-1. Your responses will be spoken aloud via Text-to-Speech. Keep them conversational and concise.
-2. NEVER use markdown like asterisks (**), dashes (-), or hashes (#). Use plain text only.
-3. Use natural pauses and phrasing.
-4. Always respond in the language: ${agent.language || 'en'}.
+## VOICE CALL RULES (always apply):
+- You are on a LIVE VOICE CALL. Your text is spoken aloud via TTS.
+- Keep responses SHORT and conversational (1-3 sentences per turn). Do NOT give long monologues.
+- NEVER use markdown: no **, no *, no #, no -, no bullet points, no numbered lists.
+- Use plain spoken language only. Write as you would speak naturally.
+- Respond in ${langInstruction}.
+- Ask one question at a time. Wait for the user to answer before moving on.
+- If you don't know something, say so honestly. Don't make up information.
+- Current date: ${new Date().toDateString()}.
 `;
 
     if (agent.transferToAgentId) {
-      prompt += `\n5. If the user asks to be transferred to a different department, or needs specialized help you cannot provide, use the "transfer_to_agent" tool with agentId "${agent.transferToAgentId}".`;
+      prompt += `\n- If the user needs help you cannot provide, use the "transfer_to_agent" tool with agentId "${agent.transferToAgentId}".`;
     }
 
-    prompt += `\n
-Current Date: ${new Date().toDateString()}
-
-[Strict Restrictions]:
-1. If you don't know something, say you'll check.
-2. Never use markdown formatting (bold, italics, lists) in speech.
-`;
-
-    // Add User Memory (Pichli baatein)
     if (memory && memory.facts?.length > 0) {
       const factsStr = memory.facts.map(f => `- ${f.content}`).join('\n');
-      prompt += `\n[User Memory (Pichli baatein)]:\n${factsStr}`;
+      prompt += `\n\n## CALLER MEMORY (previous interactions):\n${factsStr}`;
     }
 
-    // Add RAG Context
     if (ragContext) {
-      prompt += `\n[Knowledge Base Context]:\n${ragContext}`;
+      prompt += `\n\n## KNOWLEDGE BASE CONTEXT (use this to answer questions):\n${ragContext}`;
     }
 
     return prompt;

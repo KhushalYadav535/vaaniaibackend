@@ -33,6 +33,42 @@ router.post('/leads', async (req, res, next) => {
   }
 });
 
+// @route   PUT /api/crm/leads/:id
+// @desc    Update a lead
+router.put('/leads/:id', async (req, res, next) => {
+  try {
+    const lead = await Lead.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user._id },
+      req.body,
+      { new: true, runValidators: true }
+    );
+    
+    if (!lead) {
+      return res.status(404).json({ success: false, message: 'Lead not found' });
+    }
+    
+    res.json({ success: true, lead });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   DELETE /api/crm/leads/:id
+// @desc    Delete a lead
+router.delete('/leads/:id', async (req, res, next) => {
+  try {
+    const lead = await Lead.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
+    
+    if (!lead) {
+      return res.status(404).json({ success: false, message: 'Lead not found' });
+    }
+    
+    res.json({ success: true, message: 'Lead deleted successfully' });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // @route   GET /api/crm/tickets
 // @desc    Get all tickets for the user
 router.get('/tickets', async (req, res, next) => {
@@ -55,6 +91,42 @@ router.post('/tickets', async (req, res, next) => {
       userId: req.user._id,
     });
     res.status(201).json({ success: true, ticket: newTicket });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   PUT /api/crm/tickets/:id
+// @desc    Update a ticket
+router.put('/tickets/:id', async (req, res, next) => {
+  try {
+    const ticket = await Ticket.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user._id },
+      req.body,
+      { new: true, runValidators: true }
+    );
+    
+    if (!ticket) {
+      return res.status(404).json({ success: false, message: 'Ticket not found' });
+    }
+    
+    res.json({ success: true, ticket });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   DELETE /api/crm/tickets/:id
+// @desc    Delete a ticket
+router.delete('/tickets/:id', async (req, res, next) => {
+  try {
+    const ticket = await Ticket.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
+    
+    if (!ticket) {
+      return res.status(404).json({ success: false, message: 'Ticket not found' });
+    }
+    
+    res.json({ success: true, message: 'Ticket deleted successfully' });
   } catch (error) {
     next(error);
   }

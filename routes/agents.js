@@ -38,7 +38,7 @@ router.get('/:id', async (req, res, next) => {
 // @route   POST /api/agents
 router.post('/', async (req, res, next) => {
   try {
-    const { name, systemPrompt, firstMessage, language, voice, llm, temperature, maxDuration, endCallMessage, endCallPhrases, webhooks, tools, voicemailMessage, transferNumber, transferConditions, postCallActions } = req.body;
+    const { name, systemPrompt, firstMessage, language, voice, llm, temperature, maxDuration, endCallMessage, endCallPhrases, webhooks, tools, voicemailMessage, transferNumber, transferToAgentId, transferConditions, postCallActions, advanced, knowledgeBaseId, workflowId } = req.body;
 
     const agent = await Agent.create({
       userId: req.user._id,
@@ -56,8 +56,12 @@ router.post('/', async (req, res, next) => {
       tools,
       voicemailMessage: voicemailMessage || '',
       transferNumber: transferNumber || '',
+      transferToAgentId: transferToAgentId || undefined,
       transferConditions: transferConditions || {},
       postCallActions: postCallActions || {},
+      advanced: advanced || {},
+      knowledgeBaseId: knowledgeBaseId || undefined,
+      workflowId: workflowId || undefined,
     });
 
     res.status(201).json({ success: true, agent });
@@ -103,6 +107,29 @@ router.patch('/:id/status', async (req, res, next) => {
     );
     if (!agent) return res.status(404).json({ success: false, message: 'Agent not found' });
     res.json({ success: true, agent });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   POST /api/agents/:id/duplicate
+router.post('/:id/duplicate', async (req, res, next) => {
+  try {
+    const original = await Agent.findOne({ _id: req.params.id, userId: req.user._id });
+    if (!original) return res.status(404).json({ success: false, message: 'Agent not found' });
+
+    const { _id, createdAt, updatedAt, callsCount, totalMinutes, ...rest } = original.toObject();
+
+    const duplicate = await Agent.create({
+      ...rest,
+      userId: req.user._id,
+      name: `Copy of ${original.name}`,
+      status: 'inactive',
+      callsCount: 0,
+      totalMinutes: 0,
+    });
+
+    res.status(201).json({ success: true, agent: duplicate });
   } catch (error) {
     next(error);
   }

@@ -40,12 +40,16 @@ class DeepgramService {
   }
 
   /**
-   * Create a live streaming transcription WebSocket connection
+   * Create a live streaming transcription WebSocket connection.
    * Returns an object compatible with the old Deepgram LiveClient API:
    *   .send(buffer)   — send audio data
    *   .finish()       — close the connection gracefully
+   *
+   * @param audioConfig  Optional explicit audio config { encoding, sampleRate, channels, audioInputMode }.
+   *                     Overrides env vars. Use this for per-session config to avoid
+   *                     the race condition caused by mutating process.env in concurrent sessions.
    */
-  createLiveConnection({ apiKey, language = 'en', backgroundDenoising = 'default', onTranscript, onError, onClose, keywords = [], onVADEvent = null }) {
+  createLiveConnection({ apiKey, language = 'en', backgroundDenoising = 'default', onTranscript, onError, onClose, keywords = [], onVADEvent = null, audioConfig = null }) {
     const key = apiKey || process.env.DEEPGRAM_API_KEY;
     if (!key) throw new Error('No Deepgram API key. Get $200 free credits at https://deepgram.com');
 
@@ -71,10 +75,14 @@ class DeepgramService {
     const utteranceEndMs = Number(process.env.DEEPGRAM_UTTERANCE_END_MS || defaultUtteranceEndMs);
     const endpointingMs  = Number(process.env.DEEPGRAM_ENDPOINTING_MS  || defaultEndpointingMs);
     const minFinalChars  = Number(process.env.MIN_TRANSCRIPT_CHARS_FOR_FINAL || 2);
-    const audioInputMode = (process.env.DEEPGRAM_AUDIO_INPUT_MODE || 'webm').toLowerCase();
-    const encoding   = process.env.DEEPGRAM_ENCODING    || 'linear16';
-    const sampleRate = Number(process.env.DEEPGRAM_SAMPLE_RATE || 16000);
-    const channels   = Number(process.env.DEEPGRAM_CHANNELS   || 1);
+
+    // FIX: Use explicit audioConfig (per-session) if provided, otherwise fall back to env vars.
+    // This avoids the dangerous pattern of mutating process.env for per-session audio config,
+    // which creates a race condition when two sessions trigger mic_config simultaneously.
+    const audioInputMode = audioConfig?.audioInputMode || (process.env.DEEPGRAM_AUDIO_INPUT_MODE || 'webm').toLowerCase();
+    const encoding   = audioConfig?.encoding    || process.env.DEEPGRAM_ENCODING    || 'linear16';
+    const sampleRate = Number(audioConfig?.sampleRate || process.env.DEEPGRAM_SAMPLE_RATE || 16000);
+    const channels   = Number(audioConfig?.channels   || process.env.DEEPGRAM_CHANNELS   || 1);
     const mimeType   = process.env.DEEPGRAM_MIME_TYPE || 'audio/webm;codecs=opus';
 
     if (!this._latencyConfigLogged) {
@@ -133,8 +141,21 @@ class DeepgramService {
       headers: { Authorization: 'Token ' + key },
     });
 
+    // FIX: Keepalive ping every 10s to prevent Deepgram idle-timeout disconnects.
+    // Without this, the WS connection silently drops after ~60s of silence
+    // (e.g. user on hold, long pauses). Deepgram accepts a JSON { type: 'KeepAlive' }
+    // message to reset the server-side idle timer without sending audio data.
+    let keepaliveInterval = null;
+
     ws.on('open', () => {
       console.log('🎙️ Deepgram connection opened');
+      keepaliveInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: 'KeepAlive' }));
+          } catch (_) { /* ignore if connection is closing */ }
+        }
+      }, 10000);
     });
 
     ws.on('message', (data) => {
@@ -183,6 +204,8 @@ class DeepgramService {
     });
 
     ws.on('close', (code, reason) => {
+      // Clean up keepalive interval on close
+      if (keepaliveInterval) { clearInterval(keepaliveInterval); keepaliveInterval = null; }
       const closeInfo = {
         code,
         reason: reason ? reason.toString() : '',
@@ -201,6 +224,7 @@ class DeepgramService {
       },
       finish() {
         try {
+          if (keepaliveInterval) { clearInterval(keepaliveInterval); keepaliveInterval = null; }
           if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
             ws.close(1000, 'Session ended');
           }

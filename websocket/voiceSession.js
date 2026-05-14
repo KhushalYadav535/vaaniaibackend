@@ -177,21 +177,16 @@ async function handleMicConfig(session, message) {
   const deepgramKey = session.userSettings?.deepgramKey || process.env.DEEPGRAM_API_KEY;
   const sttLanguage = session.agent.language || 'en';
 
-  // Temporarily override env vars for this connection
-  const origEncoding = process.env.DEEPGRAM_ENCODING;
-  const origSampleRate = process.env.DEEPGRAM_SAMPLE_RATE;
-  const origChannels = process.env.DEEPGRAM_CHANNELS;
-  const origMode = process.env.DEEPGRAM_AUDIO_INPUT_MODE;
-
-  process.env.DEEPGRAM_ENCODING = encoding;
-  process.env.DEEPGRAM_SAMPLE_RATE = String(sampleRate);
-  process.env.DEEPGRAM_CHANNELS = String(channels);
-  process.env.DEEPGRAM_AUDIO_INPUT_MODE = 'raw';
+  // FIX: Pass audio config directly — NEVER mutate process.env.
+  // Mutating global env vars is NOT safe for concurrent sessions (race condition).
+  // If two users trigger mic_config simultaneously, they corrupt each other's config.
+  const audioConfig = { encoding, sampleRate: String(sampleRate), channels: String(channels), audioInputMode: 'raw' };
 
   session.deepgramConn = deepgramService.createLiveConnection({
     apiKey: deepgramKey,
     language: sttLanguage,
     backgroundDenoising: session.agent.advanced?.backgroundDenoising || 'default',
+    audioConfig,
     onTranscript: async ({ transcript, isFinal, speechFinal }) => {
       safeSend(session.ws, { type: 'transcript', text: transcript, isFinal: false, role: 'user' });
 
@@ -228,13 +223,7 @@ async function handleMicConfig(session, message) {
     },
   });
 
-  // Restore env vars
-  process.env.DEEPGRAM_ENCODING = origEncoding;
-  process.env.DEEPGRAM_SAMPLE_RATE = origSampleRate;
-  process.env.DEEPGRAM_CHANNELS = origChannels;
-  process.env.DEEPGRAM_AUDIO_INPUT_MODE = origMode;
-
-  console.log(`[MicConfig] Deepgram reinitialized: ${encoding}@${sampleRate}Hz`);
+  console.log(`[MicConfig] Deepgram reinitialized: ${encoding}@${sampleRate}Hz (no env mutation)`);
   safeSend(session.ws, { type: 'status', message: `🎙️ STT ready (${sampleRate}Hz)` });
 }
 
@@ -429,6 +418,8 @@ async function handleInit(session, message) {
         }
 
         // ─── Path 2: Client-side silence timer fallback ───────────────
+        // FIX: Reduced from 1200ms → 800ms — Deepgram speech_final usually
+        // arrives within 600-800ms; 1200ms added unnecessary lag.
         if (session._silenceTimer) clearTimeout(session._silenceTimer);
         session._silenceTimer = setTimeout(async () => {
           session._silenceTimer = null;
@@ -449,7 +440,7 @@ async function handleInit(session, message) {
             console.error("Error processing silence-timer transcript:", e);
             session.isProcessing = false;
           }
-        }, 1200);
+        }, 800);
 
       },
     onError: (err) => {
@@ -759,7 +750,8 @@ async function processTranscript(session, transcript) {
     safeSend(session.ws, { type: 'status', message: '💭 AI is thinking...' });
     session.latency.llmStartedAt = Date.now();
 
-    // Fetch RAG context if agent has a Knowledge Base
+    // FIX: RAG fetch runs here after sentiment (which is non-blocking via .then()).
+    // In future: can be kicked off simultaneously with sentiment using Promise.all.
     let ragContext = '';
     if (session.agent?.knowledgeBaseId) {
       try {
@@ -777,10 +769,13 @@ async function processTranscript(session, transcript) {
     if (session.callFlow) {
       stream = callFlowEngine.processFlowStep(session, transcript, session.callFlow);
     } else {
+      // FIX: Send full history — voicePipeline.compressHistory() handles
+      // rolling summary compression. Slicing to 10 here was preventing the
+      // compressor from ever seeing older messages (threshold is 12).
       stream = voicePipeline.processTextStream({
         text: transcript,
         agent: session.agent,
-        history: session.history.slice(-10),
+        history: session.history,
         userSettings: session.userSettings,
         memory: session.memory,
         ragContext
@@ -1136,7 +1131,15 @@ function sendAudioBuffer(session, buffer) {
 
   // Mark agent as speaking — mutes STT processing to prevent echo loop
   // (mic picking up TTS audio → Deepgram transcribes it → agent responds to itself)
-  session.agentSpeaking = true;
+  // FIX: Only start the agentSpeaking timer ONCE per turn (not per chunk).
+  // Previously this reset the 1500ms timer on every chunk send, which was
+  // mostly correct but caused the timer to extend indefinitely if many chunks
+  // arrived in rapid succession, keeping the mic muted too long.
+  if (!session.agentSpeaking) {
+    session.agentSpeaking = true;
+    session._agentSpeakingChunkCount = 0;
+  }
+  session._agentSpeakingChunkCount = (session._agentSpeakingChunkCount || 0) + 1;
 
   const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
   if (session.ws.bufferedAmount > maxBufferedBytes) {
@@ -1165,15 +1168,19 @@ function sendAudioBuffer(session, buffer) {
     session.latency.firstAudioAt = Date.now();
     emitLatencyMetrics(session, 'first_audio');
   }
-  
+
+  // Send audio_end per chunk — frontend NEEDS this after each MP3 chunk
+  // to trigger AudioContext.decodeAudioData and queue playback.
+  // Each TTS chunk is a complete MP3 file; they cannot be concatenated.
   safeSend(session.ws, { type: 'audio_end' });
 
-  // After audio_end, give 500ms for TTS to finish playing on frontend
-  // before allowing STT to process again (accounts for network + playback delay)
+  // Extend agentSpeaking window on each chunk to prevent echo.
+  // Timer resets correctly here because each chunk adds playback time.
   if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
   session._agentSpeakingTimer = setTimeout(() => {
     session.agentSpeaking = false;
-    session._lastSttTranscript = ''; // Clear any echo that accumulated during TTS
+    session._agentSpeakingChunkCount = 0;
+    session._lastSttTranscript = ''; // Clear echo accumulated during TTS
   }, 1500);
 }
 

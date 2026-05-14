@@ -57,22 +57,27 @@ const server = http.createServer(app);
 // ─── WebSocket Voice Session ───────────────────────────────────────────────
 const wss = new WebSocket.Server({
   noServer: true,
-  path: '/voice',
+  path: '/ws/voice',
 });
+
+// Wire up the voice session handler — this registers the 'connection' event
+setupVoiceSession(wss);
 
 // ─── WebRTC Session ─────────────────────────────────────────────────────────
 const webrtcWss = createWebRTCServer(server);
 
 server.on('upgrade', (request, socket, head) => {
-  if (request.url === '/voice') {
+  // Support both '/ws/voice' (frontend) and legacy '/voice' paths
+  if (request.url === '/ws/voice' || request.url === '/voice') {
     wss.handleUpgrade(request, socket, head, (ws) => {
-      handleVoiceSession(ws, request);
+      wss.emit('connection', ws, request);
     });
   } else if (request.url === '/webrtc') {
     // WebRTC upgrade is handled by createWebRTCServer
     return;
   }
 });
+
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
 app.use(helmet({
@@ -139,7 +144,7 @@ app.get('/', (req, res) => {
       voicePreview: '/api/voice-preview',
       voices: '/api/voices',
       models: '/api/models',
-      websocket: 'ws://localhost:' + (process.env.PORT || 5000) + '/ws/voice',
+      websocket: 'ws://localhost:' + (process.env.PORT || 5000) + '/ws/voice',  // matches frontend WS_BASE
     },
   });
 });

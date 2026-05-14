@@ -125,6 +125,14 @@ const callLogSchema = new mongoose.Schema({
   }],
 
   endReason: { type: String, default: '' }, // 'user_hangup', 'agent_hangup', 'timeout', 'error', 'voicemail'
+
+  // Call Tags / Labels (manual + auto)
+  tags: [{ type: String, trim: true, lowercase: true }],
 }, { timestamps: true });
+
+// Index for full-text search on transcripts
+callLogSchema.index({ 'transcript.content': 'text' });
+callLogSchema.index({ userId: 1, startTime: -1 });
+callLogSchema.index({ userId: 1, tags: 1 });
 
 module.exports = mongoose.model('CallLog', callLogSchema);

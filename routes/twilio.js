@@ -27,6 +27,7 @@ const toolExecutor = require('../services/toolExecutor');
 const localStorageService = require('../services/localStorageService');
 const campaignWorker = require('../services/campaignWorker');
 const notificationService = require('../services/notificationService');
+const dtmfService = require('../services/dtmfService');
 const { protect } = require('../middleware/auth');
 
 // Helper: get Twilio client
@@ -796,6 +797,199 @@ router.post('/whatsapp', async (req, res) => {
   } catch (error) {
     console.error('❌ WhatsApp webhook error:', error);
     twiml.message('Sorry, I am experiencing technical difficulties.');
+    res.type('text/xml').send(twiml.toString());
+  }
+});
+
+// ─── DTMF (Keypad Input) Handlers ───────────────────────────────────────────────
+
+/**
+ * POST /api/twilio/dtmf/:sessionId
+ * Handle DTMF digit collection for a specific session
+ */
+router.post('/dtmf/:sessionId', async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const { sessionId } = req.params;
+  const { Digits } = req.body;
+
+  try {
+    if (!Digits) {
+      // No digits received, retry
+      const menu = dtmfService.getMenu(sessionId);
+      if (menu) {
+        const retryTwiml = dtmfService.generateMenuTwiml(sessionId, menu);
+        return res.type('text/xml').send(retryTwiml);
+      }
+      twiml.hangup();
+      return res.type('text/xml').send(twiml.toString());
+    }
+
+    // Process the digit(s)
+    const result = dtmfService.processDigit(sessionId, Digits);
+    
+    if (!result) {
+      twiml.say('Session expired. Goodbye.');
+      twiml.hangup();
+      return res.type('text/xml').send(twiml.toString());
+    }
+
+    switch (result.type) {
+      case 'digit_received':
+        // Still collecting digits
+        twiml.say(result.prompt);
+        twiml.pause({ length: 1 });
+        const continueTwiml = dtmfService.generateGatherTwiml({
+          prompt: 'Please continue entering digits.',
+          timeout: 5,
+          actionUrl: `/api/twilio/dtmf/${sessionId}`,
+        });
+        return res.type('text/xml').send(continueTwiml);
+
+      case 'input_complete':
+        // Input complete, execute action
+        twiml.say(result.message);
+        
+        if (result.action?.type === 'hangup') {
+          twiml.hangup();
+        } else if (result.action?.type === 'route') {
+          // Route to specific agent/department
+          twiml.say(`Connecting to ${result.action.target}...`);
+          twiml.redirect(`/api/twilio/transfer/${result.action.target}`);
+        } else if (result.action?.type === 'voicemail') {
+          twiml.say('Please leave a message after the tone.');
+          twiml.record({
+            maxLength: 60,
+            action: `/api/twilio/voicemail/${sessionId}`,
+            transcribe: true,
+          });
+        } else {
+          // Default: continue with normal flow
+          twiml.redirect(`/api/twilio/inbound`);
+        }
+        break;
+
+      case 'timeout_retry':
+        twiml.say(`Attempt ${result.attempt} of ${result.attempt + result.remaining}. ${result.prompt}`);
+        const retryTwiml = dtmfService.generateMenuTwiml(sessionId, dtmfService.getMenu(sessionId));
+        return res.type('text/xml').send(retryTwiml);
+
+      case 'max_attempts_reached':
+        twiml.say(result.message);
+        twiml.hangup();
+        break;
+
+      default:
+        twiml.say('An error occurred. Please try again later.');
+        twiml.hangup();
+    }
+
+    res.type('text/xml').send(twiml.toString());
+  } catch (error) {
+    console.error('[DTMF] Error processing input:', error);
+    twiml.say('Sorry, an error occurred. Goodbye.');
+    twiml.hangup();
+    res.type('text/xml').send(twiml.toString());
+  }
+});
+
+/**
+ * POST /api/twilio/dtmf-menu
+ * Create a new DTMF menu and return TwiML
+ */
+router.post('/dtmf-menu', async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const { sessionId, menuType = 'mainMenu', customConfig } = req.body;
+
+  try {
+    let menuConfig;
+    
+    if (customConfig) {
+      menuConfig = customConfig;
+    } else {
+      // Use predefined template
+      const templates = dtmfService.constructor.getTemplates();
+      menuConfig = templates[menuType] || templates.mainMenu;
+    }
+
+    // Create menu
+    const menu = dtmfService.createMenu(sessionId, menuConfig);
+    
+    // Generate TwiML
+    const menuTwiml = dtmfService.generateMenuTwiml(sessionId, menu);
+    
+    res.type('text/xml').send(menuTwiml);
+  } catch (error) {
+    console.error('[DTMF] Error creating menu:', error);
+    twiml.say('Sorry, we cannot process your request right now.');
+    twiml.hangup();
+    res.type('text/xml').send(twiml.toString());
+  }
+});
+
+/**
+ * POST /api/twilio/transfer/:target
+ * Transfer call to another number or agent
+ */
+router.post('/transfer/:target', async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const { target } = req.params;
+
+  try {
+    // Look up target number/agent
+    const phoneNumber = await PhoneNumber.findOne({ friendlyName: target });
+    
+    if (phoneNumber && phoneNumber.phoneNumber) {
+      twiml.say(`Transferring to ${target}...`);
+      twiml.dial({ callerId: phoneNumber.phoneNumber }, phoneNumber.phoneNumber);
+    } else {
+      // Try to find agent by name
+      const agent = await Agent.findOne({ name: new RegExp(target, 'i') });
+      if (agent && agent.phoneNumber) {
+        twiml.say(`Transferring to ${agent.name}...`);
+        twiml.dial({ callerId: agent.phoneNumber }, agent.phoneNumber);
+      } else {
+        twiml.say('Sorry, the requested department is not available.');
+        twiml.say('Please try again later.');
+        twiml.hangup();
+      }
+    }
+    
+    res.type('text/xml').send(twiml.toString());
+  } catch (error) {
+    console.error('[Transfer] Error:', error);
+    twiml.say('Sorry, we cannot transfer your call right now.');
+    twiml.hangup();
+    res.type('text/xml').send(twiml.toString());
+  }
+});
+
+/**
+ * POST /api/twilio/voicemail/:sessionId
+ * Handle voicemail recording completion
+ */
+router.post('/voicemail/:sessionId', async (req, res) => {
+  const twiml = new twilio.twiml.VoiceResponse();
+  const { sessionId } = req.params;
+  const { RecordingUrl, RecordingSid, TranscriptionText } = req.body;
+
+  try {
+    // Log the voicemail
+    console.log(`[Voicemail] Session ${sessionId}: ${RecordingUrl}`);
+    
+    if (TranscriptionText) {
+      console.log(`[Voicemail] Transcription: ${TranscriptionText}`);
+    }
+
+    // TODO: Save to database, send notification, etc.
+
+    twiml.say('Thank you for your message. We will get back to you soon.');
+    twiml.hangup();
+    
+    res.type('text/xml').send(twiml.toString());
+  } catch (error) {
+    console.error('[Voicemail] Error:', error);
+    twiml.say('Thank you for your message.');
+    twiml.hangup();
     res.type('text/xml').send(twiml.toString());
   }
 });

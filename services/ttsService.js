@@ -8,23 +8,149 @@
 const { EdgeTTS } = require('node-edge-tts');
 const { Readable } = require('stream');
 const fetch = require('node-fetch');
+const crypto = require('crypto');
+
+/**
+ * LRU Cache for TTS audio buffers.
+ * Avoids regenerating audio for repeated phrases (fillers, greetings, FAQ answers).
+ * Default: 200 entries, ~100MB max.
+ */
+class TTSCache {
+  constructor(maxEntries = 200, maxBytes = 100 * 1024 * 1024) {
+    this.maxEntries = maxEntries;
+    this.maxBytes = maxBytes;
+    this.cache = new Map(); // key → { buffer, size, accessedAt }
+    this.totalBytes = 0;
+    this.hits = 0;
+    this.misses = 0;
+  }
+
+  _key(text, voiceId, speed, provider) {
+    return crypto.createHash('md5').update(`${provider}:${voiceId}:${speed}:${text}`).digest('hex');
+  }
+
+  get(text, voiceId, speed, provider) {
+    const key = this._key(text, voiceId, speed, provider);
+    const entry = this.cache.get(key);
+    if (entry) {
+      this.hits++;
+      entry.accessedAt = Date.now();
+      // Move to end (most recently used)
+      this.cache.delete(key);
+      this.cache.set(key, entry);
+      return entry.buffer;
+    }
+    this.misses++;
+    return null;
+  }
+
+  set(text, voiceId, speed, provider, buffer) {
+    if (!buffer || buffer.length === 0) return;
+    const key = this._key(text, voiceId, speed, provider);
+
+    // Don't cache very large audio (> 512KB)
+    if (buffer.length > 512 * 1024) return;
+
+    // Evict if needed
+    while (this.cache.size >= this.maxEntries || this.totalBytes + buffer.length > this.maxBytes) {
+      const oldestKey = this.cache.keys().next().value;
+      if (!oldestKey) break;
+      const evicted = this.cache.get(oldestKey);
+      this.totalBytes -= evicted.size;
+      this.cache.delete(oldestKey);
+    }
+
+    this.cache.set(key, { buffer, size: buffer.length, accessedAt: Date.now() });
+    this.totalBytes += buffer.length;
+  }
+
+  getStats() {
+    const total = this.hits + this.misses;
+    return {
+      entries: this.cache.size,
+      totalBytes: this.totalBytes,
+      totalMB: (this.totalBytes / 1024 / 1024).toFixed(1),
+      hits: this.hits,
+      misses: this.misses,
+      hitRate: total > 0 ? ((this.hits / total) * 100).toFixed(1) + '%' : '0%',
+    };
+  }
+}
 
 class TtsService {
+  constructor() {
+    const maxEntries = Number(process.env.TTS_CACHE_MAX_ENTRIES || 200);
+    const maxMB = Number(process.env.TTS_CACHE_MAX_MB || 100);
+    this.cache = new TTSCache(maxEntries, maxMB * 1024 * 1024);
+    this._cacheEnabled = String(process.env.TTS_CACHE_ENABLED || 'true').toLowerCase() === 'true';
+  }
   /**
    * Convert text to speech audio buffer
    * Returns: Buffer containing MP3 audio
    */
   async textToSpeech({ text, voiceId = 'en-US-JennyNeural', speed = 1.0, pitch = 0, apiKey = null, provider = 'edge-tts' }) {
+    if (!text || text.trim().length === 0) return Buffer.alloc(0);
+
+    // ── Check cache first ─────────────────────────────────────────────
+    if (this._cacheEnabled) {
+      const cached = this.cache.get(text, voiceId, speed, provider);
+      if (cached) return cached;
+    }
+
+    let audioBuffer;
+
     // Respect selected provider. Use ElevenLabs only when explicitly requested.
     if (provider === 'eleven-labs' && (apiKey || process.env.ELEVENLABS_API_KEY)) {
       try {
-        return await this.elevenLabsTTS(text, voiceId, apiKey || process.env.ELEVENLABS_API_KEY);
+        audioBuffer = await this.elevenLabsTTS(text, voiceId, apiKey || process.env.ELEVENLABS_API_KEY);
       } catch (e) {
         console.error('ElevenLabs TTS failed, falling back to Edge:', e.message);
       }
     }
 
     // Default to Edge TTS (Free)
+    if (!audioBuffer) {
+      try {
+        audioBuffer = await this.edgeTTSInMemory(text, voiceId, speed, pitch);
+      } catch (e) {
+        console.error('Edge TTS in-memory failed, trying file fallback:', e.message);
+        audioBuffer = await this.edgeTTSFileFallback(text, voiceId, speed, pitch);
+      }
+    }
+
+    // ── Store in cache ────────────────────────────────────────────────
+    if (this._cacheEnabled && audioBuffer && audioBuffer.length > 0) {
+      this.cache.set(text, voiceId, speed, provider, audioBuffer);
+    }
+
+    return audioBuffer || Buffer.alloc(0);
+  }
+
+  /**
+   * Edge TTS — in-memory via toStream() to avoid disk I/O
+   * ~2-3x faster than file-based approach for short phrases
+   */
+  async edgeTTSInMemory(text, voiceId, speed, pitch) {
+    const rate = `${speed >= 1 ? '+' : ''}${Math.round((speed - 1) * 100)}%`;
+    const pitchStr = `${pitch >= 0 ? '+' : ''}${pitch}Hz`;
+
+    const tts = new EdgeTTS({ voice: voiceId, rate, pitch: pitchStr });
+    const readable = tts.toStream(text);
+
+    const chunks = [];
+    for await (const chunk of readable) {
+      if (Buffer.isBuffer(chunk)) chunks.push(chunk);
+      else if (typeof chunk === 'object' && chunk.audio) chunks.push(chunk.audio);
+    }
+    const audio = Buffer.concat(chunks);
+    if (audio.length === 0) throw new Error('EdgeTTS stream returned empty audio');
+    return audio;
+  }
+
+  /**
+   * Edge TTS — file-based fallback (original approach)
+   */
+  async edgeTTSFileFallback(text, voiceId, speed, pitch) {
     try {
       const path = require('path');
       const fs = require('fs/promises');
@@ -33,24 +159,44 @@ class TtsService {
       const rate = `${speed >= 1 ? '+' : ''}${Math.round((speed - 1) * 100)}%`;
       const pitchStr = `${pitch >= 0 ? '+' : ''}${pitch}Hz`;
 
-      const tts = new EdgeTTS({
-        voice: voiceId,
-        rate,
-        pitch: pitchStr,
-      });
-
+      const tts = new EdgeTTS({ voice: voiceId, rate, pitch: pitchStr });
       const tmpFile = path.join(os.tmpdir(), `tts_${Date.now()}_${Math.floor(Math.random()*1000)}.mp3`);
       
       await tts.ttsPromise(text, tmpFile);
       const audio = await fs.readFile(tmpFile);
-      // Best-effort cleanup; don't fail TTS response if temp cleanup fails.
       fs.unlink(tmpFile).catch(() => {});
       
       return audio;
     } catch (e) {
-      console.error('Edge TTS error:', e.message);
+      console.error('Edge TTS file fallback error:', e.message);
       return Buffer.alloc(0);
     }
+  }
+
+  /**
+   * Pre-warm cache with common phrases (call at startup or agent init)
+   * Generates audio for filler words and common responses ahead of time
+   */
+  async prewarmCache(voiceId = 'en-US-JennyNeural', speed = 1.0, provider = 'edge-tts') {
+    const phrases = [
+      'Hmm...', 'Let me see...', 'Umm...', 'Okay...', 'Well...',
+      'One moment please.', 'Let me check that for you.',
+      'Sure!', 'Of course.', 'Absolutely.',
+      'I understand.', 'Got it.',
+    ];
+
+    let warmed = 0;
+    for (const phrase of phrases) {
+      try {
+        await this.textToSpeech({ text: phrase, voiceId, speed, provider });
+        warmed++;
+      } catch (e) { /* skip failures */ }
+    }
+    console.log(`[TTS Cache] Pre-warmed ${warmed}/${phrases.length} phrases for ${voiceId}`);
+  }
+
+  getCacheStats() {
+    return this.cache.getStats();
   }
 
   /**

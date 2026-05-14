@@ -307,10 +307,24 @@ async function handleInit(session, message) {
     const sttLanguage = agent.language || 'en';
     console.log(`🌐 Agent language: ${sttLanguage}`);
 
+  // Extract keywords from agent config for Deepgram boosting
+  const sttKeywords = [
+    ...(agent.advanced?.sttKeywords || []),
+    agent.name, // Boost agent's own name
+    ...(agent.systemPrompt || '').match(/\b[A-Z][a-zA-Z]{3,}\b/g) || [], // Proper nouns from system prompt
+  ].filter(Boolean).slice(0, 50);
+
   session.deepgramConn = deepgramService.createLiveConnection({
       apiKey: deepgramKey,
       language: sttLanguage,
       backgroundDenoising: agent.advanced?.backgroundDenoising || 'default',
+      keywords: sttKeywords,
+      onVADEvent: (event) => {
+        if (event.type === 'speech_started' && session.agentSpeaking) {
+          // User started speaking while agent is talking — prepare for interruption
+          safeSend(session.ws, { type: 'vad_speech_started' });
+        }
+      },
       onTranscript: async ({ transcript, isFinal, speechFinal }) => {
         // ── Interruption detection: if user speaks while agent is talking ──
         if (session.agentSpeaking) {
@@ -913,18 +927,42 @@ async function handleEndSession(session, reason = 'user_hangup') {
     } catch (e) {}
   }
 
+  // Save call recording (concatenate TTS audio buffers)
+  let recordingUrl = '';
+  if (session.fullAudioBuffer && session.fullAudioBuffer.length > 0 && session.callLogId) {
+    try {
+      const fs = require('fs');
+      const path = require('path');
+      const recordingsDir = path.join(__dirname, '..', 'recordings');
+      if (!fs.existsSync(recordingsDir)) fs.mkdirSync(recordingsDir, { recursive: true });
+
+      const filename = `call_${session.callLogId}_${Date.now()}.mp3`;
+      const filepath = path.join(recordingsDir, filename);
+      const fullBuffer = Buffer.concat(session.fullAudioBuffer);
+      fs.writeFileSync(filepath, fullBuffer);
+
+      recordingUrl = `/api/recordings/download/${filename}`;
+      console.log(`[Recording] Saved ${(fullBuffer.length / 1024).toFixed(0)}KB → ${filename}`);
+    } catch (recErr) {
+      console.error('[Recording] Failed to save:', recErr.message);
+    }
+  }
+
   // Update call log
   const endTime = new Date();
   const duration = Math.round((endTime - new Date(session.startTime)) / 1000);
 
   if (session.callLogId) {
     await flushCallLogWriteQueue(session);
-    const finalCallLog = await CallLog.findByIdAndUpdate(session.callLogId, {
+    const updateData = {
       status: 'completed',
       endTime,
       duration,
       endReason: reason,
-    }, { new: true });
+    };
+    if (recordingUrl) updateData.recordingUrl = recordingUrl;
+
+    const finalCallLog = await CallLog.findByIdAndUpdate(session.callLogId, updateData, { new: true });
 
     // Background analysis
     if (!session.skipPostCallAnalysis && finalCallLog && finalCallLog.transcript.length > 0) {
@@ -944,7 +982,11 @@ async function handleEndSession(session, reason = 'user_hangup') {
             customerIntent: analysis.customerIntent || '',
             urgencyLevel: analysis.urgencyLevel || '',
             followUpRequired: analysis.followUpRequired || false,
-            qa: { score: analysis.qaScore || 0 }
+            qa: {
+              score: analysis.qaScore || 0,
+              grade: analysis.qaGrade || '',
+            },
+            tags: analysis.tags || []
           });
 
           // Save to User Memory (Pichli baatein)

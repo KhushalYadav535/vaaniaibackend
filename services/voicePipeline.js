@@ -3,12 +3,25 @@
  * Flow: Audio Input → STT (Deepgram) → LLM (Groq) → TTS (Edge TTS) → Audio Output
  */
 const groqService = require('./groqService');
+const geminiService = require('./geminiService');
 const ttsService = require('./ttsService');
 const deepgramService = require('./deepgramService');
 const toolExecutor = require('./toolExecutor');
 const KnowledgeBase = require('../models/KnowledgeBase');
 
 class VoicePipeline {
+  constructor() {
+    // LRU response cache for FAQ-type repeated queries
+    this._responseCache = new Map();
+    this._responseCacheMaxEntries = Number(process.env.LLM_RESPONSE_CACHE_MAX || 50);
+    this._responseCacheEnabled = String(process.env.LLM_RESPONSE_CACHE_ENABLED || 'true').toLowerCase() === 'true';
+    this._responseCacheTtlMs = Number(process.env.LLM_RESPONSE_CACHE_TTL_MS || 300000); // 5 min
+
+    // Rolling summary settings
+    this._summaryThreshold = Number(process.env.ROLLING_SUMMARY_THRESHOLD || 12); // summarize after N messages
+    this._summaryKeepRecent = Number(process.env.ROLLING_SUMMARY_KEEP_RECENT || 6); // keep last N messages verbatim
+  }
+
   getGroqFallbackModels(primaryModel = 'llama-3.1-8b-instant') {
     const envList = (process.env.GROQ_FALLBACK_MODELS || '')
       .split(',')
@@ -38,7 +51,19 @@ class VoicePipeline {
       }
     }
 
-    throw lastError || new Error('all_groq_models_failed');
+    // ─── GEMINI FALLBACK: If ALL Groq models failed, try Gemini (free) ────
+    if (geminiService.isAvailable()) {
+      try {
+        console.log('[LLM Fallback] All Groq models failed. Trying Gemini...');
+        const geminiResp = await geminiService.generateResponse({ messages, temperature });
+        console.log(`[LLM Fallback] Gemini success (${geminiResp.latencyMs}ms)`);
+        return geminiResp;
+      } catch (geminiErr) {
+        console.error('[LLM Fallback] Gemini also failed:', geminiErr.message);
+      }
+    }
+
+    throw lastError || new Error('all_llm_models_failed');
   }
 
   /**
@@ -97,7 +122,16 @@ class VoicePipeline {
         } catch (e) {
           llmResponse = { text: "Custom LLM failed.", latencyMs: 0, toolCalls: [] };
         }
-      } else if (llmProvider === 'groq' || !userSettings.openaiKey) {
+      } else if (llmProvider === 'gemini') {
+        // ─── Direct Gemini provider selection ─────────────────────────────
+        llmResponse = await geminiService.generateResponse({
+          messages,
+          model: llmModel || 'gemini-1.5-flash',
+          temperature: agent.temperature || 0.7,
+          apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
+        });
+      } else {
+        // ─── Default: Groq with Gemini auto-fallback ─────────────────────
         llmResponse = await this.generateGroqResponseWithFallback({
           messages,
           model: llmModel,
@@ -206,100 +240,105 @@ class VoicePipeline {
 
   /**
    * Process text with full streaming (LLM tokens -> Sentence chunks -> TTS)
-   * This is much faster for real-time voice
+   *
+   * CONCURRENT PIPELINE: LLM token stream is consumed without ever blocking on TTS.
+   * Each complete sentence immediately fires a TTS Promise that is pushed into an
+   * ordered array (ttsQueue). A separate drainer yields results in insertion order.
+   *
+   * Old sequential timeline:  LLM[s1] ──wait──> TTS[s1] ──wait──> LLM[s2] ──wait──> TTS[s2]
+   * New concurrent timeline:  LLM[s1,s2,s3...] runs concurrently with TTS[s1] TTS[s2] TTS[s3]
+   *
+   * Result: First audio arrives ~500ms instead of ~1000ms.
    */
   async *processTextStream({ text, agent, history = [], userSettings = {}, memory = null, ragContext = '' }) {
+    // ── Emotion detection ──────────────────────────────────────────────────
     const currentEmotion = this.detectEmotion(text);
     let emotionPrompt = '';
-    if (currentEmotion === 'angry') emotionPrompt = '\n[SYSTEM DIRECTIVE]: The user seems frustrated or angry. Adopt a highly empathetic, calming, and apologetic tone immediately.';
+    if (currentEmotion === 'angry')  emotionPrompt = '\n[SYSTEM DIRECTIVE]: The user seems frustrated or angry. Adopt a highly empathetic, calming, and apologetic tone immediately.';
     if (currentEmotion === 'urgent') emotionPrompt = '\n[SYSTEM DIRECTIVE]: The user has an urgent issue. Be extremely concise, fast, and helpful. Get straight to the point.';
 
+    // ── Rolling conversation summary for long calls ──────────────────────
+    const { summary: rollingSummary, recentHistory } = await this.compressHistory(history);
+    let summaryPrompt = '';
+    if (rollingSummary) {
+      summaryPrompt = `\n\n## EARLIER CONVERSATION SUMMARY:\n${rollingSummary}`;
+    }
+
     const messages = [
-      { role: 'system', content: this.buildSystemPrompt(agent, memory, ragContext) + emotionPrompt },
-      ...history.map(msg => ({ role: msg.role, content: msg.content })),
+      { role: 'system', content: this.buildSystemPrompt(agent, memory, ragContext) + summaryPrompt + emotionPrompt },
+      ...recentHistory.map(msg => ({ role: msg.role, content: msg.content })),
       { role: 'user', content: text },
     ];
 
-    const llmProvider = agent.llm?.provider || 'groq';
-    const llmModel = agent.llm?.model || 'llama-3.1-8b-instant';
-    const voiceProvider = agent.voice?.provider || 'edge-tts';
-    const voiceId = agent.voice?.voiceId || 'en-US-JennyNeural';
-    const speed = agent.voice?.speed || 1.0;
+    const llmProvider   = agent.llm?.provider   || 'groq';
+    const llmModel      = agent.llm?.model       || 'llama-3.1-8b-instant';
+    const voiceProvider = agent.voice?.provider  || 'edge-tts';
+    const voiceId       = agent.voice?.voiceId   || 'en-US-JennyNeural';
+    const speed         = agent.voice?.speed     || 1.0;
+    const ttsApiKey     = userSettings.ttsKey    || process.env.ELEVENLABS_API_KEY;
 
-    let fullResponseText = '';
-    let currentSentence = '';
-    let hasSpokenFirstChunk = false;
-    let hasEmittedAnyChunk = false;
-    const fastFirstChunkMode = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
-    const firstChunkCharThreshold = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 36);
-    const firstChunkMaxWords = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 8);
-    
-    // Check for Dynamic Knowledge (RAG 2.0)
+    const fastFirstChunkMode       = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
+    const firstChunkCharThreshold  = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 36);
+    const firstChunkMaxWords       = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 8);
+
+    // ── Dynamic Knowledge (RAG 2.0) ────────────────────────────────────────
     let dynamicKnowledge = '';
     if (agent.knowledgeBaseId) {
-      // Find relevant chunks (Simplified for now)
       const kb = await KnowledgeBase.findById(agent.knowledgeBaseId);
       if (kb) {
-        // Logic for finding relevant content in KnowledgeBase (Retell/Vapi style)
         dynamicKnowledge = `\n[Dynamic Knowledge Context]:\n${kb.content.substring(0, 1000)}`;
       }
     }
 
-    // Build tool context for Tool Calling (Vapi/Retell style)
-    const toolInstructions = agent.webhooks?.length > 0 ? 
-      `\n[Tool Instructions]: You can call these tools if needed: ${agent.webhooks.map(w => w.name).join(', ')}. Format: <TOOL>function_name(args)</TOOL>` : '';
+    // ── Tool instructions ──────────────────────────────────────────────────
+    const toolInstructions = agent.webhooks?.length > 0
+      ? `\n[Tool Instructions]: You can call these tools if needed: ${agent.webhooks.map(w => w.name).join(', ')}. Format: <TOOL>function_name(args)</TOOL>`
+      : '';
 
     const systemPrompt = this.buildSystemPrompt(agent, memory, ragContext) + dynamicKnowledge + toolInstructions + emotionPrompt;
     messages[0].content = systemPrompt;
 
-    // Inject Filler Word to reduce perceived latency
+    // ── Filler word (fires synchronously before stream to reduce TTFA) ─────
     if (agent.advanced?.fillerWords && Math.random() < 0.35) {
-      const fillers = ["Hmm...", "Let me see...", "Umm...", "Okay...", "Well..."];
-      const filler = fillers[Math.floor(Math.random() * fillers.length)];
-      
-      const audioBuffer = await ttsService.textToSpeech({
-        text: filler,
-        voiceId,
-        speed,
-        apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
-        provider: voiceProvider,
-      });
-
-      yield {
-        type: 'chunk',
-        text: filler + ' ',
-        audio: audioBuffer,
-      };
+      const fillers = ['Hmm...', 'Let me see...', 'Umm...', 'Okay...', 'Well...'];
+      const filler  = fillers[Math.floor(Math.random() * fillers.length)];
+      const fillerAudio = await ttsService.textToSpeech({ text: filler, voiceId, speed, apiKey: ttsApiKey, provider: voiceProvider });
+      yield { type: 'chunk', text: filler + ' ', audio: fillerAudio };
     }
 
-    // Use streaming LLM or Custom Webhook
+    // ── Select token stream (Custom URL or Groq with fallback) ────────────
     let tokenStream;
     if (agent.advanced?.customLlmUrl) {
       tokenStream = (async function* () {
         const axios = require('axios');
         try {
-          const res = await axios.post(agent.advanced.customLlmUrl, { messages, agentId: agent._id });
-          const text = typeof res.data === 'string' ? res.data : (res.data?.text || res.data?.response || JSON.stringify(res.data));
-          // Split into words or sentences to simulate stream
-          const words = text.split(' ');
-          for (const w of words) yield w + ' ';
+          const res  = await axios.post(agent.advanced.customLlmUrl, { messages, agentId: agent._id });
+          const body = typeof res.data === 'string' ? res.data : (res.data?.text || res.data?.response || JSON.stringify(res.data));
+          for (const w of body.split(' ')) yield w + ' ';
         } catch (e) {
-          console.error("Custom LLM Webhook failed:", e.message);
-          yield "Sorry, my external intelligence server is offline.";
+          console.error('Custom LLM Webhook failed:', e.message);
+          yield 'Sorry, my external intelligence server is offline.';
         }
       })();
+    } else if (llmProvider === 'gemini' && geminiService.isAvailable(userSettings.geminiKey)) {
+      // ─── Direct Gemini streaming ─────────────────────────────────────
+      tokenStream = geminiService.generateStreamResponse({
+        messages,
+        model: llmModel || 'gemini-1.5-flash',
+        temperature: agent.temperature || 0.7,
+        apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
+      });
     } else {
       const candidateModels = this.getGroqFallbackModels(llmModel);
       let streamCreated = false;
       let lastErr = null;
-
       for (const modelCandidate of candidateModels) {
         try {
-          tokenStream = groqService.generateStreamResponse({
+          tokenStream   = groqService.generateStreamResponse({
             messages,
-            model: modelCandidate,
+            model:       modelCandidate,
             temperature: agent.temperature || 0.7,
-            apiKey: userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
+            apiKey:      userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
           });
           streamCreated = true;
           break;
@@ -308,154 +347,167 @@ class VoicePipeline {
           console.warn(`[LLM Stream Fallback] ${modelCandidate} failed -> ${err.message}`);
         }
       }
-
-      if (!streamCreated) {
-        throw lastErr || new Error('all_groq_stream_models_failed');
+      // ─── Gemini auto-fallback for streaming ───────────────────────────
+      if (!streamCreated && geminiService.isAvailable()) {
+        console.log('[LLM Stream Fallback] All Groq models failed. Trying Gemini stream...');
+        tokenStream = geminiService.generateStreamResponse({ messages, temperature: agent.temperature || 0.7 });
+        streamCreated = true;
       }
+      if (!streamCreated) throw lastErr || new Error('all_llm_stream_models_failed');
     }
 
-    try {
-      for await (const token of tokenStream) {
-        fullResponseText += token;
-        currentSentence += token;
+    // ═════════════════════════════════════════════════════════════════════
+    // CONCURRENT PIPELINE CORE
+    // ─────────────────────────────────────────────────────────────────────
+    // ttsQueue  : Array<Promise<{text, audio}>>  — ordered TTS jobs
+    // producerDone: boolean — signals that the LLM loop has finished
+    // producerError: Error|null — any error from the producer
+    // ─────────────────────────────────────────────────────────────────────
 
-        // Tool Execution Logic (Vapi/Retell style)
-        if (fullResponseText.includes('<TOOL>') && fullResponseText.includes('</TOOL>')) {
-          const toolMatch = fullResponseText.match(/<TOOL>(.*?)<\/TOOL>/);
-          if (toolMatch) {
-            const toolCallStr = toolMatch[1]; // e.g. "get_stock_price({symbol: 'AAPL'})"
-            const name = toolCallStr.split('(')[0];
-            const argsStr = toolCallStr.match(/\((.*?)\)/)?.[1] || '{}';
-            
-            try {
-              const args = JSON.parse(argsStr.replace(/'/g, '"'));
-              const toolResult = await toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent });
-              
-              if (toolResult.result && toolResult.result.__transferToAgentId) {
-                yield {
-                  type: 'transfer_agent',
-                  agentId: toolResult.result.__transferToAgentId,
-                  reason: toolResult.result.reason
-                };
-                return; // Stop current stream
-              }
-
-              // Add tool result back to conversation context and restart generation
-              // (Simplified: for now we just append result to prompt and continue)
-              console.log(`[Tool Executed] Result:`, toolResult);
-              fullResponseText = fullResponseText.replace(toolMatch[0], ` [Result: ${JSON.stringify(toolResult)}] `);
-            } catch (e) {
-              console.error('Tool parsing failed:', e.message);
-            }
-          }
-        }
-
-        // Fast-first-chunk: speak early before punctuation to reduce time-to-first-audio.
-        if (
-          fastFirstChunkMode &&
-          !hasSpokenFirstChunk &&
-          currentSentence.trim().length >= firstChunkCharThreshold
-        ) {
-          const words = currentSentence.trim().split(/\s+/).filter(Boolean);
-          const firstChunkText = words.slice(0, firstChunkMaxWords).join(' ').trim();
-          const remainder = words.slice(firstChunkMaxWords).join(' ').trim();
-
-          if (firstChunkText.length > 0) {
-            const audioBuffer = await ttsService.textToSpeech({
-              text: firstChunkText,
-              voiceId,
-              speed,
-              apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
-              provider: voiceProvider,
-            });
-
-            yield {
-              type: 'chunk',
-              text: firstChunkText,
-              audio: audioBuffer,
-            };
-
-            hasSpokenFirstChunk = true;
-            hasEmittedAnyChunk = true;
-            currentSentence = remainder ? `${remainder} ` : '';
-          }
-        }
-
-        // Check if we have a complete sentence (., !, ?, or \n)
-        if (/[.!?\n]/.test(token) && currentSentence.trim().length > 5) {
-          const sentenceToSpeak = currentSentence.trim();
-          currentSentence = '';
-
-          // Generate TTS for this sentence
-          const audioBuffer = await ttsService.textToSpeech({
-            text: sentenceToSpeak,
-            voiceId,
-            speed,
-            apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
-            provider: voiceProvider,
-          });
-
-          yield {
-            type: 'chunk',
-            text: sentenceToSpeak,
-            audio: audioBuffer,
-          };
-          hasEmittedAnyChunk = true;
-        }
-      }
-
-      // Process any remaining text
-      if (currentSentence.trim().length > 0) {
-        const audioBuffer = await ttsService.textToSpeech({
-          text: currentSentence.trim(),
-          voiceId,
-          speed,
-          apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
-          provider: voiceProvider,
+    /** Helper: kick off TTS without blocking; returns a Promise<{text,audio}> */
+    const fireTTS = (sentenceText) =>
+      ttsService.textToSpeech({ text: sentenceText, voiceId, speed, apiKey: ttsApiKey, provider: voiceProvider })
+        .then(audio => ({ text: sentenceText, audio }))
+        .catch(err  => {
+          console.error(`[TTS Concurrent] Failed: "${sentenceText.substring(0, 40)}"`, err.message);
+          return { text: sentenceText, audio: Buffer.alloc(0) };
         });
 
-        yield {
-          type: 'chunk',
-          text: currentSentence.trim(),
-          audio: audioBuffer,
-        };
+    const ttsQueue     = [];   // ordered promise array
+    let producerDone   = false;
+    let producerError  = null;
+    let fullResponseText = '';
+
+    // ── LLM Producer (runs concurrently; never awaits TTS) ────────────────
+    const runProducer = async () => {
+      let currentSentence     = '';
+      let hasSpokenFirstChunk = false;
+
+      try {
+        for await (const token of tokenStream) {
+          fullResponseText  += token;
+          currentSentence   += token;
+
+          // ── Tool Execution (Vapi/Retell style) ──────────────────────────
+          if (fullResponseText.includes('<TOOL>') && fullResponseText.includes('</TOOL>')) {
+            const toolMatch = fullResponseText.match(/<TOOL>(.*?)<\/TOOL>/);
+            if (toolMatch) {
+              const toolCallStr = toolMatch[1];
+              const name        = toolCallStr.split('(')[0];
+              const argsStr     = toolCallStr.match(/\((.*?)\)/)?.[1] || '{}';
+              try {
+                const args       = JSON.parse(argsStr.replace(/'/g, '"'));
+                const toolResult = await toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent });
+
+                if (toolResult.result?.__transferToAgentId) {
+                  // Enqueue a special sentinel so the drainer can yield the transfer event
+                  ttsQueue.push(Promise.resolve({
+                    __special: 'transfer_agent',
+                    agentId:   toolResult.result.__transferToAgentId,
+                    reason:    toolResult.result.reason,
+                  }));
+                  return; // Stop producing
+                }
+
+                console.log('[Tool Executed] Result:', toolResult);
+                fullResponseText = fullResponseText.replace(toolMatch[0], ` [Result: ${JSON.stringify(toolResult)}] `);
+              } catch (e) {
+                console.error('Tool parsing failed:', e.message);
+              }
+            }
+          }
+
+          // ── Fast-first-chunk: fire TTS before sentence boundary ─────────
+          if (fastFirstChunkMode && !hasSpokenFirstChunk && currentSentence.trim().length >= firstChunkCharThreshold) {
+            const words          = currentSentence.trim().split(/\s+/).filter(Boolean);
+            const firstChunkText = words.slice(0, firstChunkMaxWords).join(' ').trim();
+            const remainder      = words.slice(firstChunkMaxWords).join(' ').trim();
+
+            if (firstChunkText.length > 0) {
+              ttsQueue.push(fireTTS(firstChunkText)); // fire immediately, don't await
+              hasSpokenFirstChunk = true;
+              currentSentence     = remainder ? `${remainder} ` : '';
+              console.log(`[Pipeline] Fast-chunk TTS fired (queue=${ttsQueue.length}): "${firstChunkText.substring(0, 50)}"`);
+            }
+          }
+
+          // ── Sentence boundary detected ──────────────────────────────────
+          if (/[.!?\n]/.test(token) && currentSentence.trim().length > 5) {
+            const sentenceToSpeak = currentSentence.trim();
+            currentSentence = '';
+            ttsQueue.push(fireTTS(sentenceToSpeak)); // fire immediately, don't await
+            console.log(`[Pipeline] Sentence TTS fired (queue=${ttsQueue.length}): "${sentenceToSpeak.substring(0, 50)}"`);
+          }
+        }
+
+        // Flush any trailing partial sentence
+        if (currentSentence.trim().length > 0) {
+          ttsQueue.push(fireTTS(currentSentence.trim()));
+          console.log(`[Pipeline] Remainder TTS fired: "${currentSentence.trim().substring(0, 50)}"`);
+        }
+      } catch (err) {
+        producerError = err;
+      } finally {
+        producerDone = true;
+      }
+    };
+
+    // ── Start producer without awaiting it — it runs concurrently ─────────
+    const producerPromise = runProducer();
+
+    let hasEmittedAnyChunk = false;
+
+    try {
+      // ── Drainer: yield completed TTS jobs in order ──────────────────────
+      // Poll the front of ttsQueue. When the next promise resolves, yield it.
+      let drainIdx = 0;
+      while (true) {
+        if (drainIdx >= ttsQueue.length) {
+          if (producerDone) break; // Producer is done and queue is drained
+          // Briefly yield control so the producer can push more items
+          await new Promise(resolve => setImmediate(resolve));
+          continue;
+        }
+
+        const result = await ttsQueue[drainIdx++];
+
+        // Handle special sentinel (transfer event)
+        if (result.__special === 'transfer_agent') {
+          await producerPromise;
+          yield { type: 'transfer_agent', agentId: result.agentId, reason: result.reason };
+          return;
+        }
+
+        yield { type: 'chunk', text: result.text, audio: result.audio };
         hasEmittedAnyChunk = true;
       }
 
-      yield {
-        type: 'final',
-        fullText: fullResponseText,
-      };
-    } catch (streamErr) {
-      if (hasEmittedAnyChunk) {
-        throw streamErr;
-      }
+      await producerPromise; // ensure producer has fully exited
 
-      // Stream startup timeout fallback: switch to non-stream response instead of failing the turn.
+      if (producerError && !hasEmittedAnyChunk) throw producerError;
+
+      yield { type: 'final', fullText: fullResponseText };
+
+    } catch (streamErr) {
+      await producerPromise.catch(() => {});
+
+      if (hasEmittedAnyChunk) throw streamErr;
+
+      // ── Fallback: non-streaming response if stream never started ─────────
+      console.warn('[Pipeline] Stream failed before first chunk — falling back to non-stream');
       const fallbackResponse = await this.generateGroqResponseWithFallback({
         messages,
-        model: llmModel,
+        model:       llmModel,
         temperature: agent.temperature || 0.7,
-        apiKey: userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
+        apiKey:      userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
       });
-      const fallbackText = (fallbackResponse?.text || 'I am here to help.').trim();
+      const fallbackText  = (fallbackResponse?.text || 'I am here to help.').trim();
       const fallbackAudio = await ttsService.textToSpeech({
-        text: fallbackText,
-        voiceId,
-        speed,
-        apiKey: userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
-        provider: voiceProvider,
+        text: fallbackText, voiceId, speed, apiKey: ttsApiKey, provider: voiceProvider,
       });
 
-      yield {
-        type: 'chunk',
-        text: fallbackText,
-        audio: fallbackAudio,
-      };
-      yield {
-        type: 'final',
-        fullText: fallbackText,
-      };
+      yield { type: 'chunk', text: fallbackText,  audio: fallbackAudio };
+      yield { type: 'final', fullText: fallbackText };
     }
   }
 
@@ -486,7 +538,9 @@ class VoicePipeline {
         "extractedData": { "name": "", "email": "", "phone": "", "company": "", "date": "" },
         "emotion": "happy" | "angry" | "sad" | "frustrated" | "neutral",
         "metrics": { "nps": 0, "csat": 0 },
-        "qaScore": 95
+        "qaScore": 95,
+        "qaGrade": "A",
+        "tags": ["auto-generated", "tag", "labels"]
       }
 
       Rules:
@@ -494,7 +548,9 @@ class VoicePipeline {
       - Be accurate with sentiment — frustrated or angry customers = negative
       - followUpRequired = true if there are pending action items or unresolved questions
       - urgencyLevel = critical only for emergencies or angry escalations
-      - qaScore = Evaluate the AI agent's performance from 0 to 100 based on politeness, accuracy, and helpfulness.
+      - qaScore = Evaluate the AI agent's performance from 0 to 100 based on: greeting quality, listening, accuracy, empathy, resolution, and professionalism
+      - qaGrade = A (90-100), B (80-89), C (70-79), D (60-69), F (<60)
+      - tags = Auto-generate 2-5 tags describing this call (e.g. "refund", "billing", "vip", "escalated", "resolved", "complaint", "inquiry", "demo-request", "follow-up-needed")
     `;
 
     try {
@@ -505,6 +561,7 @@ class VoicePipeline {
         ],
         model: 'llama-3.1-8b-instant',
         temperature: 0.1,
+        jsonMode: true,
       });
 
       const cleanJson = response.text.replace(/```json|```/g, '').trim();
@@ -517,7 +574,7 @@ class VoicePipeline {
 
   /**
    * Real-time sentiment classification for live calls
-   * Ultra-fast — uses minimal tokens for instant response
+   * SMART MODE: Keyword-first (0ms), LLM only for ambiguous text (saves ~300ms & tokens)
    * Returns: { sentiment: 'positive'|'neutral'|'negative', score: -1 to 1 }
    */
   async classifySentiment(text) {
@@ -525,6 +582,21 @@ class VoicePipeline {
       return { sentiment: 'neutral', score: 0 };
     }
 
+    // Phase 1: Fast keyword-based classification (instant, zero cost)
+    const keywordResult = this.keywordSentiment(text);
+    
+    // If keyword analysis is confident (strong signal), skip LLM entirely
+    const absScore = Math.abs(keywordResult.score);
+    if (absScore >= 0.5) {
+      return keywordResult; // High confidence — no LLM call needed
+    }
+
+    // Phase 2: Short text with no keywords → default neutral (don't waste tokens)
+    if (text.trim().split(/\s+/).length < 5) {
+      return keywordResult;
+    }
+
+    // Phase 3: Ambiguous text → use LLM for accurate classification
     try {
       const response = await groqService.generateResponse({
         messages: [
@@ -547,8 +619,7 @@ class VoicePipeline {
         score: typeof parsed.v === 'number' ? Math.max(-1, Math.min(1, parsed.v)) : 0,
       };
     } catch (e) {
-      // Fallback: simple keyword-based sentiment
-      return this.keywordSentiment(text);
+      return keywordResult; // Fallback to keyword result
     }
   }
 
@@ -652,6 +723,47 @@ class VoicePipeline {
       return lowConfidenceAcks[Math.floor(Math.random() * lowConfidenceAcks.length)];
     }
     return null;
+  }
+
+  /**
+   * Rolling conversation summarizer for long calls.
+   * When history exceeds threshold, summarizes older messages into a compact string
+   * and keeps only the most recent messages verbatim.
+   * This prevents LLM context window overflow and maintains coherence.
+   *
+   * Returns: { summary: string|null, recentHistory: Array }
+   */
+  async compressHistory(history) {
+    if (!history || history.length <= this._summaryThreshold) {
+      return { summary: null, recentHistory: history };
+    }
+
+    const olderMessages = history.slice(0, history.length - this._summaryKeepRecent);
+    const recentHistory = history.slice(-this._summaryKeepRecent);
+
+    const olderFormatted = olderMessages.map(m => `${m.role}: ${m.content}`).join('\n');
+
+    try {
+      const response = await groqService.generateResponse({
+        messages: [
+          {
+            role: 'system',
+            content: 'Summarize this call conversation in 3-5 bullet points. Include key facts, decisions, and any data mentioned (names, numbers, dates). Be concise. Respond with ONLY the summary, no preamble.',
+          },
+          { role: 'user', content: olderFormatted },
+        ],
+        model: 'llama-3.1-8b-instant',
+        temperature: 0.1,
+      });
+
+      const summary = response.text.trim();
+      console.log(`[Rolling Summary] Compressed ${olderMessages.length} older messages into summary`);
+      return { summary, recentHistory };
+    } catch (e) {
+      console.error('[Rolling Summary] Failed:', e.message);
+      // Fallback: just truncate
+      return { summary: null, recentHistory: history.slice(-10) };
+    }
   }
 
   /**

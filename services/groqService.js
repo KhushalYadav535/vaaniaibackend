@@ -76,7 +76,7 @@ class GroqService {
   /**
    * Generate LLM response (non-streaming)
    */
-  async generateResponse({ messages, model = 'llama-3.1-8b-instant', temperature = 0.7, apiKey, tools = null }) {
+  async generateResponse({ messages, model = 'llama-3.1-8b-instant', temperature = 0.7, apiKey, tools = null, jsonMode = false }) {
     if (this.isCircuitOpen()) {
       throw new Error('groq_circuit_open');
     }
@@ -90,6 +90,11 @@ class GroqService {
       temperature,
       max_tokens: 1024,
     };
+
+    // Structured JSON output mode
+    if (jsonMode) {
+      options.response_format = { type: 'json_object' };
+    }
 
     if (tools && tools.length > 0) {
       options.tools = tools;

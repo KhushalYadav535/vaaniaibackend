@@ -132,6 +132,8 @@ const agentSchema = new mongoose.Schema({
     backgroundDenoising: { type: String, enum: ['none', 'default', 'high'], default: 'default' },
     fillerWords: { type: Boolean, default: false },
     customLlmUrl: { type: String, default: '' }, // Custom Webhook for Bring Your Own LLM
+    sttKeywords: [{ type: String }], // Domain-specific terms for Deepgram keyword boosting (e.g. product names, company name)
+    responseCacheEnabled: { type: Boolean, default: true }, // Cache FAQ-type LLM responses for speed
   },
   // Webhook URLs for this agent
   webhooks: {

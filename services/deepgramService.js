@@ -45,7 +45,7 @@ class DeepgramService {
    *   .send(buffer)   — send audio data
    *   .finish()       — close the connection gracefully
    */
-  createLiveConnection({ apiKey, language = 'en', backgroundDenoising = 'default', onTranscript, onError, onClose }) {
+  createLiveConnection({ apiKey, language = 'en', backgroundDenoising = 'default', onTranscript, onError, onClose, keywords = [], onVADEvent = null }) {
     const key = apiKey || process.env.DEEPGRAM_API_KEY;
     if (!key) throw new Error('No Deepgram API key. Get $200 free credits at https://deepgram.com');
 
@@ -114,6 +114,19 @@ class DeepgramService {
       params.set('filler_words', 'true');
     }
 
+    // Keyword boosting: improves recognition of domain-specific terms
+    // (company names, product names, agent-specific vocabulary)
+    if (keywords && keywords.length > 0) {
+      const validKeywords = keywords.filter(k => typeof k === 'string' && k.trim().length > 0).slice(0, 100);
+      if (validKeywords.length > 0) {
+        params.set('keywords', validKeywords.join(','));
+        console.log(`[Deepgram] Keyword boosting: ${validKeywords.length} terms`);
+      }
+    }
+
+    // Enable VAD events for smarter turn-taking
+    params.set('vad_events', 'true');
+
     const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
 
     const ws = new WebSocket(url, {
@@ -130,6 +143,12 @@ class DeepgramService {
 
         // Handle UtteranceEnd
         if (msg.type === 'UtteranceEnd') {
+          return;
+        }
+
+        // Handle SpeechStarted VAD event
+        if (msg.type === 'SpeechStarted') {
+          if (onVADEvent) onVADEvent({ type: 'speech_started', timestamp: msg.timestamp });
           return;
         }
 

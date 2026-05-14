@@ -437,4 +437,129 @@ router.get('/trends', async (req, res, next) => {
   }
 });
 
+// @route   GET /api/analytics/latency
+// @desc    Average response latency breakdown (STT→LLM→TTS) from transcript timestamps
+router.get('/latency', async (req, res, next) => {
+  try {
+    const userId = req.user._id;
+    const { period = '30d' } = req.query;
+    const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
+    const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const data = await CallLog.aggregate([
+      {
+        $match: {
+          userId,
+          status: 'completed',
+          startTime: { $gte: startDate },
+          'transcript.latencyMs': { $exists: true },
+        },
+      },
+      { $unwind: '$transcript' },
+      { $match: { 'transcript.latencyMs': { $gt: 0 } } },
+      {
+        $group: {
+          _id: '$transcript.role',
+          avgLatencyMs: { $avg: '$transcript.latencyMs' },
+          minLatencyMs: { $min: '$transcript.latencyMs' },
+          maxLatencyMs: { $max: '$transcript.latencyMs' },
+          p50: { $avg: '$transcript.latencyMs' }, // approx
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    // Overall avg
+    const overall = await CallLog.aggregate([
+      {
+        $match: {
+          userId,
+          status: 'completed',
+          startTime: { $gte: startDate },
+          'transcript.latencyMs': { $exists: true },
+        },
+      },
+      { $unwind: '$transcript' },
+      { $match: { 'transcript.latencyMs': { $gt: 0 } } },
+      {
+        $group: {
+          _id: null,
+          avgLatencyMs: { $avg: '$transcript.latencyMs' },
+          totalMessages: { $sum: 1 },
+        },
+      },
+    ]);
+
+    res.json({
+      success: true,
+      latency: {
+        byRole: data.reduce((acc, d) => ({ ...acc, [d._id]: d }), {}),
+        overall: overall[0] || { avgLatencyMs: 0, totalMessages: 0 },
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// @route   GET /api/analytics/qa-distribution
+// @desc    QA score distribution across all calls
+router.get('/qa-distribution', async (req, res, next) => {
+  try {
+    const userId = req.user._id;
+    const { period = '30d' } = req.query;
+    const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
+    const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+    const gradeDistribution = await CallLog.aggregate([
+      {
+        $match: {
+          userId,
+          startTime: { $gte: startDate },
+          'qa.grade': { $exists: true, $ne: '' },
+        },
+      },
+      { $group: { _id: '$qa.grade', count: { $sum: 1 } } },
+      { $sort: { _id: 1 } },
+    ]);
+
+    const avgScore = await CallLog.aggregate([
+      {
+        $match: {
+          userId,
+          startTime: { $gte: startDate },
+          'qa.score': { $exists: true, $gt: 0 },
+        },
+      },
+      { $group: { _id: null, avg: { $avg: '$qa.score' }, count: { $sum: 1 } } },
+    ]);
+
+    const tagDistribution = await CallLog.aggregate([
+      {
+        $match: {
+          userId,
+          startTime: { $gte: startDate },
+          tags: { $exists: true, $ne: [] },
+        },
+      },
+      { $unwind: '$tags' },
+      { $group: { _id: '$tags', count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 25 },
+    ]);
+
+    res.json({
+      success: true,
+      qa: {
+        gradeDistribution,
+        avgScore: avgScore[0]?.avg ? Math.round(avgScore[0].avg) : 0,
+        totalScored: avgScore[0]?.count || 0,
+      },
+      tagDistribution,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

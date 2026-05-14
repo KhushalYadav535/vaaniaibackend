@@ -169,4 +169,42 @@ router.post('/admin/cleanup', protect, async (req, res, next) => {
   }
 });
 
+/**
+ * GET /api/recordings/download/:filename
+ * Download a call recording saved by voiceSession
+ */
+router.get('/download/:filename', protect, async (req, res, next) => {
+  try {
+    const { filename } = req.params;
+
+    // Security: sanitize filename
+    if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+      return res.status(400).json({ success: false, message: 'Invalid filename' });
+    }
+
+    const recordingsDir = path.join(__dirname, '..', 'recordings');
+    const filePath = path.join(recordingsDir, filename);
+
+    if (!fs.existsSync(filePath)) {
+      return res.status(404).json({ success: false, message: 'Recording not found' });
+    }
+
+    // Verify the call belongs to this user
+    const callIdMatch = filename.match(/call_([a-f0-9]+)_/);
+    if (callIdMatch) {
+      const CallLog = require('../models/CallLog');
+      const call = await CallLog.findOne({ _id: callIdMatch[1], userId: req.user._id });
+      if (!call) {
+        return res.status(403).json({ success: false, message: 'Not authorized to access this recording' });
+      }
+    }
+
+    res.setHeader('Content-Type', 'audio/mpeg');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    fs.createReadStream(filePath).pipe(res);
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

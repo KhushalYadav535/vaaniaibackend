@@ -44,6 +44,9 @@ const path = require('path');
 // WebSocket
 const { setupVoiceSession } = require('./websocket/voiceSession');
 
+// WebRTC
+const { createWebRTCServer } = require('./websocket/webrtcSession');
+
 // Worker
 const campaignWorker = require('./services/campaignWorker');
 
@@ -51,10 +54,25 @@ const campaignWorker = require('./services/campaignWorker');
 const app = express();
 const server = http.createServer(app);
 
-// ─── WebSocket Setup ────────────────────────────────────────────────────────
-const wss = new WebSocket.Server({ server, path: '/ws/voice' });
-setupVoiceSession(wss);
-console.log('🔌 WebSocket server ready on /ws/voice');
+// ─── WebSocket Voice Session ───────────────────────────────────────────────
+const wss = new WebSocket.Server({
+  noServer: true,
+  path: '/voice',
+});
+
+// ─── WebRTC Session ─────────────────────────────────────────────────────────
+const webrtcWss = createWebRTCServer(server);
+
+server.on('upgrade', (request, socket, head) => {
+  if (request.url === '/voice') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      handleVoiceSession(ws, request);
+    });
+  } else if (request.url === '/webrtc') {
+    // WebRTC upgrade is handled by createWebRTCServer
+    return;
+  }
+});
 
 // ─── Middleware ─────────────────────────────────────────────────────────────
 app.use(helmet({
@@ -127,12 +145,16 @@ app.get('/', (req, res) => {
 });
 
 app.get('/health', (req, res) => {
+  const ttsService = require('./services/ttsService');
   res.json({
     success: true,
     status: 'healthy',
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     mongodb: require('mongoose').connection.readyState === 1 ? 'connected' : 'disconnected',
+    ttsCache: ttsService.getCacheStats(),
+    activeWsSessions: wss.clients ? wss.clients.size : 0,
+    memoryMB: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1),
   });
 });
 
@@ -156,6 +178,8 @@ app.use('/api/knowledge-base', knowledgeBaseRoutes);
 app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/crm', crmRoutes);
 app.use('/api/widget', widgetRoutes);
+const usageRoutes = require('./routes/usage');
+app.use('/api/usage', usageRoutes);
 
 // TTS Voice list (public - no auth needed)
 app.get('/api/voices', (req, res) => {
@@ -166,7 +190,12 @@ app.get('/api/voices', (req, res) => {
 // LLM Models list (public)
 app.get('/api/models', (req, res) => {
   const groqService = require('./services/groqService');
-  res.json({ success: true, models: groqService.constructor.getAvailableModels() });
+  const geminiService = require('./services/geminiService');
+  const models = [
+    ...groqService.constructor.getAvailableModels(),
+    ...geminiService.constructor.getAvailableModels(),
+  ];
+  res.json({ success: true, models });
 });
 
 // ─── 404 Handler ────────────────────────────────────────────────────────────
@@ -213,11 +242,43 @@ const startServer = async () => {
 
 startServer();
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
+// Graceful shutdown — close WS connections, flush DB, stop workers
+const gracefulShutdown = (signal) => {
+  console.log(`${signal} received. Shutting down gracefully...`);
+  
+  // 1. Stop accepting new connections
   server.close(() => {
-    console.log('Server closed.');
-    process.exit(0);
+    console.log('HTTP server closed.');
   });
-});
+
+  // 2. Close all active WebSocket connections
+  if (wss.clients) {
+    console.log(`Closing ${wss.clients.size} active WebSocket connections...`);
+    wss.clients.forEach((ws) => {
+      try {
+        ws.close(1001, 'Server shutting down');
+      } catch (e) { /* ignore */ }
+    });
+  }
+
+  // 3. Stop background workers
+  try { campaignWorker.stop?.(); } catch (e) { /* ignore */ }
+
+  // 4. Close MongoDB connection
+  const mongoose = require('mongoose');
+  mongoose.connection.close(false).then(() => {
+    console.log('MongoDB connection closed.');
+    process.exit(0);
+  }).catch(() => {
+    process.exit(1);
+  });
+
+  // Force exit after 10 seconds if graceful shutdown hangs
+  setTimeout(() => {
+    console.error('Forced exit after timeout.');
+    process.exit(1);
+  }, 10000);
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));

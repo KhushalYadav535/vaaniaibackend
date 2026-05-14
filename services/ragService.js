@@ -1,13 +1,15 @@
 /**
  * RAG Service (Retrieval-Augmented Generation)
  * 
- * Approach A: Groq keyword extraction + text search (no vector DB)
+ * Enhanced: Hybrid search with Gemini free embeddings + keywords
  * - Chunk text into overlapping segments
- * - Generate keywords/summary per chunk via Groq
- * - Search by keyword matching + Groq reranking
- * - Zero external dependencies (no OpenAI, no Pinecone)
+ * - Generate embeddings via Gemini (free text-embedding-004)
+ * - Hybrid search: keyword + semantic cosine similarity
+ * - Optional Groq reranking for best quality
+ * - Uses Gemini embeddings (768 dims) — completely free
  */
 const groqService = require('./groqService');
+const geminiService = require('./geminiService');
 const KnowledgeBase = require('../models/KnowledgeBase');
 const pdfParse = require('pdf-parse');
 
@@ -24,6 +26,111 @@ const pdfjsLib = require('pdfjs-dist/legacy/build/pdf.js');
 class RAGService {
   constructor() {
     this.contextCache = new Map();
+  }
+
+  /**
+   * Generate embedding for a single text using Gemini (free)
+   */
+  async generateEmbedding(text) {
+    try {
+      return await geminiService.generateEmbedding(text);
+    } catch (e) {
+      console.error('[RAG] Embedding generation failed:', e.message);
+      return null;
+    }
+  }
+
+  /**
+   * Generate embeddings for multiple texts (batch)
+   */
+  async generateEmbeddings(texts) {
+    try {
+      return await geminiService.generateEmbeddings(texts);
+    } catch (e) {
+      console.error('[RAG] Batch embedding generation failed:', e.message);
+      // Fallback: generate one by one
+      const results = [];
+      for (const text of texts) {
+        const emb = await this.generateEmbedding(text);
+        results.push(emb || []);
+      }
+      return results;
+    }
+  }
+
+  /**
+   * Calculate cosine similarity between two vectors
+   */
+  cosineSimilarity(vecA, vecB) {
+    if (!Array.isArray(vecA) || !Array.isArray(vecB) || vecA.length !== vecB.length) {
+      return 0;
+    }
+    let dotProduct = 0;
+    let normA = 0;
+    let normB = 0;
+    for (let i = 0; i < vecA.length; i++) {
+      dotProduct += vecA[i] * vecB[i];
+      normA += vecA[i] * vecA[i];
+      normB += vecB[i] * vecB[i];
+    }
+    if (normA === 0 || normB === 0) return 0;
+    return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+  }
+
+  /**
+   * Hybrid search: keyword + semantic similarity
+   */
+  async hybridSearch(query, knowledgeBaseId, topK = 3, semanticWeight = 0.6) {
+    const kb = await KnowledgeBase.findById(knowledgeBaseId);
+    if (!kb || kb.status !== 'ready' || !kb.chunks || kb.chunks.length === 0) {
+      return [];
+    }
+
+    // Generate query embedding
+    const queryEmbedding = await this.generateEmbedding(query);
+    if (!queryEmbedding) {
+      // Fallback to keyword-only search
+      return this.searchRelevantChunks(query, knowledgeBaseId, topK);
+    }
+
+    // Score each chunk
+    const scoredChunks = kb.chunks.map(chunk => {
+      let score = 0;
+      let semanticScore = 0;
+      let keywordScore = 0;
+
+      // Semantic similarity
+      if (chunk.embedding && Array.isArray(chunk.embedding)) {
+        semanticScore = this.cosineSimilarity(queryEmbedding, chunk.embedding);
+      }
+
+      // Keyword matching (existing logic)
+      const queryLower = query.toLowerCase();
+      const queryWords = queryLower.split(/\W+/).filter(w => w.length > 2);
+      const chunkLower = chunk.text.toLowerCase();
+      const chunkKeywords = (chunk.keywords || []).map(k => k.toLowerCase());
+
+      queryWords.forEach(word => {
+        if (chunkLower.includes(word)) keywordScore += 2;
+        if (chunkKeywords.includes(word)) keywordScore += 3;
+      });
+
+      // Hybrid score
+      score = (semanticScore * semanticWeight) + (keywordScore * (1 - semanticWeight));
+
+      return {
+        ...chunk.toObject ? chunk.toObject() : chunk,
+        score,
+        semanticScore,
+        keywordScore,
+      };
+    });
+
+    // Sort and return top K
+    return scoredChunks
+      .filter(c => c.score > 0)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topK);
   }
 
 
@@ -113,8 +220,8 @@ class RAGService {
   }
 
   /**
-   * Process a document: chunk → extract metadata → save
-   * Called after knowledge base content is uploaded
+   * Process a document: chunk → extract metadata → embeddings → save
+   * Enhanced with Gemini embeddings for semantic search
    */
   async processDocument(knowledgeBaseId) {
     const kb = await KnowledgeBase.findById(knowledgeBaseId);
@@ -130,13 +237,15 @@ class RAGService {
       const chunks = this.chunkText(kb.content);
       console.log(`[RAG] Created ${chunks.length} chunks`);
 
-      // 2. Generate metadata for each chunk (parallel, max 5 at a time)
+      // 2. Generate metadata + embeddings for each chunk (parallel, max 5 at a time)
       const processedChunks = [];
       const batchSize = 5;
 
       for (let i = 0; i < chunks.length; i += batchSize) {
         const batch = chunks.slice(i, i + batchSize);
-        const results = await Promise.all(
+        
+        // Generate metadata for batch
+        const metadataResults = await Promise.all(
           batch.map(async (chunk) => {
             const metadata = await this.generateChunkMetadata(chunk.text);
             return {
@@ -147,8 +256,19 @@ class RAGService {
             };
           })
         );
-        processedChunks.push(...results);
-        console.log(`[RAG] Processed ${Math.min(i + batchSize, chunks.length)}/${chunks.length} chunks`);
+
+        // Generate embeddings for batch texts
+        const batchTexts = metadataResults.map(c => c.text);
+        const embeddings = await this.generateEmbeddings(batchTexts);
+
+        // Combine metadata with embeddings
+        const enrichedResults = metadataResults.map((chunk, idx) => ({
+          ...chunk,
+          embedding: embeddings[idx] || [],
+        }));
+
+        processedChunks.push(...enrichedResults);
+        console.log(`[RAG] Processed ${Math.min(i + batchSize, chunks.length)}/${chunks.length} chunks (with embeddings)`);
       }
 
       // 3. Save chunks to KB
@@ -156,9 +276,10 @@ class RAGService {
       kb.totalChunks = processedChunks.length;
       kb.status = 'ready';
       kb.errorMessage = '';
+      kb.hasEmbeddings = true; // Flag to enable semantic search
       await kb.save();
 
-      console.log(`[RAG] KB ready: ${kb.name} — ${processedChunks.length} chunks`);
+      console.log(`[RAG] KB ready: ${kb.name} — ${processedChunks.length} chunks with embeddings`);
       return kb;
     } catch (error) {
       kb.status = 'error';
@@ -360,6 +481,7 @@ class RAGService {
   /**
    * Get context string for system prompt injection
    * Called during live calls to augment agent's knowledge
+   * Enhanced: Uses hybrid search when embeddings are available
    */
   async getContextForQuery(query, knowledgeBaseId) {
     if (!knowledgeBaseId) return '';
@@ -376,7 +498,20 @@ class RAGService {
 
     try {
       const topK = Number(process.env.RAG_TOP_K || 3);
-      const chunks = await this.searchRelevantChunks(normalizedQuery, knowledgeBaseId, topK);
+      let chunks = [];
+
+      // Check if KB has embeddings available
+      const kb = await KnowledgeBase.findById(knowledgeBaseId);
+      if (kb && kb.hasEmbeddings) {
+        // Use hybrid search (semantic + keywords)
+        chunks = await this.hybridSearch(normalizedQuery, knowledgeBaseId, topK);
+        console.log(`[RAG] Hybrid search: ${chunks.length} chunks (semantic+keywords)`);
+      } else {
+        // Fallback to keyword-only search
+        chunks = await this.searchRelevantChunks(normalizedQuery, knowledgeBaseId, topK);
+        console.log(`[RAG] Keyword search: ${chunks.length} chunks`);
+      }
+
       if (chunks.length === 0) return '';
 
       const contextStr = chunks

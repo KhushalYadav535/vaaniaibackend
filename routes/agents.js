@@ -135,4 +135,96 @@ router.post('/:id/duplicate', async (req, res, next) => {
   }
 });
 
+// ─── PROMPT PLAYGROUND ──────────────────────────────────────────────────────
+// POST /api/agents/playground
+// Test a system prompt + user message via LLM without a full voice call.
+// Completely free — uses Groq. Great for rapid prompt iteration.
+router.post('/playground', async (req, res, next) => {
+  try {
+    const { systemPrompt, userMessage, model = 'llama-3.1-8b-instant', temperature = 0.7, history = [] } = req.body;
+
+    if (!systemPrompt || !userMessage) {
+      return res.status(400).json({ success: false, message: 'systemPrompt and userMessage are required' });
+    }
+
+    const groqService = require('../services/groqService');
+
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      ...history.slice(-10).map(m => ({ role: m.role, content: m.content })),
+      { role: 'user', content: userMessage },
+    ];
+
+    const startMs = Date.now();
+    const response = await groqService.generateResponse({
+      messages,
+      model,
+      temperature: Math.max(0, Math.min(1, Number(temperature))),
+    });
+    const latencyMs = Date.now() - startMs;
+
+    res.json({
+      success: true,
+      response: response.text,
+      model: response.model || model,
+      latencyMs,
+      tokensUsed: response.usage || null,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─── PROMPT A/B TEST ────────────────────────────────────────────────────────
+// POST /api/agents/ab-test
+// Compare two system prompts side-by-side with the same user message.
+router.post('/ab-test', async (req, res, next) => {
+  try {
+    const { promptA, promptB, userMessage, model = 'llama-3.1-8b-instant', temperature = 0.7 } = req.body;
+
+    if (!promptA || !promptB || !userMessage) {
+      return res.status(400).json({ success: false, message: 'promptA, promptB, and userMessage are required' });
+    }
+
+    const groqService = require('../services/groqService');
+
+    const [resultA, resultB] = await Promise.all([
+      (async () => {
+        const start = Date.now();
+        const resp = await groqService.generateResponse({
+          messages: [
+            { role: 'system', content: promptA },
+            { role: 'user', content: userMessage },
+          ],
+          model,
+          temperature: Number(temperature),
+        });
+        return { response: resp.text, latencyMs: Date.now() - start };
+      })(),
+      (async () => {
+        const start = Date.now();
+        const resp = await groqService.generateResponse({
+          messages: [
+            { role: 'system', content: promptB },
+            { role: 'user', content: userMessage },
+          ],
+          model,
+          temperature: Number(temperature),
+        });
+        return { response: resp.text, latencyMs: Date.now() - start };
+      })(),
+    ]);
+
+    res.json({
+      success: true,
+      model,
+      userMessage,
+      resultA,
+      resultB,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 module.exports = router;

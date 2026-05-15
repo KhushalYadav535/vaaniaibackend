@@ -66,8 +66,8 @@ class DeepgramService {
     if (forceMulti) sttLanguage = 'multi';
 
     const fastTurnMode = String(process.env.FAST_TURN_MODE || 'false').toLowerCase() === 'true';
-    const defaultUtteranceEndMs = fastTurnMode ? 650 : 1200;
-    const defaultEndpointingMs  = fastTurnMode ? 250 : 400;
+    const defaultUtteranceEndMs = fastTurnMode ? 400 : 1200;
+    const defaultEndpointingMs  = fastTurnMode ? 200 : 400;
     const utteranceEndMs = Number(process.env.DEEPGRAM_UTTERANCE_END_MS || defaultUtteranceEndMs);
     const endpointingMs  = Number(process.env.DEEPGRAM_ENDPOINTING_MS  || defaultEndpointingMs);
     const minFinalChars  = Number(process.env.MIN_TRANSCRIPT_CHARS_FOR_FINAL || 2);

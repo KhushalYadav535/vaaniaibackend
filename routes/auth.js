@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 const User = require('../models/User');
 const { protect } = require('../middleware/auth');
 
@@ -11,22 +12,28 @@ const generateToken = (id) => {
   });
 };
 
-// @route   POST /api/auth/register
-// @access  Public
+// ✅ REGISTER
 router.post('/register', async (req, res, next) => {
   try {
     const { name, email, password } = req.body;
 
     if (!name || !email || !password) {
-      return res.status(400).json({ success: false, message: 'Please provide name, email and password' });
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide name, email and password',
+      });
     }
 
     const existingUser = await User.findOne({ email });
     if (existingUser) {
-      return res.status(400).json({ success: false, message: 'Email already registered' });
+      return res.status(400).json({
+        success: false,
+        message: 'Email already registered',
+      });
     }
 
     const user = await User.create({ name, email, password });
+
     const token = generateToken(user._id);
 
     res.status(201).json({
@@ -37,8 +44,6 @@ router.post('/register', async (req, res, next) => {
         name: user.name,
         email: user.email,
         role: user.role,
-        settings: user.settings,
-        createdAt: user.createdAt,
       },
     });
   } catch (error) {
@@ -46,45 +51,46 @@ router.post('/register', async (req, res, next) => {
   }
 });
 
-// @route   POST /api/auth/login
-// @access  Public
+// ✅ LOGIN (FINAL FIXED)
 router.post('/login', async (req, res, next) => {
   try {
+    console.log("🔥 LOGIN START");
+
     const { email, password } = req.body;
 
     if (!email || !password) {
-      return res.status(400).json({ success: false, message: 'Please provide email and password' });
+      return res.status(400).json({
+        success: false,
+        message: 'Please provide email and password',
+      });
     }
 
-    // Super Admin auto-creation
-    if (email === 'sdsiteadmin@sentientdigital.in' && password === 'Sentient1234@') {
-      let saUser = await User.findOne({ email });
-      if (!saUser) {
-        await User.create({
-          name: 'Super Admin',
-          email,
-          password,
-          role: 'super_admin'
-        });
-      } else if (saUser.role !== 'super_admin') {
-        saUser.role = 'super_admin';
-        await saUser.save();
-      }
-    }
-
+    // Fetch user
     const user = await User.findOne({ email }).select('+password');
+    console.log("✅ USER FETCHED");
+
     if (!user) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid email or password',
+      });
     }
 
-    const isMatch = await user.matchPassword(password);
+    // Compare password
+    const isMatch = await bcrypt.compare(password, user.password);
+    console.log("✅ PASSWORD CHECK DONE");
+
     if (!isMatch) {
-      return res.status(401).json({ success: false, message: 'Invalid email or password' });
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid email or password',
+      });
     }
 
     const token = generateToken(user._id);
+    console.log("✅ LOGIN SUCCESS");
 
-    res.json({
+    return res.json({
       success: true,
       token,
       user: {
@@ -92,45 +98,21 @@ router.post('/login', async (req, res, next) => {
         name: user.name,
         email: user.email,
         role: user.role,
-        settings: user.settings,
-        createdAt: user.createdAt,
       },
     });
+
   } catch (error) {
+    console.error("❌ LOGIN ERROR:", error);
     next(error);
   }
 });
 
-// @route   GET /api/auth/me
-// @access  Private
+// ✅ GET ME
 router.get('/me', protect, async (req, res) => {
   res.json({
     success: true,
-    user: {
-      id: req.user._id,
-      name: req.user.name,
-      email: req.user.email,
-      role: req.user.role,
-      settings: req.user.settings,
-      createdAt: req.user.createdAt,
-    },
+    user: req.user,
   });
-});
-
-// @route   PUT /api/auth/profile
-// @access  Private
-router.put('/profile', protect, async (req, res, next) => {
-  try {
-    const { name, email } = req.body;
-    const user = await User.findByIdAndUpdate(
-      req.user._id,
-      { name, email },
-      { new: true, runValidators: true }
-    );
-    res.json({ success: true, user });
-  } catch (error) {
-    next(error);
-  }
 });
 
 module.exports = router;

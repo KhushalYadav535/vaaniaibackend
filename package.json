@@ -35,9 +35,9 @@
     "twilio": "^5.0.4",
     "uuid": "^9.0.1",
     "winston": "^3.19.0",
-    "ws": "^8.16.0"
+    "ws": "^8.20.1"
   },
   "devDependencies": {
-    "nodemon": "^3.1.0"
+    "nodemon": "^3.1.14"
   }
 }

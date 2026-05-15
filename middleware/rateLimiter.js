@@ -3,14 +3,23 @@
  * Prevents abuse and ensures fair usage across the platform
  */
 const rateLimit = require('express-rate-limit');
-const RedisStore = require('rate-limit-redis');
+const { RedisStore } = require('rate-limit-redis');
 const redis = require('redis');
 
 // Initialize Redis client (optional - falls back to memory)
 let redisClient = null;
+
 if (process.env.REDIS_URL) {
   redisClient = redis.createClient({ url: process.env.REDIS_URL });
-  redisClient.connect().catch(err => console.warn('⚠️ Redis connection failed:', err.message));
+
+  (async () => {
+    try {
+      await redisClient.connect();
+      console.log('✅ Redis Connected');
+    } catch (err) {
+      console.warn('⚠️ Redis connection failed:', err.message);
+    }
+  })();
 }
 
 // ─── GLOBAL RATE LIMITERS ───────────────────────────────────────────────
@@ -19,37 +28,38 @@ if (process.env.REDIS_URL) {
  * Global API limiter - 100 requests per 15 minutes
  */
 const globalLimiter = rateLimit({
-  ...(redisClient ? {
-    store: new RedisStore({
-      client: redisClient,
-      prefix: 'rl:global:',
-    }),
-  } : {}),
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  ...(redisClient
+    ? {
+        store: new RedisStore({
+          prefix: 'rl:global:',
+          sendCommand: (...args) => redisClient.sendCommand(args),
+        }),
+      }
+    : {}),
+  windowMs: 15 * 60 * 1000,
   max: 100,
   message: { error: 'Too many requests, please try again later.' },
   standardHeaders: true,
   legacyHeaders: false,
-  skip: (req) => {
-    // Skip rate limiting for health checks
-    return req.path === '/health';
-  },
+  skip: (req) => req.path === '/health',
 });
 
 /**
  * Auth endpoint limiter - 5 attempts per 15 minutes
  */
 const authLimiter = rateLimit({
-  ...(redisClient ? {
-    store: new RedisStore({
-      client: redisClient,
-      prefix: 'rl:auth:',
-    }),
-  } : {}),
+  ...(redisClient
+    ? {
+        store: new RedisStore({
+          prefix: 'rl:auth:',
+          sendCommand: (...args) => redisClient.sendCommand(args),
+        }),
+      }
+    : {}),
   windowMs: 15 * 60 * 1000,
   max: 5,
   message: { error: 'Too many login attempts, please try again later.' },
-  skipSuccessfulRequests: true, // Don't count successful logins
+  skipSuccessfulRequests: true,
 });
 
 /**
@@ -57,22 +67,23 @@ const authLimiter = rateLimit({
  */
 const createUserLimiter = (options = {}) => {
   const {
-    windowMs = 60 * 60 * 1000, // 1 hour
+    windowMs = 60 * 60 * 1000,
     max = 1000,
     message = 'API rate limit exceeded',
   } = options;
 
   return rateLimit({
-    ...(redisClient ? {
-      store: new RedisStore({
-        client: redisClient,
-        prefix: 'rl:user:',
-      }),
-    } : {}),
+    ...(redisClient
+      ? {
+          store: new RedisStore({
+            prefix: 'rl:user:',
+            sendCommand: (...args) => redisClient.sendCommand(args),
+          }),
+        }
+      : {}),
     windowMs,
     max,
     keyGenerator: (req) => {
-      // Use user ID if authenticated, otherwise use IP
       return req.user?._id?.toString() || req.ip;
     },
     message: { error: message },
@@ -82,8 +93,7 @@ const createUserLimiter = (options = {}) => {
 };
 
 /**
- * Voice call limiter - prevent abuse of calling features
- * 50 outbound calls per hour per user
+ * Voice call limiter
  */
 const voiceCallLimiter = createUserLimiter({
   windowMs: 60 * 60 * 1000,
@@ -92,7 +102,7 @@ const voiceCallLimiter = createUserLimiter({
 });
 
 /**
- * Campaign limiter - 5 campaigns per hour
+ * Campaign limiter
  */
 const campaignLimiter = createUserLimiter({
   windowMs: 60 * 60 * 1000,
@@ -100,14 +110,12 @@ const campaignLimiter = createUserLimiter({
   message: 'Campaign creation limit exceeded.',
 });
 
-/**
- * WebSocket connection limiter
- * Track active connections per user
- */
+// ─── WebSocket Rate Limiter ─────────────────────────────────────────────
+
 class WebSocketRateLimiter {
   constructor(maxConnectionsPerUser = 5) {
     this.maxConnections = maxConnectionsPerUser;
-    this.connections = new Map(); // userId -> Set of connectionIds
+    this.connections = new Map();
   }
 
   canConnect(userId) {
@@ -143,10 +151,6 @@ const wsRateLimiter = new WebSocketRateLimiter(5);
 
 // ─── CUSTOM LIMITERS ────────────────────────────────────────────────────
 
-/**
- * Create a burst limiter for temporary spikes
- * Allows higher throughput in short bursts
- */
 const createBurstLimiter = (burstSize = 10, window = 60000) => {
   return rateLimit({
     windowMs: window,
@@ -157,30 +161,23 @@ const createBurstLimiter = (burstSize = 10, window = 60000) => {
   });
 };
 
-/**
- * Create sliding window counter for precise rate limiting
- */
 class SlidingWindowLimiter {
   constructor(maxRequests, windowMs) {
     this.maxRequests = maxRequests;
     this.windowMs = windowMs;
-    this.requests = new Map(); // key -> array of timestamps
+    this.requests = new Map();
   }
 
   isLimited(key) {
     const now = Date.now();
     const userRequests = this.requests.get(key) || [];
 
-    // Remove expired requests
     const activeRequests = userRequests.filter(
-      timestamp => now - timestamp < this.windowMs
+      (timestamp) => now - timestamp < this.windowMs
     );
 
-    if (activeRequests.length >= this.maxRequests) {
-      return true; // Limited
-    }
+    if (activeRequests.length >= this.maxRequests) return true;
 
-    // Add current request
     activeRequests.push(now);
     this.requests.set(key, activeRequests);
     return false;
@@ -189,19 +186,23 @@ class SlidingWindowLimiter {
   getRemainingRequests(key) {
     const now = Date.now();
     const userRequests = this.requests.get(key) || [];
+
     const activeRequests = userRequests.filter(
-      timestamp => now - timestamp < this.windowMs
+      (timestamp) => now - timestamp < this.windowMs
     );
+
     return Math.max(0, this.maxRequests - activeRequests.length);
   }
 }
 
-const slidingWindowLimiter = new SlidingWindowLimiter(1000, 60 * 60 * 1000); // 1000 per hour
+const slidingWindowLimiter = new SlidingWindowLimiter(
+  1000,
+  60 * 60 * 1000
+);
 
-// ─── MIDDLEWARE EXPORTS ─────────────────────────────────────────────────
+// ─── EXPORTS ────────────────────────────────────────────────────────────
 
 module.exports = {
-  // Limiters
   globalLimiter,
   authLimiter,
   createUserLimiter,
@@ -211,21 +212,18 @@ module.exports = {
   createBurstLimiter,
   slidingWindowLimiter,
 
-  /**
-   * Middleware to attach rate limit info to response
-   */
   attachRateLimitInfo: (req, res, next) => {
     const remaining = slidingWindowLimiter.getRemainingRequests(
       req.user?._id?.toString() || req.ip
     );
     res.set('X-RateLimit-Remaining', remaining.toString());
-    res.set('X-RateLimit-Reset', new Date(Date.now() + 60 * 60 * 1000).toISOString());
+    res.set(
+      'X-RateLimit-Reset',
+      new Date(Date.now() + 60 * 60 * 1000).toISOString()
+    );
     next();
   },
 
-  /**
-   * Graceful handler when rate limit is exceeded
-   */
   handleRateLimitExceeded: (req, res) => {
     const retryAfter = req.rateLimit?.resetTime
       ? Math.ceil((req.rateLimit.resetTime - Date.now()) / 1000)

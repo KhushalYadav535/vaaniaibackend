@@ -133,6 +133,11 @@ async function handleMessage(session, message) {
       await handleTextInput(session, message.text);
       break;
 
+    case 'interrupt':
+    case 'barge_in':
+      handleClientInterrupt(session);
+      break;
+
     case 'end_session':
       await handleEndSession(session, 'user_hangup');
       break;
@@ -240,7 +245,7 @@ async function handleMicConfig(session, message) {
 
 
 async function handleInit(session, message) {
-  const { agentId, token, preferBinaryAudio, enableStt = true, skipPostCallAnalysis = false } = message;
+  const { agentId, token, preferBinaryAudio, enableStt = true, skipPostCallAnalysis = false, streamProtocol = false } = message;
 
   // Verify JWT token
   let decoded;
@@ -269,6 +274,7 @@ async function handleInit(session, message) {
   session.userSettings = user.settings || {};
   session.prefersBinaryAudio = !!preferBinaryAudio;
   session.enableStt = enableStt !== false;
+  session.streamProtocol = !!streamProtocol;
   session.skipPostCallAnalysis = !!skipPostCallAnalysis;
   session.status = 'ready';
   
@@ -390,7 +396,7 @@ async function handleInit(session, message) {
                 console.error('Error processing interrupt silence-timer transcript:', e);
                 session.isProcessing = false;
               }
-            }, 900);
+            }, 500);
           }
           // Whether we interrupted or not, don't fall through to normal processing
           return;
@@ -449,7 +455,7 @@ async function handleInit(session, message) {
             console.error("Error processing silence-timer transcript:", e);
             session.isProcessing = false;
           }
-        }, 1200);
+        }, 600);
 
       },
     onError: (err) => {
@@ -625,6 +631,25 @@ async function handleTextInput(session, text) {
   await processTranscript(session, text.trim());
 }
 
+function handleClientInterrupt(session) {
+  session.currentGenerationId = uuidv4();
+  session.agentSpeaking = false;
+  session.isProcessing = false;
+  session._lastSttTranscript = '';
+
+  if (session._silenceTimer) {
+    clearTimeout(session._silenceTimer);
+    session._silenceTimer = null;
+  }
+  if (session._agentSpeakingTimer) {
+    clearTimeout(session._agentSpeakingTimer);
+    session._agentSpeakingTimer = null;
+  }
+
+  safeSend(session.ws, { type: 'interrupt' });
+  safeSend(session.ws, { type: 'clear_audio' });
+}
+
 async function processTranscript(session, transcript) {
   try {
     // Cancel any ongoing generation
@@ -639,19 +664,22 @@ async function processTranscript(session, transcript) {
       role: 'user',
     });
 
-    // Handle Backchanneling (Vapi/Retell style)
+    // Handle Backchanneling (Vapi/Retell style) — NON-BLOCKING to avoid delaying LLM
     if (session.agent.advanced?.backchanneling) {
       const backchannel = voicePipeline.getBackchannel(transcript);
       if (backchannel) {
-        console.log(`[Backchannel] Sending: ${backchannel}`);
-        const audio = await ttsService.textToSpeech({
+        console.log(`[Backchannel] Sending (async): ${backchannel}`);
+        ttsService.textToSpeech({
           text: backchannel,
           voiceId: session.agent.voice?.voiceId,
-          speed: 1.2, // Slightly faster for backchannels
+          speed: 1.2,
           apiKey: session.userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
           provider: session.agent.voice?.provider || 'edge-tts',
-        });
-        if (audio) sendAudioBuffer(session, audio);
+        }).then(audio => {
+          if (audio && session.currentGenerationId === generationId) {
+            sendAudioChunkOnly(session, audio);
+          }
+        }).catch(e => console.error('[Backchannel TTS Error]', e.message));
       }
     }
 
@@ -731,6 +759,8 @@ async function processTranscript(session, transcript) {
           }).catch(e => console.error('Transfer log error:', e.message));
         }
 
+
+
         // Say transfer message and end
         const transferMsg = `I'm going to connect you with a team member who can better assist you. Please hold for a moment.`;
         safeSend(session.ws, { type: 'response_text', text: transferMsg });
@@ -758,18 +788,21 @@ async function processTranscript(session, transcript) {
 
     safeSend(session.ws, { type: 'status', message: '💭 AI is thinking...' });
     session.latency.llmStartedAt = Date.now();
+    console.log(`[⏱️ LATENCY] STT→Pipeline: ${session.latency.llmStartedAt - session.latency.turnStartedAt}ms`);
 
     // Fetch RAG context if agent has a Knowledge Base
     let ragContext = '';
     if (session.agent?.knowledgeBaseId) {
+      const _ragStart = Date.now();
       try {
         ragContext = await ragService.getContextForQuery(transcript, session.agent.knowledgeBaseId);
         if (ragContext) {
-          console.log(`[RAG] Retrieved context for session ${session.id}`);
+          console.log(`[RAG] Retrieved context for session ${session.id} (${Date.now() - _ragStart}ms)`);
         }
       } catch (e) {
         console.error(`[RAG] Context retrieval error:`, e.message);
       }
+      console.log(`[⏱️ LATENCY] RAG lookup: ${Date.now() - _ragStart}ms`);
     }
 
     // Process through voice pipeline using STREAMING (Much faster) or Call Flow Engine
@@ -805,14 +838,21 @@ async function processTranscript(session, transcript) {
 
         if (!session.latency.firstTextChunkAt) {
           session.latency.firstTextChunkAt = Date.now();
+          console.log(`[⏱️ LATENCY] Pipeline→FirstText: ${session.latency.firstTextChunkAt - session.latency.llmStartedAt}ms | Total STT→Text: ${session.latency.firstTextChunkAt - session.latency.turnStartedAt}ms`);
           emitLatencyMetrics(session, 'first_text_chunk');
         }
 
-        // Send this sentence's text and audio immediately
-        safeSend(session.ws, {
-          type: 'response_text_chunk',
-          text: chunk.text,
-        });
+        if (session.streamProtocol) {
+          safeSend(session.ws, {
+            type: 'text_stream',
+            content: chunk.text,
+          });
+        } else {
+          safeSend(session.ws, {
+            type: 'response_text_chunk',
+            text: chunk.text,
+          });
+        }
 
         fullResponseText += chunk.text + ' ';
 
@@ -837,7 +877,7 @@ async function processTranscript(session, transcript) {
         }
 
         if (audioToPlay && audioToPlay.length > 0) {
-           sendAudioBuffer(session, audioToPlay);
+           sendAudioBuffer(session, audioToPlay, false); // false = don't send audio_end yet
         }
       } else if (chunk.type === 'final') {
         fullResponseText = chunk.fullText;
@@ -881,6 +921,14 @@ async function processTranscript(session, transcript) {
       }
     }
     
+    // Only send the final audio_end signal once all chunks have completed generating
+    safeSend(session.ws, { type: session.streamProtocol ? 'audio_stream_end' : 'audio_end' });
+    if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
+    session._agentSpeakingTimer = setTimeout(() => {
+      session.agentSpeaking = false;
+      session._lastSttTranscript = '';
+    }, 1000);
+
     fullResponseText = fullResponseText.trim();
 
     // Add AI response to history
@@ -891,11 +939,14 @@ async function processTranscript(session, transcript) {
       $push: { transcript: { role: 'assistant', content: fullResponseText } }
     }, 'assistant_transcript');
 
-    // Send final response text for UI consistency
-    safeSend(session.ws, {
-      type: 'response_text',
-      text: fullResponseText,
-    });
+    if (session.streamProtocol) {
+      safeSend(session.ws, { type: 'text_stream_end', content: fullResponseText });
+    } else {
+      safeSend(session.ws, {
+        type: 'response_text',
+        text: fullResponseText,
+      });
+    }
 
     session.status = 'listening';
     safeSend(session.ws, { type: 'status', message: '🎙️ Listening...' });
@@ -1128,14 +1179,36 @@ function safeSend(ws, data) {
   }
 }
 
-function sendAudioBuffer(session, buffer) {
+/**
+ * Send audio chunk WITHOUT audio_end — used for intermediate chunks (backchannels, mid-stream).
+ * Does NOT reset agentSpeaking timer.
+ */
+function sendAudioChunkOnly(session, buffer) {
+  if (session.fullAudioBuffer) session.fullAudioBuffer.push(buffer);
+  session.agentSpeaking = true;
+
+  const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
+  if (session.ws.bufferedAmount > maxBufferedBytes) return;
+
+  if (session.prefersBinaryAudio) {
+    safeSendBinary(session.ws, buffer);
+  } else {
+    const base64Audio = buffer.toString('base64');
+    if (session.streamProtocol) {
+      safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio });
+    } else {
+      safeSend(session.ws, { type: 'audio', data: base64Audio });
+    }
+  }
+}
+
+function sendAudioBuffer(session, buffer, isFinal = true) {
   // Save for full call recording (Retell style)
   if (session.fullAudioBuffer) {
     session.fullAudioBuffer.push(buffer);
   }
 
   // Mark agent as speaking — mutes STT processing to prevent echo loop
-  // (mic picking up TTS audio → Deepgram transcribes it → agent responds to itself)
   session.agentSpeaking = true;
 
   const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
@@ -1154,27 +1227,34 @@ function sendAudioBuffer(session, buffer) {
   if (session.prefersBinaryAudio) {
     safeSendBinary(session.ws, buffer);
   } else {
-    // Backward-compatible JSON/base64 audio for existing clients
-    safeSend(session.ws, {
-      type: 'audio',
-      data: buffer.toString('base64'),
-    });
+    const base64Audio = buffer.toString('base64');
+    if (session.streamProtocol) {
+      safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio });
+    } else {
+      safeSend(session.ws, { type: 'audio', data: base64Audio });
+    }
   }
 
   if (!session.latency.firstAudioAt) {
     session.latency.firstAudioAt = Date.now();
+    console.log(`[⏱️ LATENCY] Pipeline→FirstAudio: ${session.latency.firstAudioAt - session.latency.llmStartedAt}ms | Total STT→Audio: ${session.latency.firstAudioAt - session.latency.turnStartedAt}ms`);
     emitLatencyMetrics(session, 'first_audio');
   }
   
-  safeSend(session.ws, { type: 'audio_end' });
+  if (isFinal) {
+    safeSend(session.ws, { type: session.streamProtocol ? 'audio_stream_end' : 'audio_end' });
 
-  // After audio_end, give 500ms for TTS to finish playing on frontend
-  // before allowing STT to process again (accounts for network + playback delay)
-  if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
-  session._agentSpeakingTimer = setTimeout(() => {
-    session.agentSpeaking = false;
-    session._lastSttTranscript = ''; // Clear any echo that accumulated during TTS
-  }, 1500);
+    // Increased to 1000ms: allows frontend TTS buffers to finish playing before STT listens again
+    // Prevents "agent interrupted" echo loops
+    if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
+    session._agentSpeakingTimer = setTimeout(() => {
+      session.agentSpeaking = false;
+      session._lastSttTranscript = ''; // Clear any echo that accumulated
+    }, 1000);
+  } else {
+    // Keep agentSpeaking=true indefinitely while streaming chunks
+    if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
+  }
 }
 
 

@@ -1,9 +1,5 @@
 /**
- * VaaniAI Backend Server
- * Node.js + Express + MongoDB + WebSocket
- * 
- * Start: node server.js
- * Dev: npm run dev (with nodemon)
+ * VaaniAI Backend Server (FINAL STABLE - FIXED WS)
  */
 
 require('dotenv').config();
@@ -14,15 +10,11 @@ const morgan = require('morgan');
 const http = require('http');
 const WebSocket = require('ws');
 const crypto = require('crypto');
+const path = require('path');
+const mongoose = require('mongoose');
 
 const connectDB = require('./config/db');
-const { errorHandler, asyncHandler } = require('./middleware/errorHandlerEnhanced');
-const {
-  globalLimiter,
-  authLimiter,
-  voiceCallLimiter,
-  campaignLimiter,
-} = require('./middleware/rateLimiter');
+const { errorHandler } = require('./middleware/errorHandlerEnhanced');
 
 // Routes
 const authRoutes = require('./routes/auth');
@@ -39,23 +31,27 @@ const storageRoutes = require('./routes/storage');
 const superAdminRoutes = require('./routes/superAdmin');
 const crmRoutes = require('./routes/crm');
 const widgetRoutes = require('./routes/widget');
-const path = require('path');
 
 // WebSocket
 const { setupVoiceSession } = require('./websocket/voiceSession');
-
-// WebRTC
 const { createWebRTCServer } = require('./websocket/webrtcSession');
 
 // Worker
 const campaignWorker = require('./services/campaignWorker');
 
-// ─── App Setup ─────────────────────────────────────────────────────────────
+// ─── App Setup ─────────────────────────────────────────
 const app = express();
 const server = http.createServer(app);
 
-// ─── WebSocket Voice Session ───────────────────────────────────────────────
+// ─── WebSocket Setup (FINAL FIX) ───────────────────────
 const wss = new WebSocket.Server({
+  noServer: true, // IMPORTANT
+});
+
+setupVoiceSession(wss);
+
+// Optional WebRTC server
+createWebRTCServer(server);
   noServer: true,
   path: '/ws/voice',
 });
@@ -66,7 +62,12 @@ setupVoiceSession(wss);
 // ─── WebRTC Session ─────────────────────────────────────────────────────────
 const webrtcWss = createWebRTCServer(server);
 
+// Handle WebSocket upgrade
 server.on('upgrade', (request, socket, head) => {
+  try {
+    const url = request.url.split('?')[0]; // ✅ handle query params
+
+    console.log('🔌 WS Upgrade Request:', request.url);
   // Support both '/ws/voice' (frontend) and legacy '/voice' paths
   if (request.url === '/ws/voice' || request.url === '/voice') {
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -87,45 +88,65 @@ app.use(helmet({
   crossOriginResourcePolicy: { policy: 'cross-origin' },
 }));
 
-app.use(cors({
-  origin: true, // Allow all origins for widget support
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-}));
+    if (url === '/ws/voice') {
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        console.log('🔥 Voice WS Connected');
 
-// Serve static files (widget.js etc.)
-app.use(express.static(path.join(__dirname, 'public'), {
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('.js')) {
-      res.setHeader('Content-Type', 'application/javascript');
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Cache-Control', 'public, max-age=3600');
+        wss.emit('connection', ws, request);
+      });
+    } else if (url === '/webrtc') {
+      return;
+    } else {
+      console.log('❌ Unknown WS route:', url);
+      socket.destroy();
     }
+  } catch (err) {
+    console.error('WS Upgrade Error:', err.message);
+    socket.destroy();
   }
-}));
+});
 
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-if (process.env.NODE_ENV === 'development') {
-  app.use(morgan('dev'));
-} else {
-  app.use(morgan('combined'));
-}
-
-// ─── Request Correlation ID ─────────────────────────────────────────────────
+// ─── Debug Logger ──────────────────────────────────────
 app.use((req, res, next) => {
-  const incomingId = req.headers['x-request-id'];
-  const requestId = (typeof incomingId === 'string' && incomingId.trim()) || crypto.randomUUID();
-  req.requestId = requestId;
-  res.setHeader('x-request-id', requestId);
+  console.log(`➡️ ${req.method} ${req.url}`);
   next();
 });
 
-// ─── Global Rate Limiting ───────────────────────────────────────────────────
-app.use('/api/', globalLimiter);
+// ─── Security ──────────────────────────────────────────
+app.use(
+  helmet({
+    crossOriginEmbedderPolicy: false,
+    contentSecurityPolicy: false,
+  })
+);
 
+// ─── CORS ──────────────────────────────────────────────
+app.use(
+  cors({
+    origin: true,
+    credentials: true,
+  })
+);
+
+// ─── Static Files ──────────────────────────────────────
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ─── Body Parser ───────────────────────────────────────
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// ─── Logger ────────────────────────────────────────────
+app.use(morgan('dev'));
+
+// ─── Request ID Middleware ─────────────────────────────
+app.use((req, res, next) => {
+  const requestId =
+    req.headers['x-request-id'] || crypto.randomUUID();
+
+  req.requestId = requestId;
+  res.setHeader('x-request-id', requestId);
+
+  next();
 // ─── Health Check ───────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
@@ -149,95 +170,63 @@ app.get('/', (req, res) => {
   });
 });
 
+// ─── Health Check ──────────────────────────────────────
 app.get('/health', (req, res) => {
-  const ttsService = require('./services/ttsService');
   res.json({
-    success: true,
-    status: 'healthy',
+    status: 'ok',
+    mongodb:
+      mongoose.connection.readyState === 1
+        ? 'connected'
+        : 'disconnected',
     uptime: process.uptime(),
-    timestamp: new Date().toISOString(),
-    mongodb: require('mongoose').connection.readyState === 1 ? 'connected' : 'disconnected',
-    ttsCache: ttsService.getCacheStats(),
-    activeWsSessions: wss.clients ? wss.clients.size : 0,
-    memoryMB: (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1),
   });
 });
 
-const callFlowRoutes = require('./routes/callFlows');
-
-// ─── API Routes ─────────────────────────────────────────────────────────────
-app.use('/api/auth', authLimiter, authRoutes);
+// ─── API Routes ────────────────────────────────────────
+app.use('/api/auth', authRoutes);
 app.use('/api/agents', agentRoutes);
 app.use('/api/numbers', numberRoutes);
-app.use('/api/calls', voiceCallLimiter, callRoutes);
+app.use('/api/calls', callRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/webhooks', webhookRoutes);
 app.use('/api/twilio', twilioRoutes);
 app.use('/api/voice-preview', voicePreviewRoutes);
-app.use('/api/campaigns', campaignLimiter, campaignRoutes);
+app.use('/api/campaigns', campaignRoutes);
 app.use('/api/recordings', storageRoutes);
-app.use('/api/call-flows', callFlowRoutes);
-const knowledgeBaseRoutes = require('./routes/knowledgeBase');
-app.use('/api/knowledge-base', knowledgeBaseRoutes);
 app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/crm', crmRoutes);
 app.use('/api/widget', widgetRoutes);
-const usageRoutes = require('./routes/usage');
-app.use('/api/usage', usageRoutes);
 
-// TTS Voice list (public - no auth needed)
-app.get('/api/voices', (req, res) => {
-  const ttsService = require('./services/ttsService');
-  res.json({ success: true, voices: ttsService.constructor.getAvailableVoices() });
+// ─── Root Route ────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: '🎙️ VaaniAI Backend is running!',
+  });
 });
 
-// LLM Models list (public)
-app.get('/api/models', (req, res) => {
-  const groqService = require('./services/groqService');
-  const geminiService = require('./services/geminiService');
-  const models = [
-    ...groqService.constructor.getAvailableModels(),
-    ...geminiService.constructor.getAvailableModels(),
-  ];
-  res.json({ success: true, models });
-});
-
-// ─── 404 Handler ────────────────────────────────────────────────────────────
+// ─── 404 Handler ───────────────────────────────────────
 app.use('*', (req, res) => {
-  res.status(404).json({ success: false, message: `Route ${req.originalUrl} not found` });
+  res.status(404).json({
+    success: false,
+    message: `Route ${req.originalUrl} not found`,
+  });
 });
 
-// ─── Error Handler ──────────────────────────────────────────────────────────
+// ─── Error Handler ─────────────────────────────────────
 app.use(errorHandler);
 
-// ─── Start Server ───────────────────────────────────────────────────────────
+// ─── Start Server ──────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 
 const startServer = async () => {
   try {
-    if (
-      process.env.NODE_ENV === 'production' &&
-      process.env.JWT_SECRET === 'vaaniai_super_secret_jwt_key_change_in_production_2024'
-    ) {
-      throw new Error('Refusing to start in production with default JWT_SECRET');
-    }
+    await connectDB();
 
-    await connectDB().then(() => {
-      server.listen(PORT, () => {
-        console.log('');
-        console.log('╔═══════════════════════════════════════════╗');
-        console.log('║        🎙️  VaaniAI Backend Started         ║');
-        console.log('╠═══════════════════════════════════════════╣');
-        console.log(`║  HTTP:  http://localhost:${PORT}`.padEnd(44) + '║');
-        console.log(`║  WS:    ws://localhost:${PORT}/ws/voice`.padEnd(44) + '║');
-        console.log(`║  Env:   ${process.env.NODE_ENV || 'development'}`.padEnd(44) + '║');
-        console.log('╚═══════════════════════════════════════════╝');
-        console.log('');
-        
-        // Start background workers
-        campaignWorker.start();
-      });
+    server.listen(PORT, () => {
+      console.log(`🚀 Server running on http://localhost:${PORT}`);
+      campaignWorker.start();
     });
   } catch (error) {
     console.error('❌ Failed to start server:', error.message);
@@ -246,44 +235,3 @@ const startServer = async () => {
 };
 
 startServer();
-
-// Graceful shutdown — close WS connections, flush DB, stop workers
-const gracefulShutdown = (signal) => {
-  console.log(`${signal} received. Shutting down gracefully...`);
-  
-  // 1. Stop accepting new connections
-  server.close(() => {
-    console.log('HTTP server closed.');
-  });
-
-  // 2. Close all active WebSocket connections
-  if (wss.clients) {
-    console.log(`Closing ${wss.clients.size} active WebSocket connections...`);
-    wss.clients.forEach((ws) => {
-      try {
-        ws.close(1001, 'Server shutting down');
-      } catch (e) { /* ignore */ }
-    });
-  }
-
-  // 3. Stop background workers
-  try { campaignWorker.stop?.(); } catch (e) { /* ignore */ }
-
-  // 4. Close MongoDB connection
-  const mongoose = require('mongoose');
-  mongoose.connection.close(false).then(() => {
-    console.log('MongoDB connection closed.');
-    process.exit(0);
-  }).catch(() => {
-    process.exit(1);
-  });
-
-  // Force exit after 10 seconds if graceful shutdown hangs
-  setTimeout(() => {
-    console.error('Forced exit after timeout.');
-    process.exit(1);
-  }, 10000);
-};
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));

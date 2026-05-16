@@ -1,5 +1,5 @@
 /**
- * VaaniAI Backend Server (FINAL STABLE - FIXED WS)
+ * VaaniAI Backend Server
  */
 
 require('dotenv').config();
@@ -16,7 +16,7 @@ const mongoose = require('mongoose');
 const connectDB = require('./config/db');
 const { errorHandler } = require('./middleware/errorHandlerEnhanced');
 
-// Routes
+// ─── Routes ────────────────────────────────────────────────────────────────
 const authRoutes = require('./routes/auth');
 const agentRoutes = require('./routes/agents');
 const numberRoutes = require('./routes/numbers');
@@ -32,69 +32,40 @@ const superAdminRoutes = require('./routes/superAdmin');
 const crmRoutes = require('./routes/crm');
 const widgetRoutes = require('./routes/widget');
 
-// WebSocket
+// ─── WebSocket Handlers ─────────────────────────────────────────────────────
 const { setupVoiceSession } = require('./websocket/voiceSession');
 const { createWebRTCServer } = require('./websocket/webrtcSession');
 
-// Worker
+// ─── Worker ─────────────────────────────────────────────────────────────────
 const campaignWorker = require('./services/campaignWorker');
 
-// ─── App Setup ─────────────────────────────────────────
+// ─── App & HTTP Server ──────────────────────────────────────────────────────
 const app = express();
 const server = http.createServer(app);
 
-// ─── WebSocket Setup (FINAL FIX) ───────────────────────
-const wss = new WebSocket.Server({
-  noServer: true, // IMPORTANT
-});
+// ─── WebSocket Setup ────────────────────────────────────────────────────────
+const wss = new WebSocket.Server({ noServer: true });
 
+// Register the voice session connection handler
 setupVoiceSession(wss);
 
-// Optional WebRTC server
+// Register the WebRTC server (handles its own upgrade internally)
 createWebRTCServer(server);
-  noServer: true,
-  path: '/ws/voice',
-});
 
-// Wire up the voice session handler — this registers the 'connection' event
-setupVoiceSession(wss);
-
-// ─── WebRTC Session ─────────────────────────────────────────────────────────
-const webrtcWss = createWebRTCServer(server);
-
-// Handle WebSocket upgrade
+// Route WebSocket upgrade requests
 server.on('upgrade', (request, socket, head) => {
   try {
-    const url = request.url.split('?')[0]; // ✅ handle query params
+    const url = request.url.split('?')[0]; // strip query params
 
-    console.log('🔌 WS Upgrade Request:', request.url);
-  // Support both '/ws/voice' (frontend) and legacy '/voice' paths
-  if (request.url === '/ws/voice' || request.url === '/voice') {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit('connection', ws, request);
-    });
-  } else if (request.url === '/webrtc') {
-    // WebRTC upgrade is handled by createWebRTCServer
-    return;
-  }
-});
+    console.log('🔌 WS Upgrade Request:', url);
 
-
-// ─── Middleware ─────────────────────────────────────────────────────────────
-app.use(helmet({
-  crossOriginEmbedderPolicy: false,
-  contentSecurityPolicy: false,
-  crossOriginOpenerPolicy: false,
-  crossOriginResourcePolicy: { policy: 'cross-origin' },
-}));
-
-    if (url === '/ws/voice') {
+    if (url === '/ws/voice' || url === '/voice') {
       wss.handleUpgrade(request, socket, head, (ws) => {
         console.log('🔥 Voice WS Connected');
-
         wss.emit('connection', ws, request);
       });
     } else if (url === '/webrtc') {
+      // Handled by createWebRTCServer — do nothing here
       return;
     } else {
       console.log('❌ Unknown WS route:', url);
@@ -106,21 +77,16 @@ app.use(helmet({
   }
 });
 
-// ─── Debug Logger ──────────────────────────────────────
-app.use((req, res, next) => {
-  console.log(`➡️ ${req.method} ${req.url}`);
-  next();
-});
-
-// ─── Security ──────────────────────────────────────────
+// ─── Middleware ─────────────────────────────────────────────────────────────
 app.use(
   helmet({
     crossOriginEmbedderPolicy: false,
     contentSecurityPolicy: false,
+    crossOriginOpenerPolicy: false,
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
   })
 );
 
-// ─── CORS ──────────────────────────────────────────────
 app.use(
   cors({
     origin: true,
@@ -128,26 +94,26 @@ app.use(
   })
 );
 
-// ─── Static Files ──────────────────────────────────────
 app.use(express.static(path.join(__dirname, 'public')));
-
-// ─── Body Parser ───────────────────────────────────────
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
-
-// ─── Logger ────────────────────────────────────────────
 app.use(morgan('dev'));
 
-// ─── Request ID Middleware ─────────────────────────────
+// ─── Request ID ─────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
-  const requestId =
-    req.headers['x-request-id'] || crypto.randomUUID();
-
+  const requestId = req.headers['x-request-id'] || crypto.randomUUID();
   req.requestId = requestId;
   res.setHeader('x-request-id', requestId);
-
   next();
-// ─── Health Check ───────────────────────────────────────────────────────────
+});
+
+// ─── Debug Logger ───────────────────────────────────────────────────────────
+app.use((req, res, next) => {
+  console.log(`➡️  ${req.method} ${req.url}`);
+  next();
+});
+
+// ─── Health Checks ──────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
   res.json({
     success: true,
@@ -163,26 +129,20 @@ app.get('/', (req, res) => {
       webhooks: '/api/webhooks',
       twilio: '/api/twilio',
       voicePreview: '/api/voice-preview',
-      voices: '/api/voices',
-      models: '/api/models',
-      websocket: 'ws://localhost:' + (process.env.PORT || 5000) + '/ws/voice',  // matches frontend WS_BASE
+      websocket: 'ws://localhost:' + (process.env.PORT || 5000) + '/ws/voice',
     },
   });
 });
 
-// ─── Health Check ──────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    mongodb:
-      mongoose.connection.readyState === 1
-        ? 'connected'
-        : 'disconnected',
+    mongodb: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
     uptime: process.uptime(),
   });
 });
 
-// ─── API Routes ────────────────────────────────────────
+// ─── API Routes ─────────────────────────────────────────────────────────────
 app.use('/api/auth', authRoutes);
 app.use('/api/agents', agentRoutes);
 app.use('/api/numbers', numberRoutes);
@@ -198,15 +158,7 @@ app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/crm', crmRoutes);
 app.use('/api/widget', widgetRoutes);
 
-// ─── Root Route ────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({
-    success: true,
-    message: '🎙️ VaaniAI Backend is running!',
-  });
-});
-
-// ─── 404 Handler ───────────────────────────────────────
+// ─── 404 Handler ────────────────────────────────────────────────────────────
 app.use('*', (req, res) => {
   res.status(404).json({
     success: false,
@@ -214,10 +166,10 @@ app.use('*', (req, res) => {
   });
 });
 
-// ─── Error Handler ─────────────────────────────────────
+// ─── Error Handler ───────────────────────────────────────────────────────────
 app.use(errorHandler);
 
-// ─── Start Server ──────────────────────────────────────
+// ─── Start Server ────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
 
 const startServer = async () => {

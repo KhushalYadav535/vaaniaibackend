@@ -424,8 +424,8 @@ async function handleInit(session, message) {
         }
 
         // ─── Path 2: Client-side silence timer fallback ───────────────
-        // FIX: Reduced from 1200ms → 800ms — Deepgram speech_final usually
-        // arrives within 600-800ms; 1200ms added unnecessary lag.
+        // Reduced from 1200ms → 600ms — Deepgram speech_final usually
+        // arrives within 600ms; longer timeout added unnecessary lag.
         if (session._silenceTimer) clearTimeout(session._silenceTimer);
         session._silenceTimer = setTimeout(async () => {
           session._silenceTimer = null;
@@ -447,7 +447,6 @@ async function handleInit(session, message) {
             session.isProcessing = false;
           }
         }, 600);
-        }, 800);
 
       },
     onError: (err) => {
@@ -1199,23 +1198,14 @@ function sendAudioChunkOnly(session, buffer) {
 }
 
 function sendAudioBuffer(session, buffer, isFinal = true) {
-  // Save for full call recording (Retell style)
+  // Save for full call recording
   if (session.fullAudioBuffer) {
     session.fullAudioBuffer.push(buffer);
   }
 
   // Mark agent as speaking — mutes STT processing to prevent echo loop
-  session.agentSpeaking = true;
   // (mic picking up TTS audio → Deepgram transcribes it → agent responds to itself)
-  // FIX: Only start the agentSpeaking timer ONCE per turn (not per chunk).
-  // Previously this reset the 1500ms timer on every chunk send, which was
-  // mostly correct but caused the timer to extend indefinitely if many chunks
-  // arrived in rapid succession, keeping the mic muted too long.
-  if (!session.agentSpeaking) {
-    session.agentSpeaking = true;
-    session._agentSpeakingChunkCount = 0;
-  }
-  session._agentSpeakingChunkCount = (session._agentSpeakingChunkCount || 0) + 1;
+  session.agentSpeaking = true;
 
   const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
   if (session.ws.bufferedAmount > maxBufferedBytes) {
@@ -1246,35 +1236,19 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
     console.log(`[⏱️ LATENCY] Pipeline→FirstAudio: ${session.latency.firstAudioAt - session.latency.llmStartedAt}ms | Total STT→Audio: ${session.latency.firstAudioAt - session.latency.turnStartedAt}ms`);
     emitLatencyMetrics(session, 'first_audio');
   }
-  
-  if (isFinal) {
-    safeSend(session.ws, { type: session.streamProtocol ? 'audio_stream_end' : 'audio_end' });
 
-    // Increased to 1000ms: allows frontend TTS buffers to finish playing before STT listens again
-    // Prevents "agent interrupted" echo loops
-    if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
-    session._agentSpeakingTimer = setTimeout(() => {
-      session.agentSpeaking = false;
-      session._lastSttTranscript = ''; // Clear any echo that accumulated
-    }, 1000);
-  } else {
-    // Keep agentSpeaking=true indefinitely while streaming chunks
-    if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
-  }
+  // Send audio_end after each MP3 chunk — frontend needs this to trigger
+  // AudioContext.decodeAudioData and queue playback. Each TTS chunk is a
+  // complete MP3; they cannot be concatenated.
+  safeSend(session.ws, { type: session.streamProtocol ? 'audio_stream_end' : 'audio_end' });
 
-  // Send audio_end per chunk — frontend NEEDS this after each MP3 chunk
-  // to trigger AudioContext.decodeAudioData and queue playback.
-  // Each TTS chunk is a complete MP3 file; they cannot be concatenated.
-  safeSend(session.ws, { type: 'audio_end' });
-
-  // Extend agentSpeaking window on each chunk to prevent echo.
-  // Timer resets correctly here because each chunk adds playback time.
+  // Reset the agentSpeaking timer on every chunk so it extends to cover
+  // the full playback duration, then releases the mic afterward.
   if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
   session._agentSpeakingTimer = setTimeout(() => {
     session.agentSpeaking = false;
-    session._agentSpeakingChunkCount = 0;
-    session._lastSttTranscript = ''; // Clear echo accumulated during TTS
-  }, 1500);
+    session._lastSttTranscript = ''; // Clear any echo that accumulated during TTS
+  }, isFinal ? 1000 : 1500);
 }
 
 

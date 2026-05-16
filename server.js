@@ -52,6 +52,15 @@ setupVoiceSession(wss);
 
 // Optional WebRTC server
 createWebRTCServer(server);
+  noServer: true,
+  path: '/ws/voice',
+});
+
+// Wire up the voice session handler — this registers the 'connection' event
+setupVoiceSession(wss);
+
+// ─── WebRTC Session ─────────────────────────────────────────────────────────
+const webrtcWss = createWebRTCServer(server);
 
 // Handle WebSocket upgrade
 server.on('upgrade', (request, socket, head) => {
@@ -59,6 +68,25 @@ server.on('upgrade', (request, socket, head) => {
     const url = request.url.split('?')[0]; // ✅ handle query params
 
     console.log('🔌 WS Upgrade Request:', request.url);
+  // Support both '/ws/voice' (frontend) and legacy '/voice' paths
+  if (request.url === '/ws/voice' || request.url === '/voice') {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  } else if (request.url === '/webrtc') {
+    // WebRTC upgrade is handled by createWebRTCServer
+    return;
+  }
+});
+
+
+// ─── Middleware ─────────────────────────────────────────────────────────────
+app.use(helmet({
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: false,
+  crossOriginOpenerPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
 
     if (url === '/ws/voice') {
       wss.handleUpgrade(request, socket, head, (ws) => {
@@ -119,6 +147,27 @@ app.use((req, res, next) => {
   res.setHeader('x-request-id', requestId);
 
   next();
+// ─── Health Check ───────────────────────────────────────────────────────────
+app.get('/', (req, res) => {
+  res.json({
+    success: true,
+    message: '🎙️ VaaniAI Backend is running!',
+    version: '1.0.0',
+    endpoints: {
+      auth: '/api/auth',
+      agents: '/api/agents',
+      numbers: '/api/numbers',
+      calls: '/api/calls',
+      analytics: '/api/analytics',
+      settings: '/api/settings',
+      webhooks: '/api/webhooks',
+      twilio: '/api/twilio',
+      voicePreview: '/api/voice-preview',
+      voices: '/api/voices',
+      models: '/api/models',
+      websocket: 'ws://localhost:' + (process.env.PORT || 5000) + '/ws/voice',  // matches frontend WS_BASE
+    },
+  });
 });
 
 // ─── Health Check ──────────────────────────────────────

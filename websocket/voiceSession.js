@@ -105,6 +105,22 @@ function setupVoiceSession(wss) {
   });
 }
 
+function startIdleTimer(session) {
+  if (session._idleTimer) clearTimeout(session._idleTimer);
+  // Idle timeout is 10 seconds of absolute silence
+  session._idleTimer = setTimeout(() => {
+    if (session.status === 'ended' || session.agentSpeaking || session.isProcessing) return;
+    console.log(`[Idle] User silent for 10s. Triggering active re-engagement.`);
+    // Send a system event to the LLM to actively re-engage the user
+    // We don't await this directly here because processTranscript is async
+    try {
+      processTranscript(session, "[SYSTEM_EVENT: The user has been completely silent for 10 seconds. Briefly and naturally ask if they are still there or if they need any help. DO NOT mention this system event.]");
+    } catch (e) {
+      console.error("Failed to trigger idle engagement:", e);
+    }
+  }, 10000);
+}
+
 async function handleMessage(session, message) {
   const { type } = message;
 
@@ -324,10 +340,25 @@ async function handleInit(session, message) {
         // ── Interruption detection: if user speaks while agent is talking ──
         if (session.agentSpeaking) {
           const sensitivity = agent.advanced?.interruptionSensitivity ?? 0.5;
-          const interruptThreshold = Math.max(2, Math.round(12 * (1 - sensitivity)));
+          const charThreshold = Math.max(5, Math.round(20 * (1 - sensitivity)));
+          
+          const trimmedText = transcript.trim().toLowerCase();
+          const wordCount = trimmedText.split(/\s+/).length;
+          
+          // Noise words/affirmations that should NEVER trigger an interruption on their own
+          const noiseWords = ['hmm', 'um', 'uh', 'ah', 'oh', 'yeah', 'yes', 'ok', 'okay', 'haan', 'acha', 'accha', 'hmm...', 'right'];
+          const isJustNoise = wordCount <= 2 && noiseWords.some(w => trimmedText === w || trimmedText.startsWith(w));
+          
+          // Strong interruption words that should trigger immediately
+          const stopWords = ['stop', 'wait', 'hold on', 'ruko', 'ek second', 'listen', 'no', 'nahi', 'galat'];
+          const hasStopWord = stopWords.some(w => trimmedText.includes(w));
 
-          // Only interrupt if the user actually said something meaningful (not mic echo)
-          if (transcript.trim().length >= interruptThreshold) {
+          // Only interrupt if:
+          // 1. It contains a strong stop word OR
+          // 2. It is not just noise AND (character length >= threshold OR word count >= 3)
+          const shouldInterrupt = hasStopWord || (!isJustNoise && (trimmedText.length >= charThreshold || wordCount >= 3));
+
+          if (shouldInterrupt) {
             console.log(`[Interrupt] User spoke during agent TTS: "${transcript.trim().substring(0, 60)}"`);
 
             // 1. Cancel current generation so LLM stream loop exits
@@ -335,6 +366,7 @@ async function handleInit(session, message) {
 
             // 2. Clear agentSpeaking so new processing can start
             session.agentSpeaking = false;
+            session._audioQueueDurationMs = 0;
             if (session._agentSpeakingTimer) { clearTimeout(session._agentSpeakingTimer); session._agentSpeakingTimer = null; }
 
             // 3. Reset processing flag — the old pipeline will exit via generationId mismatch
@@ -343,6 +375,29 @@ async function handleInit(session, message) {
             // 4. Tell client to stop playing any queued audio immediately
             safeSend(session.ws, { type: 'interrupt' });
             safeSend(session.ws, { type: 'clear_audio' });
+
+            // ── Phase 3: Flawless Barge-in (Interruption Handling) ──
+            const lang = session.agent.language || 'en';
+            const interruptFillers = {
+              'en': 'Sorry, go ahead.',
+              'hi': 'Haan boliye.',
+              'hi-Latn': 'Haan boliye.',
+              'multi': 'Haan boliye.',
+              'en-IN': 'Sorry, go ahead.'
+            };
+            const fillerText = interruptFillers[lang] || interruptFillers['en'];
+            const ttsService = require('../services/ttsService');
+            ttsService.textToSpeech({
+              text: fillerText,
+              voiceId: session.agent.voice?.voiceId,
+              speed: 1.15,
+              provider: session.agent.voice?.provider
+            }).then(audioBuffer => {
+              if (audioBuffer && audioBuffer.length > 0) {
+                 safeSend(session.ws, { type: 'response_text', text: fillerText });
+                 sendAudioBuffer(session, audioBuffer);
+              }
+            }).catch(e => console.error("Interruption TTS failed:", e));
 
             // 5. Treat this transcript as the new user turn
             session._lastSttTranscript = transcript;
@@ -355,6 +410,8 @@ async function handleInit(session, message) {
               session.latency.llmStartedAt = null;
               session.latency.firstTextChunkAt = null;
               session.latency.firstAudioAt = null;
+              session._userSpeechStartTime = null;
+              session._backchannelTriggered = false;
               console.log(`[STT] Interrupt speech_final: "${transcript}"`);
               try {
                 await processTranscript(session, transcript);
@@ -378,6 +435,8 @@ async function handleInit(session, message) {
               session.latency.llmStartedAt = null;
               session.latency.firstTextChunkAt = null;
               session.latency.firstAudioAt = null;
+              session._userSpeechStartTime = null;
+              session._backchannelTriggered = false;
               console.log(`[STT] Interrupt silence-timer: "${pending}"`);
               try {
                 await processTranscript(session, pending);
@@ -401,7 +460,38 @@ async function handleInit(session, message) {
 
         // Track latest transcript for silence-timer fallback
         if (transcript.trim().length > 0) {
+          if (session._idleTimer) { clearTimeout(session._idleTimer); session._idleTimer = null; }
           session._lastSttTranscript = transcript;
+
+          // ── Phase 1: Active Backchanneling ──
+          if (!session._userSpeechStartTime) {
+            session._userSpeechStartTime = Date.now();
+            session._backchannelTriggered = false;
+          } else if (Date.now() - session._userSpeechStartTime > 4000 && !session._backchannelTriggered && !session.agentSpeaking) {
+            session._backchannelTriggered = true;
+            console.log("[Backchannel] Injecting active listening filler...");
+            const lang = agent.language || 'en';
+            const backchannels = {
+               'en': ['Mhmm...', 'Right.', 'I see.'],
+               'hi': ['Mhmm...', 'Accha.', 'Haan...'],
+               'hi-Latn': ['Mhmm...', 'Accha.', 'Haan...'],
+               'multi': ['Mhmm...', 'Accha.'],
+               'en-IN': ['Mhmm...', 'Right.']
+            };
+            const options = backchannels[lang] || backchannels['en'];
+            const backchannelText = options[Math.floor(Math.random() * options.length)];
+            const ttsService = require('../services/ttsService');
+            ttsService.textToSpeech({
+              text: backchannelText,
+              voiceId: agent.voice?.voiceId,
+              speed: 0.9, // slower for "thinking" feel
+              provider: agent.voice?.provider
+            }).then(audioBuffer => {
+              if (audioBuffer && audioBuffer.length > 0) {
+                 sendAudioBuffer(session, audioBuffer);
+              }
+            }).catch(e => console.error("Backchannel TTS failed:", e));
+          }
         }
 
         // ─── Path 1: Deepgram speech_final (works when account supports it) ───
@@ -413,6 +503,8 @@ async function handleInit(session, message) {
           session.latency.llmStartedAt = null;
           session.latency.firstTextChunkAt = null;
           session.latency.firstAudioAt = null;
+          session._userSpeechStartTime = null;
+          session._backchannelTriggered = false;
           console.log(`[STT] speech_final triggered: "${transcript}"`);
           try {
             await processTranscript(session, transcript);
@@ -439,6 +531,8 @@ async function handleInit(session, message) {
           session.latency.llmStartedAt = null;
           session.latency.firstTextChunkAt = null;
           session.latency.firstAudioAt = null;
+          session._userSpeechStartTime = null;
+          session._backchannelTriggered = false;
           console.log(`[STT] silence-timer triggered: "${pending}"`);
           try {
             await processTranscript(session, pending);
@@ -572,6 +666,7 @@ async function handleInit(session, message) {
     });
 
     session.status = 'listening';
+    startIdleTimer(session);
 
   } catch (error) {
     throw new Error('Failed to initialize agent: ' + error.message);
@@ -918,11 +1013,11 @@ async function processTranscript(session, transcript) {
     
     // Only send the final audio_end signal once all chunks have completed generating
     safeSend(session.ws, { type: session.streamProtocol ? 'audio_stream_end' : 'audio_end' });
-    if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
-    session._agentSpeakingTimer = setTimeout(() => {
-      session.agentSpeaking = false;
-      session._lastSttTranscript = '';
-    }, 1000);
+    // If no audio was generated/sent, start the idle timer immediately.
+    // Otherwise, sendAudioBuffer has already set a timer based on the actual audio duration.
+    if (!session.agentSpeaking) {
+      startIdleTimer(session);
+    }
 
     fullResponseText = fullResponseText.trim();
 
@@ -956,6 +1051,11 @@ async function processTranscript(session, transcript) {
 
 async function handleEndSession(session, reason = 'user_hangup') {
   if (session.status === 'ended') return;
+  if (session._idleTimer) clearTimeout(session._idleTimer);
+  if (session._logFlushInterval) {
+    clearInterval(session._logFlushInterval);
+    session._logFlushInterval = null;
+  }
   session.status = 'ended';
 
   // Send goodbye if not already
@@ -973,13 +1073,17 @@ async function handleEndSession(session, reason = 'user_hangup') {
     } catch (e) {}
   }
 
-  // Save call recording (concatenate TTS audio buffers)
+  // Save call recording (streamed directly to disk)
   let recordingUrl = '';
-  if (session.fullAudioBuffer && session.fullAudioBuffer.length > 0 && session.callLogId) {
+  if (session.audioWriteStream) {
+    session.audioWriteStream.end();
+    recordingUrl = `/api/recordings/download/${require('path').basename(session.recordingFilepath)}`;
+    console.log(`[Recording] Stream saved to disk → ${recordingUrl}`);
+  } else if (session.fullAudioBuffer && session.fullAudioBuffer.length > 0 && session.callLogId) {
     try {
       const fs = require('fs');
       const path = require('path');
-      const recordingsDir = path.join(__dirname, '..', 'recordings');
+      const recordingsDir = process.env.RECORDINGS_DIR ? require('path').resolve(process.env.RECORDINGS_DIR) : path.join(__dirname, '..', 'recordings');
       if (!fs.existsSync(recordingsDir)) fs.mkdirSync(recordingsDir, { recursive: true });
 
       const filename = `call_${session.callLogId}_${Date.now()}.mp3`;
@@ -988,7 +1092,6 @@ async function handleEndSession(session, reason = 'user_hangup') {
       fs.writeFileSync(filepath, fullBuffer);
 
       recordingUrl = `/api/recordings/download/${filename}`;
-      console.log(`[Recording] Saved ${(fullBuffer.length / 1024).toFixed(0)}KB → ${filename}`);
     } catch (recErr) {
       console.error('[Recording] Failed to save:', recErr.message);
     }
@@ -1179,76 +1282,96 @@ function safeSend(ws, data) {
  * Does NOT reset agentSpeaking timer.
  */
 function sendAudioChunkOnly(session, buffer) {
-  if (session.fullAudioBuffer) session.fullAudioBuffer.push(buffer);
+  if (!session.audioWriteStream && session.callLogId) {
+    const fs = require('fs');
+    const path = require('path');
+    const recordingsDir = process.env.RECORDINGS_DIR ? require('path').resolve(process.env.RECORDINGS_DIR) : path.join(__dirname, '..', 'recordings');
+    if (!fs.existsSync(recordingsDir)) fs.mkdirSync(recordingsDir, { recursive: true });
+    session.recordingFilepath = path.join(recordingsDir, `call_${session.callLogId}_${Date.now()}.mp3`);
+    session.audioWriteStream = fs.createWriteStream(session.recordingFilepath);
+  }
+  if (session.audioWriteStream) {
+    session.audioWriteStream.write(buffer);
+  }
+
   session.agentSpeaking = true;
 
-  const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
-  if (session.ws.bufferedAmount > maxBufferedBytes) return;
-
-  if (session.prefersBinaryAudio) {
-    safeSendBinary(session.ws, buffer);
-  } else {
-    const base64Audio = buffer.toString('base64');
-    if (session.streamProtocol) {
-      safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio });
-    } else {
-      safeSend(session.ws, { type: 'audio', data: base64Audio });
+  const task = async () => {
+    const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
+    while (session.ws.readyState === 1 && session.ws.bufferedAmount > maxBufferedBytes) {
+      await new Promise(r => setTimeout(r, 100)); // Backpressure pause, no dropping audio
     }
-  }
+
+    if (session.prefersBinaryAudio) {
+      safeSendBinary(session.ws, buffer);
+    } else {
+      const base64Audio = buffer.toString('base64');
+      if (session.streamProtocol) {
+        safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio });
+      } else {
+        safeSend(session.ws, { type: 'audio', data: base64Audio });
+      }
+    }
+  };
+
+  session._audioSendQueue = (session._audioSendQueue || Promise.resolve()).then(task).catch(console.error);
 }
 
 function sendAudioBuffer(session, buffer, isFinal = true) {
-  // Save for full call recording
-  if (session.fullAudioBuffer) {
-    session.fullAudioBuffer.push(buffer);
+  if (!session.audioWriteStream && session.callLogId) {
+    const fs = require('fs');
+    const path = require('path');
+    const recordingsDir = process.env.RECORDINGS_DIR ? require('path').resolve(process.env.RECORDINGS_DIR) : path.join(__dirname, '..', 'recordings');
+    if (!fs.existsSync(recordingsDir)) fs.mkdirSync(recordingsDir, { recursive: true });
+    session.recordingFilepath = path.join(recordingsDir, `call_${session.callLogId}_${Date.now()}.mp3`);
+    session.audioWriteStream = fs.createWriteStream(session.recordingFilepath);
+  }
+  if (session.audioWriteStream) {
+    session.audioWriteStream.write(buffer);
   }
 
-  // Mark agent as speaking — mutes STT processing to prevent echo loop
-  // (mic picking up TTS audio → Deepgram transcribes it → agent responds to itself)
   session.agentSpeaking = true;
 
-  const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
-  if (session.ws.bufferedAmount > maxBufferedBytes) {
-    const now = Date.now();
-    if (now - session.warnedBackpressureAt > 3000) {
-      session.warnedBackpressureAt = now;
-      safeSend(session.ws, {
-        type: 'status',
-        message: 'Network slow: optimizing response delivery...',
-      });
+  const task = async () => {
+    const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
+    while (session.ws.readyState === 1 && session.ws.bufferedAmount > maxBufferedBytes) {
+      await new Promise(r => setTimeout(r, 100)); // Backpressure pause
     }
-    return;
-  }
 
-  if (session.prefersBinaryAudio) {
-    safeSendBinary(session.ws, buffer);
-  } else {
-    const base64Audio = buffer.toString('base64');
-    if (session.streamProtocol) {
-      safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio });
+    if (session.prefersBinaryAudio) {
+      safeSendBinary(session.ws, buffer);
     } else {
-      safeSend(session.ws, { type: 'audio', data: base64Audio });
+      const base64Audio = buffer.toString('base64');
+      if (session.streamProtocol) {
+        safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio });
+      } else {
+        safeSend(session.ws, { type: 'audio', data: base64Audio });
+      }
     }
-  }
 
-  if (!session.latency.firstAudioAt) {
-    session.latency.firstAudioAt = Date.now();
-    console.log(`[⏱️ LATENCY] Pipeline→FirstAudio: ${session.latency.firstAudioAt - session.latency.llmStartedAt}ms | Total STT→Audio: ${session.latency.firstAudioAt - session.latency.turnStartedAt}ms`);
-    emitLatencyMetrics(session, 'first_audio');
-  }
+    if (isFinal) {
+      if (!session.latency.firstAudioAt) {
+        session.latency.firstAudioAt = Date.now();
+        emitLatencyMetrics(session, 'first_audio');
+      }
 
-  // Send audio_end after each MP3 chunk — frontend needs this to trigger
-  // AudioContext.decodeAudioData and queue playback. Each TTS chunk is a
-  // complete MP3; they cannot be concatenated.
-  safeSend(session.ws, { type: session.streamProtocol ? 'audio_stream_end' : 'audio_end' });
+      safeSend(session.ws, { type: session.streamProtocol ? 'audio_stream_end' : 'audio_end' });
 
-  // Reset the agentSpeaking timer on every chunk so it extends to cover
-  // the full playback duration, then releases the mic afterward.
-  if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
-  session._agentSpeakingTimer = setTimeout(() => {
-    session.agentSpeaking = false;
-    session._lastSttTranscript = ''; // Clear any echo that accumulated during TTS
-  }, isFinal ? 1000 : 1500);
+      if (!session._audioQueueDurationMs) session._audioQueueDurationMs = 0;
+      const chunkDurationMs = Math.max(500, Math.round((buffer.length / 4000) * 1000));
+      session._audioQueueDurationMs += chunkDurationMs;
+
+      if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
+      session._agentSpeakingTimer = setTimeout(() => {
+        session.agentSpeaking = false;
+        session._lastSttTranscript = '';
+        startIdleTimer(session);
+        session._audioQueueDurationMs = 0;
+      }, session._audioQueueDurationMs + 500);
+    }
+  };
+
+  session._audioSendQueue = (session._audioSendQueue || Promise.resolve()).then(task).catch(console.error);
 }
 
 
@@ -1291,21 +1414,41 @@ function emitLatencyMetrics(session, stage = 'update') {
 function queueCallLogUpdate(session, update, label = 'call_log_update') {
   if (!session?.callLogId) return;
 
-  session.callLogWriteQueue = session.callLogWriteQueue
-    .then(() => CallLog.findByIdAndUpdate(session.callLogId, update))
-    .catch((err) => {
-      console.error(`[CallLog Queue Error] ${label}:`, err.message);
-    });
+  if (!session._pendingLogUpdates) {
+    session._pendingLogUpdates = [];
+  }
+  
+  if (update.$push && update.$push.transcript) {
+    session._pendingLogUpdates.push(update.$push.transcript);
+  } else {
+    // Non-transcript updates (like metrics/flags) happen immediately
+    CallLog.findByIdAndUpdate(session.callLogId, update).catch(() => {});
+    return;
+  }
+
+  // Setup flush interval (runs every 5 seconds to bulk write)
+  if (!session._logFlushInterval) {
+    session._logFlushInterval = setInterval(() => {
+       flushCallLogWriteQueue(session);
+    }, 5000);
+  }
 }
 
 async function flushCallLogWriteQueue(session) {
-  if (!session?.callLogWriteQueue) return;
+  if (!session?.callLogId || !session._pendingLogUpdates || session._pendingLogUpdates.length === 0) return;
+  
+  const transcriptsToPush = [...session._pendingLogUpdates];
+  session._pendingLogUpdates = [];
 
-  const timeoutMs = Number(process.env.CALL_LOG_FLUSH_TIMEOUT_MS || 1500);
-  await Promise.race([
-    session.callLogWriteQueue,
-    new Promise((resolve) => setTimeout(resolve, timeoutMs)),
-  ]).catch(() => {});
+  try {
+     await CallLog.findByIdAndUpdate(session.callLogId, {
+        $push: { transcript: { $each: transcriptsToPush } }
+     });
+  } catch (err) {
+     console.error(`[CallLog Bulk Update Error]:`, err.message);
+     // Put them back at the front of the queue to retry next interval
+     session._pendingLogUpdates = [...transcriptsToPush, ...(session._pendingLogUpdates || [])];
+  }
 }
 
 function allowAudioIngress(session, chunkBytes) {

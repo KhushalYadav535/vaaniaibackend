@@ -20,6 +20,103 @@ class VoicePipeline {
     // Rolling summary settings
     this._summaryThreshold = Number(process.env.ROLLING_SUMMARY_THRESHOLD || 12); // summarize after N messages
     this._summaryKeepRecent = Number(process.env.ROLLING_SUMMARY_KEEP_RECENT || 6); // keep last N messages verbatim
+
+    // Language-specific filler words for natural turn-taking
+    this._fillersByLang = {
+      'en':      ['Hmm...', 'Let me see...', 'Umm...', 'So...', 'Well...', 'Right...', 'Okay so...'],
+      'hi':      ['Hmm...', 'Dekhte hain...', 'Ek minute...', 'Accha...', 'Toh...', 'Haan...', 'Ji...'],
+      'hi-Latn': ['Hmm...', 'Ek sec...', 'Acchaa...', 'Toh basically...', 'Haan...', 'Dekho...'],
+      'multi':   ['Hmm...', 'Accha...', 'Let me check...', 'Toh...', 'Okay...', 'Haan...'],
+      'en-IN':   ['Hmm...', 'One second...', 'Okay so...', 'Let me check...', 'Right...'],
+    };
+  }
+
+  /**
+   * Humanize LLM text for natural speech.
+   * Adds micro-pauses, forces contractions, formats numbers for speaking,
+   * and removes any remaining markdown artifacts.
+   */
+  humanizeText(text, lang = 'en') {
+    if (!text) return text;
+    let t = text;
+
+    // 1. Force contractions (formal → spoken)
+    t = t.replace(/\bI would\b/gi, "I'd");
+    t = t.replace(/\bI will\b/gi, "I'll");
+    t = t.replace(/\bI am\b/gi, "I'm");
+    t = t.replace(/\bI have\b/gi, "I've");
+    t = t.replace(/\bdo not\b/gi, "don't");
+    t = t.replace(/\bcan not\b/gi, "can't");
+    t = t.replace(/\bcannot\b/gi, "can't");
+    t = t.replace(/\bwill not\b/gi, "won't");
+    t = t.replace(/\bwould not\b/gi, "wouldn't");
+    t = t.replace(/\bshould not\b/gi, "shouldn't");
+    t = t.replace(/\bcould not\b/gi, "couldn't");
+    t = t.replace(/\bit is\b/gi, "it's");
+    t = t.replace(/\bthat is\b/gi, "that's");
+    t = t.replace(/\bwhat is\b/gi, "what's");
+    t = t.replace(/\bthere is\b/gi, "there's");
+    t = t.replace(/\bwe are\b/gi, "we're");
+    t = t.replace(/\bthey are\b/gi, "they're");
+    t = t.replace(/\byou are\b/gi, "you're");
+    t = t.replace(/\blet us\b/gi, "let's");
+    t = t.replace(/\bhere is\b/gi, "here's");
+
+    // 2. Kill remaining robotic phrases the LLM might slip through
+    t = t.replace(/\bCertainly!?\s*/gi, '');
+    t = t.replace(/\bAbsolutely!?\s*/gi, 'Sure, ');
+    t = t.replace(/\bAdditionally,?\s*/gi, 'Also, ');
+    t = t.replace(/\bFurthermore,?\s*/gi, 'And ');
+    // Handle full "I'd/would be happy to assist/help [you] [with that]" constructions
+    t = t.replace(/\bI'?d be happy to (help|assist)( you)?( with that)?[.,]?\s*/gi, "I'll help. ");
+    t = t.replace(/\bI would be happy to (help|assist)( you)?( with that)?[.,]?\s*/gi, "I'll help. ");
+    t = t.replace(/Is there anything else I can help you with(\?|\.|!)?/gi, 'Anything else?');
+    t = t.replace(/Is there anything else(\?|\.|!)?/gi, 'Anything else?');
+
+    // 3. Numbers ≥4 digits → spoken digit-by-digit (phone numbers, OTPs, codes)
+    t = t.replace(/\b(\d{4,})\b/g, (match) => {
+      return match.split('').join(', ');
+    });
+
+    // 4. Clean excess punctuation
+    t = t.replace(/!{2,}/g, '!');
+    t = t.replace(/\?{2,}/g, '?');
+
+    // 5. Clean any remaining markdown artifacts
+    t = t.replace(/\*+/g, '');
+    t = t.replace(/#{1,6}\s/g, '');
+    t = t.replace(/^- /gm, '');
+
+    // 6. Add micro-pause after commas for natural breathing rhythm
+    //    (Ellipsis triggers a slight pause in Edge TTS)
+    t = t.replace(/,\s(?!\.)/g, ',... ');
+
+    // 7. Handle emotional tokens (Phase 3)
+    t = t.replace(/\[LAUGH\]/gi, 'haha...');
+    t = t.replace(/\[SIGH\]/gi, 'huff...');
+
+    // 8. Hinglish Context Switching (Zoronal Speciality - Phase 4)
+    if (lang === 'hi' || lang === 'hi-Latn' || lang === 'multi') {
+      t = t.replace(/\b(Yes|Yeah)\b/gi, "Haan");
+      t = t.replace(/\b(Okay|Ok)\b/gi, "Theek hai");
+      t = t.replace(/\b(Sorry)\b/gi, "Maaf karna");
+      t = t.replace(/\brupees\b/gi, "rupaye");
+    }
+
+    return t.trim();
+  }
+
+  /**
+   * Get dynamic TTS pitch variation based on sentence type.
+   * Humans naturally raise pitch for questions and vary it for statements.
+   * This breaks the monotone "robot reading a script" feel.
+   */
+  getDynamicPitch(text) {
+    const trimmed = (text || '').trim();
+    if (trimmed.endsWith('?'))  return 2;  // Questions: +2Hz (slightly higher)
+    if (trimmed.endsWith('!'))  return 1;  // Excitement: +1Hz
+    // Statements: alternate between -1Hz and 0Hz to prevent metronomic monotone
+    return Math.random() > 0.5 ? -1 : 0;
   }
 
   getGroqFallbackModels(primaryModel = 'llama-3.1-8b-instant') {
@@ -198,14 +295,19 @@ class VoicePipeline {
     else if (lang === 'en-IN') defaultVoiceId = 'en-IN-NeerjaNeural';
 
     const voiceId = agent.voice?.voiceId || defaultVoiceId;
-    const speed = agent.voice?.speed || 1.0;
+    const speed = agent.voice?.speed || 1.05;
+
+    // Humanize LLM output for natural speech
+    const humanizedResponse = this.humanizeText(responseText, lang);
+    const pitch = this.getDynamicPitch(humanizedResponse);
 
     let audioBuffer;
     try {
       audioBuffer = await ttsService.textToSpeech({
-        text: responseText,
+        text: humanizedResponse,
         voiceId,
         speed,
+        pitch,
         provider: voiceProvider,
       });
     } catch (ttsError) {
@@ -274,7 +376,7 @@ class VoicePipeline {
     const llmModel      = agent.llm?.model       || 'llama-3.1-8b-instant';
     const voiceProvider = agent.voice?.provider  || 'edge-tts';
     const voiceId       = agent.voice?.voiceId   || 'en-US-JennyNeural';
-    const speed         = agent.voice?.speed     || 1.0;
+    const speed         = agent.voice?.speed     || 1.05; // 1.05 = slightly faster than default, sounds more conversational
     const ttsApiKey     = userSettings.ttsKey    || process.env.ELEVENLABS_API_KEY;
 
     const fastFirstChunkMode       = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
@@ -299,10 +401,13 @@ class VoicePipeline {
     messages[0].content = systemPrompt;
 
     // ── Filler word (fires synchronously before stream to reduce TTFA) ─────
+    //    Uses language-specific fillers spoken 15% slower for realistic "thinking" feel
     if (agent.advanced?.fillerWords && Math.random() < 0.35) {
-      const fillers = ['Hmm...', 'Let me see...', 'Umm...', 'Okay...', 'Well...'];
+      const lang = agent.language || 'en';
+      const fillers = this._fillersByLang[lang] || this._fillersByLang['en'];
       const filler  = fillers[Math.floor(Math.random() * fillers.length)];
-      const fillerAudio = await ttsService.textToSpeech({ text: filler, voiceId, speed, apiKey: ttsApiKey, provider: voiceProvider });
+      const fillerSpeed = Math.max(0.85, speed - 0.15); // 15% slower — like a real person pausing to think
+      const fillerAudio = await ttsService.textToSpeech({ text: filler, voiceId, speed: fillerSpeed, apiKey: ttsApiKey, provider: voiceProvider });
       yield { type: 'chunk', text: filler + ' ', audio: fillerAudio };
     }
 
@@ -365,18 +470,23 @@ class VoicePipeline {
     // ─────────────────────────────────────────────────────────────────────
 
     /** Helper: kick off TTS without blocking; returns a Promise<{text,audio}> */
-    const fireTTS = (sentenceText) =>
-      ttsService.textToSpeech({ text: sentenceText, voiceId, speed, apiKey: ttsApiKey, provider: voiceProvider })
-        .then(audio => ({ text: sentenceText, audio }))
+    const fireTTS = (sentenceText) => {
+      const lang = agent.language || 'en';
+      const humanized = this.humanizeText(sentenceText, lang);
+      const pitch = this.getDynamicPitch(humanized);
+      return ttsService.textToSpeech({ text: humanized, voiceId, speed, pitch, apiKey: ttsApiKey, provider: voiceProvider })
+        .then(audio => ({ text: humanized, audio }))
         .catch(err  => {
-          console.error(`[TTS Concurrent] Failed: "${sentenceText.substring(0, 40)}"`, err.message);
-          return { text: sentenceText, audio: Buffer.alloc(0) };
+          console.error(`[TTS Concurrent] Failed: "${humanized.substring(0, 40)}"`, err.message);
+          return { text: humanized, audio: Buffer.alloc(0) };
         });
+    };
 
     const ttsQueue     = [];   // ordered promise array
     let producerDone   = false;
     let producerError  = null;
     let fullResponseText = '';
+    let lastTokenTime  = Date.now();
 
     // ── LLM Producer (runs concurrently; never awaits TTS) ────────────────
     const runProducer = async () => {
@@ -385,6 +495,7 @@ class VoicePipeline {
 
       try {
         for await (const token of tokenStream) {
+          lastTokenTime = Date.now();
           fullResponseText  += token;
           currentSentence   += token;
 
@@ -431,12 +542,18 @@ class VoicePipeline {
             }
           }
 
-          // ── Sentence boundary detected ──────────────────────────────────
-          if (/[.!?\n]/.test(token) && currentSentence.trim().length > 5) {
+          // ── Phase 2: Semantic Chunking ──
+          // Split on sentence boundaries OR natural pausing clauses (commas)
+          // to dramatically lower TTFA and improve speaking rhythm
+          const isSentenceBoundary = /[.!?\n]/.test(token);
+          const isClauseBoundary = /[,;:]/.test(token);
+
+          if ((isSentenceBoundary && currentSentence.trim().length > 5) || 
+              (isClauseBoundary && currentSentence.trim().length > 25)) {
             const sentenceToSpeak = currentSentence.trim();
             currentSentence = '';
             ttsQueue.push(fireTTS(sentenceToSpeak)); // fire immediately, don't await
-            console.log(`[Pipeline] Sentence TTS fired (queue=${ttsQueue.length}): "${sentenceToSpeak.substring(0, 50)}"`);
+            console.log(`[Pipeline] Semantic chunk fired (queue=${ttsQueue.length}): "${sentenceToSpeak.substring(0, 50)}"`);
           }
         }
 
@@ -464,8 +581,19 @@ class VoicePipeline {
       while (true) {
         if (drainIdx >= ttsQueue.length) {
           if (producerDone) break; // Producer is done and queue is drained
+          
+          // ── Circuit Breaker: Stop if LLM is stuck for >5s ──
+          if (Date.now() - lastTokenTime > 5000) {
+            console.error("[Circuit Breaker] LLM stream hung for >5s. Aborting.");
+            producerError = new Error("LLM_TIMEOUT");
+            producerDone = true;
+            // Generate a quick fallback audio offline (or empty buffer to trigger fallback logic)
+            yield { type: 'chunk', text: "Sorry, my connection dropped for a second.", audio: Buffer.alloc(0) };
+            break;
+          }
+
           // Briefly yield control so the producer can push more items
-          await new Promise(resolve => setImmediate(resolve));
+          await new Promise(resolve => setTimeout(resolve, 20));
           continue;
         }
 
@@ -771,21 +899,30 @@ class VoicePipeline {
    */
   buildSystemPrompt(agent, memory = null, ragContext = '') {
     const lang = agent.language || 'en';
-    const langInstruction = lang === 'en' ? 'English' : lang === 'hi' ? 'Hindi' : lang === 'hi-Latn' ? 'Hinglish (Hindi in Roman script)' : lang === 'multi' ? 'the same language the user speaks in' : lang;
+    const langInstruction = lang === 'en' ? 'English' : lang === 'hi' ? 'Hindi (MUST BE WRITTEN IN ROMAN/LATIN ALPHABET ONLY. NO DEVNAGARI SCRIPT ALLOWED)' : lang === 'hi-Latn' ? 'Hinglish (Hindi in Roman script)' : lang === 'multi' ? 'the same language the user speaks in (use Roman script for Hindi)' : lang;
 
-    let prompt = `You are "${agent.name}", a live AI voice agent on a phone call. Your personality, role, and behavior are defined ENTIRELY by the instructions below. You must follow them as your highest priority.
+    let prompt = `You are "${agent.name}", a real person on a live phone call. Your personality, role, and behavior are defined ENTIRELY by the instructions below. You must follow them as your highest priority.
 
 ## YOUR INSTRUCTIONS (FOLLOW EXACTLY):
 ${agent.systemPrompt}
 
 ## VOICE CALL RULES (always apply):
-- You are on a LIVE VOICE CALL. Your text is spoken aloud via TTS.
-- Keep responses SHORT and conversational (1-3 sentences per turn). Do NOT give long monologues.
-- NEVER use markdown: no **, no *, no #, no -, no bullet points, no numbered lists.
-- Use plain spoken language only. Write as you would speak naturally.
+- You are on a LIVE VOICE CALL. A real person is listening to you, not reading a screen.
+- Speak like a REAL HUMAN on a phone — casual, warm, and natural.
+- Use CONTRACTIONS always: "don't", "I'll", "you're", "we've", "that's", "it's".
+- BANNED WORDS (never use these): "certainly", "additionally", "furthermore", "absolutely", "I'd be happy to assist", "great question", "of course", "I understand your concern", "Is there anything else I can help you with?"
+- USE INSTEAD: "sure", "yeah", "okay", "hmm", "right", "got it", "so basically", "let me check", "one sec", "does that work?", "anything else?"
+- Keep responses SHORT: 1-2 sentences max. Think how you actually talk on the phone.
+- For phone numbers, OTPs, codes: say each digit separately ("one two three four" not "one thousand two hundred thirty four").
+- For emails: spell out ("john at gmail dot com").
+- NEVER repeat the user's question back to them. NEVER start with greetings mid-conversation.
+- NEVER use markdown, bullet points, asterisks, numbered lists, or any formatting.
+- NEVER say "As an AI" or "I'm an AI assistant" — you are a person on a phone call.
+- EMOTIONAL ACTIONS: If something is genuinely funny, output [LAUGH]. If you are thinking or exhausted, output [SIGH]. Use sparingly.
+- If you see a [SYSTEM_EVENT: ...], address the event naturally in your response but DO NOT mention the system event itself.
 - Respond in ${langInstruction}.
-- Ask one question at a time. Wait for the user to answer before moving on.
-- If you don't know something, say so honestly. Don't make up information.
+- Ask one question at a time. Wait for the user to answer.
+- If you don't know something, say "hmm, I'm not sure about that" honestly.
 - Current date: ${new Date().toDateString()}.
 `;
 

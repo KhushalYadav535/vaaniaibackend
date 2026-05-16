@@ -31,6 +31,8 @@ const storageRoutes = require('./routes/storage');
 const superAdminRoutes = require('./routes/superAdmin');
 const crmRoutes = require('./routes/crm');
 const widgetRoutes = require('./routes/widget');
+const knowledgeBaseRoutes = require('./routes/knowledgeBase');
+const callFlowsRoutes = require('./routes/callFlows');
 
 // ─── WebSocket Handlers ─────────────────────────────────────────────────────
 const { setupVoiceSession } = require('./websocket/voiceSession');
@@ -157,6 +159,8 @@ app.use('/api/recordings', storageRoutes);
 app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/crm', crmRoutes);
 app.use('/api/widget', widgetRoutes);
+app.use('/api/knowledge-base', knowledgeBaseRoutes);
+app.use('/api/call-flows', callFlowsRoutes);
 
 // ─── 404 Handler ────────────────────────────────────────────────────────────
 app.use('*', (req, res) => {

@@ -52,8 +52,8 @@ class DeepgramService {
   createLiveConnection({ apiKey, language = 'en', backgroundDenoising = 'default', onTranscript, onError, onClose, keywords = [], onVADEvent = null, audioConfig = null }) {
     const key = apiKey || process.env.DEEPGRAM_API_KEY;
     if (!key) throw new Error('No Deepgram API key. Get $200 free credits at https://deepgram.com');
-
-    const model = process.env.DEEPGRAM_MODEL || 'nova-2';
+    // Upgraded from nova-2 to nova-3 (Premium model) to utilize $200 credits for best accuracy
+    const model = process.env.DEEPGRAM_MODEL || 'nova-3';
 
     // Map Hinglish to standard Hindi model
     let sttLanguage = language;

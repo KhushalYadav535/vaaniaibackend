@@ -521,7 +521,18 @@ class VoicePipeline {
 
               try {
                 const args       = JSON.parse(argsStr.replace(/'/g, '"'));
-                const toolResult = await toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent });
+                
+                // Prevent circuit breaker from tripping during long tool execution
+                let isToolRunning = true;
+                const keepAliveTimer = setInterval(() => { if (isToolRunning) lastTokenTime = Date.now(); }, 1000);
+                
+                let toolResult;
+                try {
+                  toolResult = await toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent });
+                } finally {
+                  isToolRunning = false;
+                  clearInterval(keepAliveTimer);
+                }
 
                 if (toolResult.result?.__transferToAgentId) {
                   // Enqueue a special sentinel so the drainer can yield the transfer event

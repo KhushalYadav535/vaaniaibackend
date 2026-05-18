@@ -83,7 +83,7 @@ class DeepgramService {
     const encoding   = audioConfig?.encoding    || process.env.DEEPGRAM_ENCODING    || 'linear16';
     const sampleRate = Number(audioConfig?.sampleRate || process.env.DEEPGRAM_SAMPLE_RATE || 16000);
     const channels   = Number(audioConfig?.channels   || process.env.DEEPGRAM_CHANNELS   || 1);
-    const mimeType   = process.env.DEEPGRAM_MIME_TYPE || 'audio/webm;codecs=opus';
+    const mimeType   = audioConfig?.mimeType || process.env.DEEPGRAM_MIME_TYPE || 'audio/webm;codecs=opus';
 
     if (!this._latencyConfigLogged) {
       console.log(`[Deepgram Latency Config] FAST_TURN_MODE=${fastTurnMode} utterance_end_ms=${utteranceEndMs} endpointing=${endpointingMs} min_final_chars=${minFinalChars}`);

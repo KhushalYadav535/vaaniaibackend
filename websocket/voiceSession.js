@@ -168,19 +168,30 @@ async function handleMessage(session, message) {
 }
 
 async function handleMicConfig(session, message) {
-  const { sampleRate, encoding = 'linear16', channels = 1 } = message;
-  if (!sampleRate || !session.agent || !session.enableStt) return;
+  const {
+    sampleRate,
+    encoding = 'linear16',
+    channels = 1,
+    audioInputMode = 'raw',
+    mimeType = 'audio/webm;codecs=opus',
+  } = message;
+  if (!session.agent || !session.enableStt) return;
+
+  const normalizedInputMode = String(audioInputMode || 'raw').toLowerCase();
+  const normalizedSampleRate = Number(sampleRate || (normalizedInputMode === 'webm' ? 48000 : process.env.DEEPGRAM_SAMPLE_RATE || 48000));
+  const normalizedEncoding = normalizedInputMode === 'webm' ? 'opus' : encoding;
 
   const configuredRate = Number(process.env.DEEPGRAM_SAMPLE_RATE || 48000);
   const configuredEncoding = process.env.DEEPGRAM_ENCODING || 'linear16';
+  const configuredInputMode = String(process.env.DEEPGRAM_AUDIO_INPUT_MODE || 'webm').toLowerCase();
 
-  console.log(`[MicConfig] Browser: ${encoding}@${sampleRate}Hz | Deepgram configured: ${configuredEncoding}@${configuredRate}Hz`);
+  console.log(`[MicConfig] Browser: mode=${normalizedInputMode} ${normalizedEncoding}@${normalizedSampleRate}Hz | Deepgram configured: mode=${configuredInputMode} ${configuredEncoding}@${configuredRate}Hz`);
 
   // If the rates already match, DON'T reinitialize — the handleInit connection is already
   // open and working. Reinitializing would close it and drop audio during reconnect.
-  if (sampleRate === configuredRate && encoding === configuredEncoding) {
+  if (normalizedInputMode === configuredInputMode && normalizedSampleRate === configuredRate && normalizedEncoding === configuredEncoding) {
     console.log(`[MicConfig] Rates match — keeping existing Deepgram connection ✅`);
-    safeSend(session.ws, { type: 'status', message: `🎙️ STT ready (${sampleRate}Hz)` });
+    safeSend(session.ws, { type: 'status', message: `STT ready (${normalizedInputMode}, ${normalizedSampleRate}Hz)` });
     return;
   }
 
@@ -201,7 +212,13 @@ async function handleMicConfig(session, message) {
   // FIX: Pass audio config directly — NEVER mutate process.env.
   // Mutating global env vars is NOT safe for concurrent sessions (race condition).
   // If two users trigger mic_config simultaneously, they corrupt each other's config.
-  const audioConfig = { encoding, sampleRate: String(sampleRate), channels: String(channels), audioInputMode: 'raw' };
+  const audioConfig = {
+    encoding: normalizedEncoding,
+    sampleRate: String(normalizedSampleRate),
+    channels: String(channels),
+    audioInputMode: normalizedInputMode,
+    mimeType,
+  };
 
   session.deepgramConn = deepgramService.createLiveConnection({
     apiKey: deepgramKey,
@@ -244,8 +261,8 @@ async function handleMicConfig(session, message) {
     },
   });
 
-  console.log(`[MicConfig] Deepgram reinitialized: ${encoding}@${sampleRate}Hz (no env mutation)`);
-  safeSend(session.ws, { type: 'status', message: `🎙️ STT ready (${sampleRate}Hz)` });
+  console.log(`[MicConfig] Deepgram reinitialized: mode=${normalizedInputMode} ${normalizedEncoding}@${normalizedSampleRate}Hz (no env mutation)`);
+  safeSend(session.ws, { type: 'status', message: `STT ready (${normalizedInputMode}, ${normalizedSampleRate}Hz)` });
 }
 
 

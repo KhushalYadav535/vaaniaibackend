@@ -506,6 +506,19 @@ class VoicePipeline {
               const toolCallStr = toolMatch[1];
               const name        = toolCallStr.split('(')[0];
               const argsStr     = toolCallStr.match(/\((.*?)\)/)?.[1] || '{}';
+              
+              // Tell user we are looking it up (instantly)
+              const lang = agent.language || 'en';
+              const checkPhrases = {
+                'en': 'Let me check that real quick...',
+                'hi': 'Ek minute rukiye, main check karti hoon...',
+                'hi-Latn': 'Ek minute rukiye, main check karti hoon...',
+                'multi': 'Ek second...',
+                'en-IN': 'Just a moment, let me check...'
+              };
+              const checkPhrase = checkPhrases[lang] || checkPhrases['en'];
+              ttsQueue.push(fireTTS(checkPhrase));
+
               try {
                 const args       = JSON.parse(argsStr.replace(/'/g, '"'));
                 const toolResult = await toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent });
@@ -583,13 +596,19 @@ class VoicePipeline {
           if (producerDone) break; // Producer is done and queue is drained
           
           // ── Circuit Breaker: Stop if LLM is stuck for >5s ──
-          if (Date.now() - lastTokenTime > 5000) {
-            console.error("[Circuit Breaker] LLM stream hung for >5s. Aborting.");
+          if (Date.now() - lastTokenTime > 4000) {
+            console.error("[Circuit Breaker] LLM stream hung for >4s. Aborting.");
             producerError = new Error("LLM_TIMEOUT");
             producerDone = true;
-            // Generate a quick fallback audio offline (or empty buffer to trigger fallback logic)
-            yield { type: 'chunk', text: "Sorry, my connection dropped for a second.", audio: Buffer.alloc(0) };
-            break;
+            
+            if (!hasEmittedAnyChunk) {
+               // If it hung before even speaking, break completely to trigger the Fallback Engine (Gemini)
+               break; 
+            } else {
+               // If it hung mid-sentence, apologize
+               yield { type: 'chunk', text: "Sorry, my connection dropped for a second.", audio: Buffer.alloc(0) };
+               break;
+            }
           }
 
           // Briefly yield control so the producer can push more items
@@ -623,12 +642,30 @@ class VoicePipeline {
 
       // ── Fallback: non-streaming response if stream never started ─────────
       console.warn('[Pipeline] Stream failed before first chunk — falling back to non-stream');
-      const fallbackResponse = await this.generateGroqResponseWithFallback({
-        messages,
-        model:       llmModel,
-        temperature: agent.temperature || 0.7,
-        apiKey:      userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
-      });
+      
+      let fallbackResponse;
+      if (geminiService.isAvailable(userSettings.geminiKey)) {
+        console.warn('[Pipeline] Using Gemini for ultimate non-stream fallback');
+        try {
+           fallbackResponse = await geminiService.generateResponse({
+             messages,
+             model: 'gemini-1.5-flash',
+             temperature: agent.temperature || 0.7,
+             apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
+           });
+        } catch(e) {
+           console.error('[Pipeline] Gemini fallback failed too:', e.message);
+        }
+      }
+
+      if (!fallbackResponse) {
+        fallbackResponse = await this.generateGroqResponseWithFallback({
+          messages,
+          model:       llmModel,
+          temperature: agent.temperature || 0.7,
+          apiKey:      userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
+        });
+      }
       const fallbackText  = (fallbackResponse?.text || 'I am here to help.').trim();
       const fallbackAudio = await ttsService.textToSpeech({
         text: fallbackText, voiceId, speed, apiKey: ttsApiKey, provider: voiceProvider,
@@ -912,7 +949,8 @@ ${agent.systemPrompt}
 - Use CONTRACTIONS always: "don't", "I'll", "you're", "we've", "that's", "it's".
 - BANNED WORDS (never use these): "certainly", "additionally", "furthermore", "absolutely", "I'd be happy to assist", "great question", "of course", "I understand your concern", "Is there anything else I can help you with?"
 - USE INSTEAD: "sure", "yeah", "okay", "hmm", "right", "got it", "so basically", "let me check", "one sec", "does that work?", "anything else?"
-- Keep responses SHORT: 1-2 sentences max. Think how you actually talk on the phone.
+- Keep responses EXTREMELY SHORT: 1 short sentence max. Humans don't monologue on the phone.
+- Use natural conversational fillers at the start of your sentences occasionally: "Got it...", "I see...", "Right...", "Okay, so...", "Hmm...".
 - For phone numbers, OTPs, codes: say each digit separately ("one two three four" not "one thousand two hundred thirty four").
 - For emails: spell out ("john at gmail dot com").
 - NEVER repeat the user's question back to them. NEVER start with greetings mid-conversation.
@@ -920,6 +958,7 @@ ${agent.systemPrompt}
 - NEVER say "As an AI" or "I'm an AI assistant" — you are a person on a phone call.
 - EMOTIONAL ACTIONS: If something is genuinely funny, output [LAUGH]. If you are thinking or exhausted, output [SIGH]. Use sparingly.
 - If you see a [SYSTEM_EVENT: ...], address the event naturally in your response but DO NOT mention the system event itself.
+- If the user interrupts you or changes the subject suddenly, acknowledge it naturally: "Oh, sorry, go ahead", or "Ah, my bad, what were you saying?".
 - Respond in ${langInstruction}.
 - Ask one question at a time. Wait for the user to answer.
 - If you don't know something, say "hmm, I'm not sure about that" honestly.

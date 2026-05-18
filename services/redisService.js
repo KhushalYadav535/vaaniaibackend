@@ -27,8 +27,13 @@ class RedisService {
         this.connected = true;
       });
 
+      let errorCount = 0;
       this.client.on('error', (err) => {
-        console.error('[Redis] Connection error:', err.message);
+        if (errorCount === 0 || errorCount % 100 === 0) {
+           // Only log occasionally to avoid console spam
+           console.error('[Redis] Connection error:', err.message);
+        }
+        errorCount++;
         this.connected = false;
       });
 

@@ -44,7 +44,17 @@ class ToolExecutor {
         if (customTool && customTool.serverUrl) {
           console.log(`🔧 Executing custom webhook tool: ${toolName} at ${customTool.serverUrl}`);
           const axios = require('axios');
-          const response = await axios.post(customTool.serverUrl, toolInput);
+          
+          // STRICT 8-SECOND TIMEOUT for Voice Pipelines
+          // If a webhook takes longer than this, the user will hang up anyway.
+          const response = await axios.post(customTool.serverUrl, toolInput, {
+            timeout: 8000, 
+            headers: {
+              'Content-Type': 'application/json',
+              'X-VaaniAI-Agent-Id': agentContext?._id?.toString() || 'unknown'
+            }
+          });
+          
           return {
             success: true,
             tool: toolName,

@@ -15,7 +15,7 @@ class GroqService {
   }
 
   getTimeoutMs() {
-    return Number(process.env.GROQ_TIMEOUT_MS || 8000);
+    return Number(process.env.GROQ_TIMEOUT_MS || 4000);
   }
 
   getCircuitFailureThreshold() {

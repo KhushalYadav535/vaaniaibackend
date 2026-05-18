@@ -52,20 +52,21 @@ class DeepgramService {
   createLiveConnection({ apiKey, language = 'en', backgroundDenoising = 'default', onTranscript, onError, onClose, keywords = [], onVADEvent = null, audioConfig = null }) {
     const key = apiKey || process.env.DEEPGRAM_API_KEY;
     if (!key) throw new Error('No Deepgram API key. Get $200 free credits at https://deepgram.com');
-    // Upgraded from nova-2 to nova-3 (Premium model) to utilize $200 credits for best accuracy
-    const model = process.env.DEEPGRAM_MODEL || 'nova-3';
+    // Using nova-2 as nova-3 may return 400 for certain languages like hi/multi
+    const model = process.env.DEEPGRAM_MODEL || 'nova-2';
 
-    // Map Hinglish to standard Hindi model
     let sttLanguage = language;
     if (sttLanguage === 'hi-Latn') sttLanguage = 'hi';
 
+    // Force nova-2 for multi/hi as nova-3 is returning 400 errors for these languages
+    let finalModel = model;
+    if (finalModel === 'nova-3' && (sttLanguage === 'hi' || sttLanguage === 'multi' || process.env.DEEPGRAM_FORCE_MULTI === 'true' || process.env.DEEPGRAM_FORCE_MULTI === 'explicit')) {
+      finalModel = 'nova-2';
+    }
+
     // Language selection for STT:
-    // For Hindi agents, use 'multi' NOT 'hi' — reason:
-    //   - 'hi' mode fails 100% on English words (website→sach, banana→main)
-    //   - 'multi' handles Hinglish (Hindi+English code-switching) — occasional
-    //     Spanish confusion is less harmful than total English word loss
-    // 'en' agents keep 'en' | explicitly set agents keep their value
-    if (sttLanguage === 'hi') sttLanguage = 'multi';
+    // Let the agent's language dictate the model.
+    // 'nova-2' with 'hi' supports Hindi script and Hinglish nouns.
     const forceMulti = process.env.DEEPGRAM_FORCE_MULTI === 'explicit';
     if (forceMulti) sttLanguage = 'multi';
 
@@ -87,7 +88,7 @@ class DeepgramService {
 
     if (!this._latencyConfigLogged) {
       console.log(`[Deepgram Latency Config] FAST_TURN_MODE=${fastTurnMode} utterance_end_ms=${utteranceEndMs} endpointing=${endpointingMs} min_final_chars=${minFinalChars}`);
-      console.log(`[Deepgram STT Config] model=${model} language=${sttLanguage} force_multi=${forceMulti}`);
+      console.log(`[Deepgram STT Config] model=${finalModel} language=${sttLanguage} force_multi=${forceMulti}`);
       if (audioInputMode === 'webm') {
         console.log(`[Deepgram Audio Config] mode=webm mimetype=${mimeType}`);
       } else {
@@ -98,7 +99,7 @@ class DeepgramService {
 
     // Build query string
     const params = new URLSearchParams({
-      model,
+      model: finalModel,
       language: sttLanguage,
       smart_format: 'true',
       interim_results: 'true',
@@ -190,6 +191,10 @@ class DeepgramService {
     });
 
     ws.on('error', (err) => {
+      if (err?.message === 'WebSocket was closed before the connection was established') {
+        console.log('🔵 Deepgram connection closed before established (likely reinitialized).');
+        return;
+      }
       const normalized = {
         message: err?.message || 'WebSocket connection failed',
         code: err?.code || 'network_error',
@@ -226,6 +231,13 @@ class DeepgramService {
         try {
           if (keepaliveInterval) { clearInterval(keepaliveInterval); keepaliveInterval = null; }
           if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+            // Remove listeners to prevent 'error' or 'close' events from firing after we intentionally close it.
+            // This is especially important for CONNECTING sockets which would emit an error.
+            ws.removeAllListeners('error');
+            ws.removeAllListeners('close');
+            ws.removeAllListeners('message');
+            ws.removeAllListeners('open');
+            ws.on('error', () => {}); // Catch any subsequent errors silently
             ws.close(1000, 'Session ended');
           }
         } catch (e) {

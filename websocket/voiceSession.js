@@ -158,6 +158,35 @@ async function handleMessage(session, message) {
       await handleEndSession(session, 'user_hangup');
       break;
 
+    case 'user_speech_start':
+      // Frontend VAD detected speech start
+      if (session.agentSpeaking) {
+        // If we want to interrupt based on VAD alone, we could do it here.
+        // But we rely on Deepgram transcript length for smarter interruption.
+      }
+      break;
+
+    case 'user_speech_end':
+      // Frontend VAD detected speech end
+      // Use this as a reliable trigger to process whatever Deepgram transcribed
+      if (!session.isProcessing && session._lastSttTranscript && session._lastSttTranscript.trim().length > 0) {
+        session.isProcessing = true;
+        session.latency.turnStartedAt = Date.now();
+        session.latency.llmStartedAt = null;
+        session.latency.firstTextChunkAt = null;
+        session.latency.firstAudioAt = null;
+        const finalTranscript = session._lastSttTranscript;
+        session._lastSttTranscript = '';
+        console.log(`[VAD] user_speech_end triggered processing: "${finalTranscript}"`);
+        try {
+          await processTranscript(session, finalTranscript);
+        } catch (e) {
+          console.error('Error processing VAD transcript:', e);
+          session.isProcessing = false;
+        }
+      }
+      break;
+
     case 'ping':
       safeSend(session.ws, { type: 'pong' });
       break;
@@ -227,6 +256,7 @@ async function handleMicConfig(session, message) {
     audioConfig,
     onTranscript: async ({ transcript, isFinal, speechFinal }) => {
       safeSend(session.ws, { type: 'transcript', text: transcript, isFinal: false, role: 'user' });
+      session._lastSttTranscript = transcript;
 
       const sensitivity = session.agent.advanced?.interruptionSensitivity ?? 0.5;
       const interruptThreshold = Math.max(1, Math.round(15 * (1 - sensitivity)));
@@ -241,6 +271,7 @@ async function handleMicConfig(session, message) {
         session.latency.llmStartedAt = null;
         session.latency.firstTextChunkAt = null;
         session.latency.firstAudioAt = null;
+        session._lastSttTranscript = '';
         try {
           await processTranscript(session, transcript);
         } catch (e) {

@@ -126,25 +126,65 @@ class TtsService {
     return audioBuffer || Buffer.alloc(0);
   }
 
-  /**
-   * Edge TTS — in-memory via toStream() to avoid disk I/O
-   * ~2-3x faster than file-based approach for short phrases
-   */
   async edgeTTSInMemory(text, voiceId, speed, pitch) {
     const rate = `${speed >= 1 ? '+' : ''}${Math.round((speed - 1) * 100)}%`;
     const pitchStr = `${pitch >= 0 ? '+' : ''}${pitch}Hz`;
 
     const tts = new EdgeTTS({ voice: voiceId, rate, pitch: pitchStr });
-    const readable = tts.toStream(text);
+    
+    // Connect to WebSocket using internal method
+    const _wsConnect = await tts._connectWebSocket();
+    
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let timeout = setTimeout(() => {
+        _wsConnect.close();
+        reject(new Error('Edge TTS Timed out'));
+      }, 15000); // 15s timeout for fast failure
 
-    const chunks = [];
-    for await (const chunk of readable) {
-      if (Buffer.isBuffer(chunk)) chunks.push(chunk);
-      else if (typeof chunk === 'object' && chunk.audio) chunks.push(chunk.audio);
-    }
-    const audio = Buffer.concat(chunks);
-    if (audio.length === 0) throw new Error('EdgeTTS stream returned empty audio');
-    return audio;
+      _wsConnect.on('message', async (data, isBinary) => {
+        if (isBinary) {
+          const separator = 'Path:audio\r\n';
+          const index = data.indexOf(separator) + separator.length;
+          const audioData = data.subarray(index);
+          chunks.push(audioData);
+        } else {
+          const message = data.toString();
+          if (message.includes('Path:turn.end')) {
+            clearTimeout(timeout);
+            _wsConnect.close();
+            const audio = Buffer.concat(chunks);
+            resolve(audio);
+          }
+        }
+      });
+      
+      _wsConnect.on('error', (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      });
+
+      const crypto = require('crypto');
+      const requestId = crypto.randomBytes(16).toString('hex');
+      
+      // Escape XML to avoid breaking SSML
+      const escapeXml = (unsafe) => unsafe.replace(/[<>&"']/g, c => {
+        switch (c) {
+          case '<': return '&lt;'; case '>': return '&gt;';
+          case '&': return '&amp;'; case '"': return '&quot;';
+          case "'": return '&apos;'; default: return c;
+        }
+      });
+
+      const langCode = voiceId.split('-').slice(0, 2).join('-');
+      _wsConnect.send(`X-RequestId:${requestId}\r\nContent-Type:application/ssml+xml\r\nPath:ssml\r\n\r\n` + 
+        `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}">` +
+        `<voice name="${voiceId}">` +
+        `<prosody rate="${rate}" pitch="${pitchStr}" volume="default">` +
+        `${escapeXml(text)}` +
+        `</prosody></voice></speak>`
+      );
+    });
   }
 
   /**

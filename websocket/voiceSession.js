@@ -1059,9 +1059,11 @@ async function processTranscript(session, transcript) {
       }
     }
     
-    // Only send the final audio_end signal once all chunks have completed generating
-    safeSend(session.ws, { type: session.streamProtocol ? 'audio_stream_end' : 'audio_end' });
-    // If no audio was generated/sent, start the idle timer immediately.
+    // Send a final empty buffer with isFinal=true to trigger the end of stream logic
+    // This will send 'audio_end' and correctly start the _agentSpeakingTimer based on accumulated audio duration.
+    sendAudioBuffer(session, Buffer.alloc(0), true);
+
+    // If no audio was generated/sent at all, start the idle timer immediately.
     // Otherwise, sendAudioBuffer has already set a timer based on the actual audio duration.
     if (!session.agentSpeaking) {
       startIdleTimer(session);

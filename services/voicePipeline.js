@@ -7,6 +7,7 @@ const geminiService = require('./geminiService');
 const ttsService = require('./ttsService');
 const deepgramService = require('./deepgramService');
 const toolExecutor = require('./toolExecutor');
+const llmFallback = require('./llmFallback');
 const KnowledgeBase = require('../models/KnowledgeBase');
 
 class VoicePipeline {
@@ -124,7 +125,17 @@ class VoicePipeline {
       .split(',')
       .map(m => m.trim())
       .filter(Boolean);
-    const defaults = ['llama-3.1-8b-instant', 'llama-3.3-70b-versatile', 'mixtral-8x7b-32768'];
+    // Verified-alive models on Groq production (decommissioned ones removed):
+    // llama-3.1-8b-instant   — fastest (conversation default)
+    // llama-3.3-70b-versatile — smarter, slightly slower
+    // meta-llama/llama-4-scout-17b-16e-instruct — Llama 4, different family
+    // openai/gpt-oss-20b      — different provider for diversity if Llama family rate-limits
+    const defaults = [
+      'llama-3.1-8b-instant',
+      'llama-3.3-70b-versatile',
+      'meta-llama/llama-4-scout-17b-16e-instruct',
+      'openai/gpt-oss-20b',
+    ];
     const ordered = [primaryModel, ...envList, ...defaults];
     return [...new Set(ordered)];
   }
@@ -223,8 +234,11 @@ class VoicePipeline {
         // ─── Direct Gemini provider selection ─────────────────────────────
         llmResponse = await geminiService.generateResponse({
           messages,
-          model: llmModel || 'gemini-1.5-flash',
-          temperature: agent.temperature || 0.7,
+          model: llmModel || 'gemini-2.0-flash',
+          // Default temperature 0.4 for business voice agents — high creativity
+          // (default 0.7) makes Llama drift into long, decorative essays.
+          // Tunable via agent.temperature in DB or LLM_DEFAULT_TEMPERATURE env.
+          temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
           apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
         });
       } else {
@@ -232,7 +246,10 @@ class VoicePipeline {
         llmResponse = await this.generateGroqResponseWithFallback({
           messages,
           model: llmModel,
-          temperature: agent.temperature || 0.7,
+          // Default temperature 0.4 for business voice agents — high creativity
+          // (default 0.7) makes Llama drift into long, decorative essays.
+          // Tunable via agent.temperature in DB or LLM_DEFAULT_TEMPERATURE env.
+          temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
           apiKey: userSettings.groqKey || process.env.GROQ_API_KEY,
           tools: groqTools.length > 0 ? groqTools : null,
         });
@@ -352,7 +369,7 @@ class VoicePipeline {
    *
    * Result: First audio arrives ~500ms instead of ~1000ms.
    */
-  async *processTextStream({ text, agent, history = [], userSettings = {}, memory = null, ragContext = '' }) {
+  async *processTextStream({ text, agent, history = [], userSettings = {}, memory = null, ragContext = '', abortSignal = null }) {
     // ── Emotion detection ──────────────────────────────────────────────────
     const currentEmotion = this.detectEmotion(text);
     let emotionPrompt = '';
@@ -388,7 +405,12 @@ class VoicePipeline {
     if (agent.knowledgeBaseId) {
       const kb = await KnowledgeBase.findById(agent.knowledgeBaseId);
       if (kb) {
-        dynamicKnowledge = `\n[Dynamic Knowledge Context]:\n${kb.content.substring(0, 1000)}`;
+        // Cap at 400 chars — the 1000 cap was making Llama 3.1 8B
+        // dump the whole KB into every reply ("brochure mode").
+        // RAG already runs hybrid search separately and injects
+        // relevant chunks via getContextForQuery; this static fallback
+        // exists only to seed the agent with a basic awareness.
+        dynamicKnowledge = `\n[Dynamic Knowledge Context]:\n${kb.content.substring(0, 400)}`;
       }
     }
 
@@ -429,7 +451,7 @@ class VoicePipeline {
       // ─── Direct Gemini streaming ─────────────────────────────────────
       tokenStream = geminiService.generateStreamResponse({
         messages,
-        model: llmModel || 'gemini-1.5-flash',
+        model: llmModel || 'gemini-2.0-flash',
         temperature: agent.temperature || 0.7,
         apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
       });
@@ -442,8 +464,12 @@ class VoicePipeline {
           tokenStream   = groqService.generateStreamResponse({
             messages,
             model:       modelCandidate,
-            temperature: agent.temperature || 0.7,
+            // Default temperature 0.4 for business voice agents — high creativity
+          // (default 0.7) makes Llama drift into long, decorative essays.
+          // Tunable via agent.temperature in DB or LLM_DEFAULT_TEMPERATURE env.
+          temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
             apiKey:      userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
+            abortSignal,
           });
           streamCreated = true;
           break;
@@ -606,9 +632,13 @@ class VoicePipeline {
         if (drainIdx >= ttsQueue.length) {
           if (producerDone) break; // Producer is done and queue is drained
           
-          // ── Circuit Breaker: Stop if LLM is stuck for >5s ──
-          if (Date.now() - lastTokenTime > 4000) {
-            console.error("[Circuit Breaker] LLM stream hung for >4s. Aborting.");
+          // ── Circuit Breaker: Stop if LLM is stuck for >Ns ──
+          // Default 6s — long enough for slow Hindi/Hinglish responses,
+          // short enough that the Gemini/llmFallback path still feels live.
+          // Tunable via LLM_STREAM_HANG_TIMEOUT_MS.
+          const hangTimeoutMs = Number(process.env.LLM_STREAM_HANG_TIMEOUT_MS || 6000);
+          if (Date.now() - lastTokenTime > hangTimeoutMs) {
+            console.error(`[Circuit Breaker] LLM stream hung for >${hangTimeoutMs}ms. Aborting.`);
             producerError = new Error("LLM_TIMEOUT");
             producerDone = true;
             
@@ -653,15 +683,18 @@ class VoicePipeline {
 
       // ── Fallback: non-streaming response if stream never started ─────────
       console.warn('[Pipeline] Stream failed before first chunk — falling back to non-stream');
-      
+
       let fallbackResponse;
       if (geminiService.isAvailable(userSettings.geminiKey)) {
         console.warn('[Pipeline] Using Gemini for ultimate non-stream fallback');
         try {
            fallbackResponse = await geminiService.generateResponse({
              messages,
-             model: 'gemini-1.5-flash',
-             temperature: agent.temperature || 0.7,
+             model: 'gemini-2.0-flash',
+             // Default temperature 0.4 for business voice agents — high creativity
+          // (default 0.7) makes Llama drift into long, decorative essays.
+          // Tunable via agent.temperature in DB or LLM_DEFAULT_TEMPERATURE env.
+          temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
              apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
            });
         } catch(e) {
@@ -670,20 +703,45 @@ class VoicePipeline {
       }
 
       if (!fallbackResponse) {
-        fallbackResponse = await this.generateGroqResponseWithFallback({
-          messages,
-          model:       llmModel,
-          temperature: agent.temperature || 0.7,
-          apiKey:      userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
-        });
+        try {
+          fallbackResponse = await this.generateGroqResponseWithFallback({
+            messages,
+            model:       llmModel,
+            // Default temperature 0.4 for business voice agents — high creativity
+          // (default 0.7) makes Llama drift into long, decorative essays.
+          // Tunable via agent.temperature in DB or LLM_DEFAULT_TEMPERATURE env.
+          temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
+            apiKey:      userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
+          });
+        } catch (e) {
+          console.error('[Pipeline] Groq retry also failed:', e.message);
+        }
       }
-      const fallbackText  = (fallbackResponse?.text || 'I am here to help.').trim();
+
+      // Last-resort: cache + intent templates so the call stays alive
+      // even when both Groq and Gemini are rate-limited or down.
+      let fallbackText;
+      if (fallbackResponse?.text) {
+        fallbackText = fallbackResponse.text.trim();
+      } else {
+        const lastResort = llmFallback.getReply(text, agent);
+        fallbackText = lastResort.text;
+        console.warn(`[Pipeline] Last-resort fallback (${lastResort.source}): "${fallbackText}"`);
+      }
+
       const fallbackAudio = await ttsService.textToSpeech({
         text: fallbackText, voiceId, speed, apiKey: ttsApiKey, provider: voiceProvider,
       });
 
       yield { type: 'chunk', text: fallbackText,  audio: fallbackAudio };
       yield { type: 'final', fullText: fallbackText };
+    } finally {
+      // Remember successful responses for future fallback cache hits.
+      // Only remember non-trivial replies so we don't poison the cache
+      // with apologies or empty strings.
+      if (fullResponseText && fullResponseText.trim().length > 10) {
+        try { llmFallback.remember(text, fullResponseText.trim()); } catch (_) {}
+      }
     }
   }
 
@@ -949,31 +1007,14 @@ class VoicePipeline {
     const lang = agent.language || 'en';
     const langInstruction = lang === 'en' ? 'English' : lang === 'hi' ? 'Hindi (MUST BE WRITTEN IN ROMAN/LATIN ALPHABET ONLY. NO DEVNAGARI SCRIPT ALLOWED)' : lang === 'hi-Latn' ? 'Hinglish (Hindi in Roman script)' : lang === 'multi' ? 'the same language the user speaks in (use Roman script for Hindi)' : lang;
 
-    let prompt = `You are "${agent.name}", a real person on a live phone call. Your personality, role, and behavior are defined ENTIRELY by the instructions below. You must follow them as your highest priority.
+    // Persona block first (sets identity), then domain context, then
+    // voice constraints LAST. Llama 3.x has strong recency bias —
+    // whatever's at the end dominates the response. Putting voice rules
+    // last is what stops the model from drifting into helpful-essay mode.
+    let prompt = `You are "${agent.name}", a real person on a live phone call.
 
-## YOUR INSTRUCTIONS (FOLLOW EXACTLY):
+## YOUR ROLE & PERSONA:
 ${agent.systemPrompt}
-
-## VOICE CALL RULES (always apply):
-- You are on a LIVE VOICE CALL. A real person is listening to you, not reading a screen.
-- Speak like a REAL HUMAN on a phone — casual, warm, and natural.
-- Use CONTRACTIONS always: "don't", "I'll", "you're", "we've", "that's", "it's".
-- BANNED WORDS (never use these): "certainly", "additionally", "furthermore", "absolutely", "I'd be happy to assist", "great question", "of course", "I understand your concern", "Is there anything else I can help you with?"
-- USE INSTEAD: "sure", "yeah", "okay", "hmm", "right", "got it", "so basically", "let me check", "one sec", "does that work?", "anything else?"
-- Keep responses EXTREMELY SHORT: 1 short sentence max. Humans don't monologue on the phone.
-- Use natural conversational fillers at the start of your sentences occasionally: "Got it...", "I see...", "Right...", "Okay, so...", "Hmm...".
-- For phone numbers, OTPs, codes: say each digit separately ("one two three four" not "one thousand two hundred thirty four").
-- For emails: spell out ("john at gmail dot com").
-- NEVER repeat the user's question back to them. NEVER start with greetings mid-conversation.
-- NEVER use markdown, bullet points, asterisks, numbered lists, or any formatting.
-- NEVER say "As an AI" or "I'm an AI assistant" — you are a person on a phone call.
-- EMOTIONAL ACTIONS: If something is genuinely funny, output [LAUGH]. If you are thinking or exhausted, output [SIGH]. Use sparingly.
-- If you see a [SYSTEM_EVENT: ...], address the event naturally in your response but DO NOT mention the system event itself.
-- If the user interrupts you or changes the subject suddenly, acknowledge it naturally: "Oh, sorry, go ahead", or "Ah, my bad, what were you saying?".
-- Respond in ${langInstruction}.
-- Ask one question at a time. Wait for the user to answer.
-- If you don't know something, say "hmm, I'm not sure about that" honestly.
-- Current date: ${new Date().toDateString()}.
 `;
 
     if (agent.transferToAgentId) {
@@ -986,8 +1027,64 @@ ${agent.systemPrompt}
     }
 
     if (ragContext) {
-      prompt += `\n\n## KNOWLEDGE BASE CONTEXT (use this to answer questions):\n${ragContext}`;
+      prompt += `\n\n## KNOWLEDGE BASE CONTEXT (only quote when DIRECTLY asked; never summarize all of it):\n${ragContext}`;
     }
+
+    // VOICE CONSTRAINTS LAST — recency bias makes these dominate behavior.
+    // Few-shot examples carry far more weight than abstract rules with
+    // Llama 3.1 8B — every "❌ → ✅" pair below is a tested correction
+    // for a specific failure mode we saw in production.
+    prompt += `
+
+## CRITICAL VOICE RULES — NON-NEGOTIABLE:
+
+You are on a phone call. You are NOT writing an article, list, or brochure.
+
+# RULE 1 — LENGTH: Maximum 1 sentence (≤15 words). Always.
+  ❌ "We offer website development, e-commerce, SEO, digital marketing, and member management services for your gym..."
+  ✅ "Sure — gym ke liye website ban jaayegi. Aap kis cheez ke liye chahiye — booking, ya basic info?"
+
+# RULE 2 — DISCOVERY MODE: When user mentions a need, DON'T list features.
+Ask ONE specific qualifying question. Treat it like a sales discovery call.
+The discovery order is: 1) what exactly 2) when 3) budget/scale 4) name+contact.
+  ❌ "We can build websites with: 1) Branding 2) Design 3) SEO 4) Hosting..."
+  ✅ "Theek hai. Aapka gym kis city mein hai?"
+  ✅ "Cool. Already website hai jisko upgrade karna hai, ya bilkul fresh?"
+
+# RULE 3 — NO ROBOTIC OPENERS: Never say "गुड", "Certainly", "Absolutely",
+"I'd be happy to help", "I understand your concern", "great question".
+Use natural human openers: "Sure", "Haan", "Theek hai", "Got it", "Okay so", "Hmm", "Right".
+
+# RULE 4 — NO MARKDOWN: Zero bullets, dashes, numbers, asterisks, hyphens.
+This is spoken audio — markdown sounds broken when read aloud.
+
+# RULE 5 — CONTRACTIONS ALWAYS: don't, I'll, you're, we've, that's, it's, can't.
+
+# RULE 6 — NUMBERS & EMAILS:
+Phone numbers / OTPs / codes — say each digit separately.
+Emails — spell out: "rahul at gmail dot com".
+
+# RULE 7 — WHEN UNSURE: "hmm, mujhe iska confirm karna padega" — never invent details.
+
+# RULE 8 — LANGUAGE: Reply in ${langInstruction}. Match user's energy and code-switching.
+
+## EXAMPLE DIALOGUES — Follow this pattern:
+
+USER: "मुझे gym के लिए website banwani hai"
+YOU: "Sure, gym ke liye website ban jaayegi. Aap basic info site chahte ho ya membership booking bhi?"
+
+USER: "Mujhe ek school ke liye website chahiye"
+YOU: "Theek hai. School ka naam aur kis city mein hai, batao?"
+
+USER: "Pricing kya hai?"
+YOU: "Pricing aapke project pe depend karti hai. Aapko kya features chahiye, batao?"
+
+USER: "I want a basic ecommerce site"
+YOU: "Got it. Roughly kitne products list karne hain — under 50, ya more?"
+
+Today is ${new Date().toDateString()}.
+You are NOT an AI. Never say "As an AI" or "I'm an assistant".
+`;
 
     return prompt;
   }

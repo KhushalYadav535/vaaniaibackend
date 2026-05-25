@@ -29,9 +29,12 @@ class RAGService {
   }
 
   /**
-   * Generate embedding for a single text using Gemini (free)
+   * Generate embedding for a single text using Gemini (free).
+   * Returns null when Gemini is disabled (USE_GEMINI=false) so the caller
+   * automatically falls back to keyword-only search.
    */
   async generateEmbedding(text) {
+    if (!geminiService.isEnabled || !geminiService.isEnabled()) return null;
     try {
       return await geminiService.generateEmbedding(text);
     } catch (e) {
@@ -44,6 +47,9 @@ class RAGService {
    * Generate embeddings for multiple texts (batch)
    */
   async generateEmbeddings(texts) {
+    if (!geminiService.isEnabled || !geminiService.isEnabled()) {
+      return texts.map(() => []);
+    }
     try {
       return await geminiService.generateEmbeddings(texts);
     } catch (e) {

@@ -38,6 +38,418 @@ const ttsService = require('../services/ttsService');
 // Track active sessions
 const activeSessions = new Map();
 
+// Concurrency cap — protects free-tier API quotas (Groq, Deepgram) and server CPU.
+// When the cap is hit, new connections are rejected with a 1013 (try again later)
+// close code so the client can show a polite "system busy" message.
+const MAX_CONCURRENT_SESSIONS = Number(process.env.MAX_CONCURRENT_SESSIONS || process.env.MAX_CONCURRENT_CALLS || 25);
+
+// Hard idle timeout — kills sessions that have stopped sending any audio
+// or messages for this long. Prevents zombie sessions from accumulating
+// when a browser tab is closed without a clean WS close.
+const SESSION_HARD_IDLE_MS = Number(process.env.SESSION_HARD_IDLE_MS || 5 * 60 * 1000);
+
+function getActiveSessionCount() {
+  return activeSessions.size;
+}
+
+function canAcceptNewSession() {
+  return activeSessions.size < MAX_CONCURRENT_SESSIONS;
+}
+
+// Reaper: every 30s, kill sessions whose last activity exceeded the idle window.
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, sess] of activeSessions.entries()) {
+    const last = sess._lastActivityAt || sess.startTime || now;
+    if (now - last > SESSION_HARD_IDLE_MS) {
+      console.log(`[Reaper] Killing idle session ${id} (idle ${Math.round((now - last) / 1000)}s)`);
+      try { sess.ws?.close(1000, 'idle_timeout'); } catch (_) {}
+      try { sess.deepgramConn?.finish(); } catch (_) {}
+      activeSessions.delete(id);
+    }
+  }
+}, 30000).unref?.();
+
+function touchSession(session) {
+  session._lastActivityAt = Date.now();
+}
+
+/**
+ * Build the FULL Deepgram onTranscript handler for a session.
+ *
+ * Why this exists: previously handleMicConfig and trySttFallbackReconnect
+ * created Deepgram connections with a dumbed-down handler that lacked
+ * interruption detection, backchanneling, idle timers and silence-timer
+ * fallback. The user got a silently degraded experience after mic_config.
+ * One handler factory keeps them in sync forever.
+ */
+function buildSessionOnTranscript(session) {
+  return async ({ transcript, isFinal, speechFinal }) => {
+    const agent = session.agent;
+    if (!agent) return;
+
+    // ── Interruption detection: user speaks while agent is talking ──
+    if (session.agentSpeaking) {
+      const sensitivity = agent.advanced?.interruptionSensitivity ?? 0.5;
+      const charThreshold = Math.max(5, Math.round(20 * (1 - sensitivity)));
+
+      const trimmedText = transcript.trim().toLowerCase();
+      const wordCount = trimmedText.split(/\s+/).length;
+
+      const noiseWords = ['hmm', 'um', 'uh', 'ah', 'oh', 'yeah', 'yes', 'ok', 'okay', 'haan', 'acha', 'accha', 'hmm...', 'right'];
+      const isJustNoise = wordCount <= 2 && noiseWords.some(w => trimmedText === w || trimmedText.startsWith(w));
+
+      const stopWords = ['stop', 'wait', 'hold on', 'ruko', 'ek second', 'listen', 'no', 'nahi', 'galat'];
+      const hasStopWord = stopWords.some(w => trimmedText.includes(w));
+
+      const shouldInterrupt = hasStopWord || (!isJustNoise && (trimmedText.length >= charThreshold || wordCount >= 3));
+
+      // ── Debounce: after firing one interrupt, suppress further filler+
+      // interrupt churn for 2.5s. The filler TTS itself sets agentSpeaking=true
+      // briefly which would otherwise re-trigger this branch on every new
+      // interim transcript and cause a "Haan boliye / Sorry, go ahead." loop.
+      const INTERRUPT_DEBOUNCE_MS = 2500;
+      const recentlyInterrupted = session._interruptFiredAt && (Date.now() - session._interruptFiredAt < INTERRUPT_DEBOUNCE_MS);
+
+      if (shouldInterrupt && !recentlyInterrupted) {
+        console.log(`[Interrupt] User spoke during agent TTS: "${transcript.trim().substring(0, 60)}"`);
+        session._interruptFiredAt = Date.now();
+
+        session.currentGenerationId = uuidv4();
+        // Abort the in-flight LLM HTTP request so it actually stops
+        // consuming a Groq SDK connection slot. Without this, parallel
+        // interrupts queue up behind dead streams and the next real
+        // request hits a "groq_completion_timeout".
+        if (session._currentAbortController) {
+          try { session._currentAbortController.abort(); } catch (_) {}
+          session._currentAbortController = null;
+        }
+        session.agentSpeaking = false;
+        session._audioQueueDurationMs = 0;
+        if (session._agentSpeakingTimer) { clearTimeout(session._agentSpeakingTimer); session._agentSpeakingTimer = null; }
+        session.isProcessing = false;
+
+        safeSend(session.ws, { type: 'interrupt' });
+        safeSend(session.ws, { type: 'clear_audio' });
+
+        // Interrupt filler ("Haan boliye / Sorry, go ahead") is OPT-IN.
+        // The polished default is: stop the agent, listen quietly, then
+        // respond to what the user actually said. Talking over an
+        // interrupting user with a filler is what makes voice agents feel
+        // robotic — Vapi/Retell ship with no filler by default.
+        // Enable explicitly via INTERRUPT_FILLER_ENABLED=true.
+        const fillerEnabled = String(process.env.INTERRUPT_FILLER_ENABLED || 'false').toLowerCase() === 'true';
+        if (fillerEnabled) {
+          const lang = agent.language || 'en';
+          const interruptFillers = {
+            'en': 'Sorry, go ahead.',
+            'hi': 'Haan boliye.',
+            'hi-Latn': 'Haan boliye.',
+            'multi': 'Haan boliye.',
+            'en-IN': 'Sorry, go ahead.'
+          };
+          const fillerText = interruptFillers[lang] || interruptFillers['en'];
+          ttsService.textToSpeech({
+            text: fillerText,
+            voiceId: agent.voice?.voiceId,
+            speed: 1.15,
+            provider: agent.voice?.provider
+          }).then(audioBuffer => {
+            if (audioBuffer && audioBuffer.length > 0) {
+              safeSend(session.ws, { type: 'response_text', text: fillerText });
+              sendAudioBuffer(session, audioBuffer);
+            }
+          }).catch(e => console.error('Interruption TTS failed:', e));
+        }
+
+        session._lastSttTranscript = transcript;
+
+        if (isFinal && speechFinal && transcript.trim().length > 0) {
+          if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
+          session.isProcessing = true;
+          session.latency.turnStartedAt = Date.now();
+          session.latency.llmStartedAt = null;
+          session.latency.firstTextChunkAt = null;
+          session.latency.firstAudioAt = null;
+          session._userSpeechStartTime = null;
+          session._backchannelTriggered = false;
+          console.log(`[STT] Interrupt speech_final: "${transcript}"`);
+          try {
+            await processTranscript(session, transcript);
+          } catch (e) {
+            console.error('Error processing interrupt transcript:', e);
+            session.isProcessing = false;
+          }
+          return;
+        }
+
+        if (session._silenceTimer) clearTimeout(session._silenceTimer);
+        session._silenceTimer = setTimeout(async () => {
+          session._silenceTimer = null;
+          const pending = session._lastSttTranscript;
+          if (!pending || pending.trim().length < 2) return;
+          if (session.isProcessing) return;
+          session._lastSttTranscript = '';
+          session.isProcessing = true;
+          session.latency.turnStartedAt = Date.now();
+          session.latency.llmStartedAt = null;
+          session.latency.firstTextChunkAt = null;
+          session.latency.firstAudioAt = null;
+          session._userSpeechStartTime = null;
+          session._backchannelTriggered = false;
+          console.log(`[STT] Interrupt silence-timer: "${pending}"`);
+          try {
+            await processTranscript(session, pending);
+          } catch (e) {
+            console.error('Error processing interrupt silence-timer transcript:', e);
+            session.isProcessing = false;
+          }
+        }, 500);
+      }
+      return;
+    }
+
+    // Normal listening path: forward interim transcripts + run timers
+    // Reset the interrupt-debounce window once the user has actually
+    // produced a final transcript — at that point the previous interrupt
+    // is fully consumed and a new one is legitimate.
+    if (isFinal && speechFinal) {
+      session._interruptFiredAt = 0;
+    }
+
+    safeSend(session.ws, {
+      type: 'transcript',
+      text: transcript,
+      isFinal: false,
+      role: 'user',
+    });
+
+    if (transcript.trim().length > 0) {
+      if (session._idleTimer) { clearTimeout(session._idleTimer); session._idleTimer = null; }
+      session._lastSttTranscript = transcript;
+
+      // Active backchanneling (after 4s of continuous user speech)
+      if (!session._userSpeechStartTime) {
+        session._userSpeechStartTime = Date.now();
+        session._backchannelTriggered = false;
+      } else if (Date.now() - session._userSpeechStartTime > 4000 && !session._backchannelTriggered && !session.agentSpeaking) {
+        session._backchannelTriggered = true;
+        console.log('[Backchannel] Injecting active listening filler...');
+        const lang = agent.language || 'en';
+        const backchannels = {
+          'en': ['Mhmm...', 'Right.', 'I see.'],
+          'hi': ['Mhmm...', 'Accha.', 'Haan...'],
+          'hi-Latn': ['Mhmm...', 'Accha.', 'Haan...'],
+          'multi': ['Mhmm...', 'Accha.'],
+          'en-IN': ['Mhmm...', 'Right.']
+        };
+        const options = backchannels[lang] || backchannels['en'];
+        const backchannelText = options[Math.floor(Math.random() * options.length)];
+        ttsService.textToSpeech({
+          text: backchannelText,
+          voiceId: agent.voice?.voiceId,
+          speed: 0.9,
+          provider: agent.voice?.provider
+        }).then(audioBuffer => {
+          if (audioBuffer && audioBuffer.length > 0) sendAudioBuffer(session, audioBuffer);
+        }).catch(e => console.error('Backchannel TTS failed:', e));
+      }
+    }
+
+    // Path 1: Deepgram speech_final
+    if (isFinal && speechFinal && transcript.trim().length > 0) {
+      if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
+      if (session.isProcessing) return;
+      session.isProcessing = true;
+      session.latency.turnStartedAt = Date.now();
+      session.latency.llmStartedAt = null;
+      session.latency.firstTextChunkAt = null;
+      session.latency.firstAudioAt = null;
+      session._userSpeechStartTime = null;
+      session._backchannelTriggered = false;
+      console.log(`[STT] speech_final triggered: "${transcript}"`);
+      try {
+        await processTranscript(session, transcript);
+      } catch (e) {
+        console.error('Error processing live transcript:', e);
+        session.isProcessing = false;
+      }
+      return;
+    }
+
+    // Path 2: Client-side silence-timer fallback (600ms)
+    if (session._silenceTimer) clearTimeout(session._silenceTimer);
+    session._silenceTimer = setTimeout(async () => {
+      session._silenceTimer = null;
+      if (session.agentSpeaking) return;
+      const pending = session._lastSttTranscript;
+      if (!pending || pending.trim().length < 2) return;
+      if (session.isProcessing) return;
+      session._lastSttTranscript = '';
+      session.isProcessing = true;
+      session.latency.turnStartedAt = Date.now();
+      session.latency.llmStartedAt = null;
+      session.latency.firstTextChunkAt = null;
+      session.latency.firstAudioAt = null;
+      session._userSpeechStartTime = null;
+      session._backchannelTriggered = false;
+      console.log(`[STT] silence-timer triggered: "${pending}"`);
+      try {
+        await processTranscript(session, pending);
+      } catch (e) {
+        console.error('Error processing silence-timer transcript:', e);
+        session.isProcessing = false;
+      }
+    }, 600);
+  };
+}
+
+/**
+ * Build VAD event handler. Forwards speech_started events to the client
+ * so it can prime its UI state when user begins talking over the agent.
+ */
+function buildSessionOnVADEvent(session) {
+  return (event) => {
+    if (event.type === 'speech_started' && session.agentSpeaking) {
+      safeSend(session.ws, { type: 'vad_speech_started' });
+    }
+  };
+}
+
+/**
+ * Tiny universal English-keyword seed.
+ * These are domain-agnostic words that appear in nearly every business
+ * conversation (any Indian user calling any agent will say one of these).
+ * Domain-specific keywords are auto-extracted from agent context — see
+ * extractAgentKeywords() below — instead of being hardcoded here.
+ */
+const UNIVERSAL_HINGLISH_SEED = [
+  'website', 'app', 'call', 'email', 'phone', 'service', 'business',
+];
+
+/**
+ * Pull English-looking domain keywords out of the agent's own configuration.
+ * The agent's systemPrompt, firstMessage, and name already encode the
+ * vocabulary that domain's users will say — boosting THESE adapts STT to
+ * any industry (lawyer, salon, doctor, gym, school, ...) without us
+ * predicting domains in advance.
+ *
+ * Heuristic: match runs of ASCII letters that are 3+ chars, dedupe,
+ * and drop a small stoplist of English filler words that would crowd
+ * out the actual signal.
+ */
+const AGENT_KEYWORD_STOPLIST = new Set([
+  'the', 'and', 'you', 'your', 'are', 'for', 'with', 'this', 'that',
+  'will', 'when', 'have', 'has', 'had', 'not', 'but', 'all', 'any',
+  'can', 'cant', 'should', 'would', 'could', 'they', 'their', 'them',
+  'our', 'use', 'using', 'used', 'ask', 'tell', 'say', 'said',
+  'role', 'voice', 'agent', 'assistant', 'human', 'user',
+  'system', 'prompt', 'reply', 'message', 'always', 'never',
+  'short', 'long', 'good', 'great', 'fine', 'nice',
+]);
+
+function extractAgentKeywords(agent) {
+  if (!agent) return [];
+  const corpus = [
+    agent.name || '',
+    agent.firstMessage || '',
+    agent.systemPrompt || '',
+  ].join(' ');
+
+  // Keep ASCII tokens that are 3+ chars and aren't pure stopwords.
+  const tokens = corpus.match(/[A-Za-z][A-Za-z0-9'-]{2,}/g) || [];
+  const keywords = [];
+  const seen = new Set();
+  for (const t of tokens) {
+    const lower = t.toLowerCase();
+    if (AGENT_KEYWORD_STOPLIST.has(lower)) continue;
+    if (seen.has(lower)) continue;
+    seen.add(lower);
+    keywords.push(lower);
+    if (keywords.length >= 60) break; // Deepgram caps at ~100 total
+  }
+  return keywords;
+}
+
+/**
+ * Create a Deepgram live connection wired up with this session's
+ * full handler set (transcript, VAD, error, close).
+ */
+function createSessionDeepgramConn(session, { deepgramKey, language, audioConfig = null, isReconnect = false } = {}) {
+  const agent = session.agent;
+  const sttKeywords = [
+    ...UNIVERSAL_HINGLISH_SEED,
+    ...extractAgentKeywords(agent),
+    ...(agent?.advanced?.sttKeywords || []),
+  ].filter(Boolean);
+
+  // Dedupe + cap at Deepgram's reasonable upper bound (100).
+  const uniqueKeywords = [...new Set(sttKeywords.map(k => k.toLowerCase()))].slice(0, 100);
+
+  // STT language: explicit `multi` preference for code-switching agents.
+  // Pure 'hi' loses English words to Hindi phonetic mapping ("gym" -> "दिन").
+  // Agent creators can set agent.language = 'multi' or 'hi-Latn' for proper
+  // Hinglish handling. STT_PREFER_MULTI env upgrades 'hi' globally as a
+  // safety net for any legacy agents that haven't been re-saved yet.
+  let effectiveLanguage = language || agent?.language || 'en';
+  const preferMulti = String(process.env.STT_PREFER_MULTI || 'false').toLowerCase() === 'true';
+  if (preferMulti && effectiveLanguage === 'hi') {
+    console.log(`[STT] Upgrading 'hi' -> 'multi' (STT_PREFER_MULTI=true) for better Hinglish recognition`);
+    effectiveLanguage = 'multi';
+  } else if (effectiveLanguage === 'hi' && !isReconnect) {
+    console.warn(`[STT] ⚠ Agent language is 'hi' (pure Hindi). Users mixing English (gym/website/app) may be mis-transcribed. Consider 'multi' or 'hi-Latn'.`);
+  }
+
+  return deepgramService.createLiveConnection({
+    apiKey: deepgramKey,
+    language: effectiveLanguage,
+    backgroundDenoising: agent?.advanced?.backgroundDenoising || 'default',
+    keywords: uniqueKeywords,
+    audioConfig,
+    onVADEvent: buildSessionOnVADEvent(session),
+    onTranscript: buildSessionOnTranscript(session),
+    onError: (err) => {
+      session.sttUnavailable = true;
+      safeSend(session.ws, {
+        type: 'error',
+        message: `Deepgram Error: ${err?.message || 'Live transcription unavailable'}`,
+      });
+      safeSend(session.ws, {
+        type: 'status',
+        message: 'STT temporarily unavailable. Reconnecting...',
+      });
+      if (!isReconnect) trySttFallbackReconnect(session, deepgramKey);
+    },
+    onClose: (closeInfo) => {
+      if (closeInfo && closeInfo.code && closeInfo.code !== 1000) {
+        safeSend(session.ws, {
+          type: 'status',
+          message: `STT connection closed (code ${closeInfo.code}).`,
+        });
+        // Auto-reconnect on abnormal close (1006, 1011, 4xxx) if session still active
+        if (session.status !== 'ended' && !isReconnect && session.enableStt) {
+          console.log(`[Deepgram] Abnormal close (${closeInfo.code}) — auto-reconnecting in 500ms`);
+          setTimeout(() => {
+            if (session.status === 'ended') return;
+            try {
+              session.deepgramConn = createSessionDeepgramConn(session, {
+                deepgramKey,
+                language,
+                audioConfig: session._lastAudioConfig || null,
+                isReconnect: true,
+              });
+              session.sttUnavailable = false;
+              safeSend(session.ws, { type: 'status', message: 'STT reconnected ✅' });
+            } catch (e) {
+              console.error('[Deepgram] Reconnect failed:', e.message);
+            }
+          }, 500);
+        }
+      }
+    },
+  });
+}
+
 function setupVoiceSession(wss) {
   wss.on('connection', (ws) => {
     const sessionId = uuidv4();
@@ -74,12 +486,14 @@ function setupVoiceSession(wss) {
     };
 
     activeSessions.set(sessionId, session);
-    console.log(`🔌 WebSocket connected: ${sessionId}`);
+    console.log(`🔌 WebSocket connected: ${sessionId} (active: ${activeSessions.size}/${MAX_CONCURRENT_SESSIONS})`);
+    touchSession(session);
 
     // Send ready ping
     safeSend(ws, { type: 'connected', sessionId });
 
     ws.on('message', async (rawData, isBinary) => {
+      touchSession(session);
       try {
         if (isBinary) {
           await handleAudioChunkBinary(session, rawData);
@@ -107,14 +521,27 @@ function setupVoiceSession(wss) {
 
 function startIdleTimer(session) {
   if (session._idleTimer) clearTimeout(session._idleTimer);
-  // Idle timeout is 10 seconds of absolute silence
+
+  // Idle re-engagement is opt-in via env. When disabled (default 0), the
+  // agent never spontaneously asks "are you still there?" — this avoids
+  // a race we observed in production where the idle timer fires at the
+  // same instant the user starts speaking, causing two parallel
+  // processTranscript runs and queue-saturating Groq.
+  const idleMs = Number(process.env.IDLE_REENGAGE_MS || 0);
+  if (!idleMs || idleMs <= 0) return;
+
   session._idleTimer = setTimeout(() => {
+    // Defense-in-depth: never re-engage on a dead/closing session,
+    // and never if the user is already mid-turn.
     if (session.status === 'ended' || session.agentSpeaking || session.isProcessing) return;
-    console.log(`[Idle] User silent for 10s. Triggering active re-engagement.`);
-    // Send a system event to the LLM to actively re-engage the user
-    // We don't await this directly here because processTranscript is async
+    if (!session.ws || session.ws.readyState !== 1) return;
+    if (!activeSessions.has(session.id)) return;
+    // Skip if STT picked up anything in the last 2s — user just hasn't
+    // hit speech_final yet.
+    if (session._lastSttTranscript && session._lastSttTranscript.trim().length > 0) return;
+    console.log(`[Idle] User silent for ${Math.round(idleMs / 1000)}s. Triggering active re-engagement.`);
     try {
-      processTranscript(session, "[SYSTEM_EVENT: The user has been completely silent for 10 seconds. Briefly and naturally ask if they are still there or if they need any help. DO NOT mention this system event.]");
+      processTranscript(session, "[SYSTEM_EVENT: The user has been completely silent. Briefly and naturally ask if they are still there or if they need any help. DO NOT mention this system event.]");
     } catch (e) {
       console.error("Failed to trigger idle engagement:", e);
     }
@@ -238,9 +665,7 @@ async function handleMicConfig(session, message) {
   const deepgramKey = session.userSettings?.deepgramKey || process.env.DEEPGRAM_API_KEY;
   const sttLanguage = session.agent.language || 'en';
 
-  // FIX: Pass audio config directly — NEVER mutate process.env.
-  // Mutating global env vars is NOT safe for concurrent sessions (race condition).
-  // If two users trigger mic_config simultaneously, they corrupt each other's config.
+  // Pass audio config directly — never mutate process.env (race condition for concurrent sessions).
   const audioConfig = {
     encoding: normalizedEncoding,
     sampleRate: String(normalizedSampleRate),
@@ -249,47 +674,19 @@ async function handleMicConfig(session, message) {
     mimeType,
   };
 
-  session.deepgramConn = deepgramService.createLiveConnection({
-    apiKey: deepgramKey,
+  // Save for auto-reconnect on idle close
+  session._lastAudioConfig = audioConfig;
+  session._deepgramKey = deepgramKey;
+  session._sttLanguage = sttLanguage;
+
+  // FIX: use the shared session handler factory so interruption,
+  // backchanneling, silence-timer fallback and idle timer all keep
+  // working after mic_config — previously this path used a stripped-down
+  // handler and silently downgraded the call experience.
+  session.deepgramConn = createSessionDeepgramConn(session, {
+    deepgramKey,
     language: sttLanguage,
-    backgroundDenoising: session.agent.advanced?.backgroundDenoising || 'default',
     audioConfig,
-    onTranscript: async ({ transcript, isFinal, speechFinal }) => {
-      safeSend(session.ws, { type: 'transcript', text: transcript, isFinal: false, role: 'user' });
-      session._lastSttTranscript = transcript;
-
-      const sensitivity = session.agent.advanced?.interruptionSensitivity ?? 0.5;
-      const interruptThreshold = Math.max(1, Math.round(15 * (1 - sensitivity)));
-      if (transcript.length >= interruptThreshold) {
-        safeSend(session.ws, { type: 'interrupt' });
-      }
-
-      if (isFinal && speechFinal && transcript.trim().length > 0) {
-        if (session.isProcessing) return;
-        session.isProcessing = true;
-        session.latency.turnStartedAt = Date.now();
-        session.latency.llmStartedAt = null;
-        session.latency.firstTextChunkAt = null;
-        session.latency.firstAudioAt = null;
-        session._lastSttTranscript = '';
-        try {
-          await processTranscript(session, transcript);
-        } catch (e) {
-          console.error('Error processing mic_config live transcript:', e);
-          session.isProcessing = false;
-        }
-      }
-    },
-    onError: (err) => {
-      console.error('[MicConfig] Deepgram error after mic_config:', err.message);
-      session.sttUnavailable = true;
-      safeSend(session.ws, { type: 'error', message: `STT error: ${err.message}` });
-    },
-    onClose: (closeInfo) => {
-      if (closeInfo?.code && closeInfo.code !== 1000) {
-        console.log(`[MicConfig] Deepgram closed: code=${closeInfo.code}`);
-      }
-    },
   });
 
   console.log(`[MicConfig] Deepgram reinitialized: mode=${normalizedInputMode} ${normalizedEncoding}@${normalizedSampleRate}Hz (no env mutation)`);
@@ -366,251 +763,14 @@ async function handleInit(session, message) {
     const sttLanguage = agent.language || 'en';
     console.log(`🌐 Agent language: ${sttLanguage}`);
 
-  // Extract keywords from agent config for Deepgram boosting
-  const sttKeywords = [
-    ...(agent.advanced?.sttKeywords || []),
-    agent.name, // Boost agent's own name
-    ...(agent.systemPrompt || '').match(/\b[A-Z][a-zA-Z]{3,}\b/g) || [], // Proper nouns from system prompt
-  ].filter(Boolean).slice(0, 50);
+    // Save key for later reconnects (used by createSessionDeepgramConn auto-reconnect path)
+    session._deepgramKey = deepgramKey;
+    session._sttLanguage = sttLanguage;
 
-  session.deepgramConn = deepgramService.createLiveConnection({
-      apiKey: deepgramKey,
+    // Use shared helper so handleMicConfig + reconnects share identical behaviour.
+    session.deepgramConn = createSessionDeepgramConn(session, {
+      deepgramKey,
       language: sttLanguage,
-      backgroundDenoising: agent.advanced?.backgroundDenoising || 'default',
-      keywords: sttKeywords,
-      onVADEvent: (event) => {
-        if (event.type === 'speech_started' && session.agentSpeaking) {
-          // User started speaking while agent is talking — prepare for interruption
-          safeSend(session.ws, { type: 'vad_speech_started' });
-        }
-      },
-      onTranscript: async ({ transcript, isFinal, speechFinal }) => {
-        // ── Interruption detection: if user speaks while agent is talking ──
-        if (session.agentSpeaking) {
-          const sensitivity = agent.advanced?.interruptionSensitivity ?? 0.5;
-          const charThreshold = Math.max(5, Math.round(20 * (1 - sensitivity)));
-          
-          const trimmedText = transcript.trim().toLowerCase();
-          const wordCount = trimmedText.split(/\s+/).length;
-          
-          // Noise words/affirmations that should NEVER trigger an interruption on their own
-          const noiseWords = ['hmm', 'um', 'uh', 'ah', 'oh', 'yeah', 'yes', 'ok', 'okay', 'haan', 'acha', 'accha', 'hmm...', 'right'];
-          const isJustNoise = wordCount <= 2 && noiseWords.some(w => trimmedText === w || trimmedText.startsWith(w));
-          
-          // Strong interruption words that should trigger immediately
-          const stopWords = ['stop', 'wait', 'hold on', 'ruko', 'ek second', 'listen', 'no', 'nahi', 'galat'];
-          const hasStopWord = stopWords.some(w => trimmedText.includes(w));
-
-          // Only interrupt if:
-          // 1. It contains a strong stop word OR
-          // 2. It is not just noise AND (character length >= threshold OR word count >= 3)
-          const shouldInterrupt = hasStopWord || (!isJustNoise && (trimmedText.length >= charThreshold || wordCount >= 3));
-
-          if (shouldInterrupt) {
-            console.log(`[Interrupt] User spoke during agent TTS: "${transcript.trim().substring(0, 60)}"`);
-
-            // 1. Cancel current generation so LLM stream loop exits
-            session.currentGenerationId = uuidv4();
-
-            // 2. Clear agentSpeaking so new processing can start
-            session.agentSpeaking = false;
-            session._audioQueueDurationMs = 0;
-            if (session._agentSpeakingTimer) { clearTimeout(session._agentSpeakingTimer); session._agentSpeakingTimer = null; }
-
-            // 3. Reset processing flag — the old pipeline will exit via generationId mismatch
-            session.isProcessing = false;
-
-            // 4. Tell client to stop playing any queued audio immediately
-            safeSend(session.ws, { type: 'interrupt' });
-            safeSend(session.ws, { type: 'clear_audio' });
-
-            // ── Phase 3: Flawless Barge-in (Interruption Handling) ──
-            const lang = session.agent.language || 'en';
-            const interruptFillers = {
-              'en': 'Sorry, go ahead.',
-              'hi': 'Haan boliye.',
-              'hi-Latn': 'Haan boliye.',
-              'multi': 'Haan boliye.',
-              'en-IN': 'Sorry, go ahead.'
-            };
-            const fillerText = interruptFillers[lang] || interruptFillers['en'];
-            const ttsService = require('../services/ttsService');
-            ttsService.textToSpeech({
-              text: fillerText,
-              voiceId: session.agent.voice?.voiceId,
-              speed: 1.15,
-              provider: session.agent.voice?.provider
-            }).then(audioBuffer => {
-              if (audioBuffer && audioBuffer.length > 0) {
-                 safeSend(session.ws, { type: 'response_text', text: fillerText });
-                 sendAudioBuffer(session, audioBuffer);
-              }
-            }).catch(e => console.error("Interruption TTS failed:", e));
-
-            // 5. Treat this transcript as the new user turn
-            session._lastSttTranscript = transcript;
-
-            // If this is a final/speechFinal, process immediately
-            if (isFinal && speechFinal && transcript.trim().length > 0) {
-              if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
-              session.isProcessing = true;
-              session.latency.turnStartedAt = Date.now();
-              session.latency.llmStartedAt = null;
-              session.latency.firstTextChunkAt = null;
-              session.latency.firstAudioAt = null;
-              session._userSpeechStartTime = null;
-              session._backchannelTriggered = false;
-              console.log(`[STT] Interrupt speech_final: "${transcript}"`);
-              try {
-                await processTranscript(session, transcript);
-              } catch (e) {
-                console.error('Error processing interrupt transcript:', e);
-                session.isProcessing = false;
-              }
-              return;
-            }
-
-            // Otherwise start silence timer for this interrupted input
-            if (session._silenceTimer) clearTimeout(session._silenceTimer);
-            session._silenceTimer = setTimeout(async () => {
-              session._silenceTimer = null;
-              const pending = session._lastSttTranscript;
-              if (!pending || pending.trim().length < 2) return;
-              if (session.isProcessing) return;
-              session._lastSttTranscript = '';
-              session.isProcessing = true;
-              session.latency.turnStartedAt = Date.now();
-              session.latency.llmStartedAt = null;
-              session.latency.firstTextChunkAt = null;
-              session.latency.firstAudioAt = null;
-              session._userSpeechStartTime = null;
-              session._backchannelTriggered = false;
-              console.log(`[STT] Interrupt silence-timer: "${pending}"`);
-              try {
-                await processTranscript(session, pending);
-              } catch (e) {
-                console.error('Error processing interrupt silence-timer transcript:', e);
-                session.isProcessing = false;
-              }
-            }, 500);
-          }
-          // Whether we interrupted or not, don't fall through to normal processing
-          return;
-        }
-
-        // Always forward interim results to show live speech in UI
-        safeSend(session.ws, {
-           type: 'transcript',
-           text: transcript,
-           isFinal: false,
-           role: 'user',
-        });
-
-        // Track latest transcript for silence-timer fallback
-        if (transcript.trim().length > 0) {
-          if (session._idleTimer) { clearTimeout(session._idleTimer); session._idleTimer = null; }
-          session._lastSttTranscript = transcript;
-
-          // ── Phase 1: Active Backchanneling ──
-          if (!session._userSpeechStartTime) {
-            session._userSpeechStartTime = Date.now();
-            session._backchannelTriggered = false;
-          } else if (Date.now() - session._userSpeechStartTime > 4000 && !session._backchannelTriggered && !session.agentSpeaking) {
-            session._backchannelTriggered = true;
-            console.log("[Backchannel] Injecting active listening filler...");
-            const lang = agent.language || 'en';
-            const backchannels = {
-               'en': ['Mhmm...', 'Right.', 'I see.'],
-               'hi': ['Mhmm...', 'Accha.', 'Haan...'],
-               'hi-Latn': ['Mhmm...', 'Accha.', 'Haan...'],
-               'multi': ['Mhmm...', 'Accha.'],
-               'en-IN': ['Mhmm...', 'Right.']
-            };
-            const options = backchannels[lang] || backchannels['en'];
-            const backchannelText = options[Math.floor(Math.random() * options.length)];
-            const ttsService = require('../services/ttsService');
-            ttsService.textToSpeech({
-              text: backchannelText,
-              voiceId: agent.voice?.voiceId,
-              speed: 0.9, // slower for "thinking" feel
-              provider: agent.voice?.provider
-            }).then(audioBuffer => {
-              if (audioBuffer && audioBuffer.length > 0) {
-                 sendAudioBuffer(session, audioBuffer);
-              }
-            }).catch(e => console.error("Backchannel TTS failed:", e));
-          }
-        }
-
-        // ─── Path 1: Deepgram speech_final (works when account supports it) ───
-        if (isFinal && speechFinal && transcript.trim().length > 0) {
-          if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
-          if (session.isProcessing) return;
-          session.isProcessing = true;
-          session.latency.turnStartedAt = Date.now();
-          session.latency.llmStartedAt = null;
-          session.latency.firstTextChunkAt = null;
-          session.latency.firstAudioAt = null;
-          session._userSpeechStartTime = null;
-          session._backchannelTriggered = false;
-          console.log(`[STT] speech_final triggered: "${transcript}"`);
-          try {
-            await processTranscript(session, transcript);
-          } catch (e) {
-            console.error("Error processing live transcript:", e);
-            session.isProcessing = false;
-          }
-          return;
-        }
-
-        // ─── Path 2: Client-side silence timer fallback ───────────────
-        // Reduced from 1200ms → 600ms — Deepgram speech_final usually
-        // arrives within 600ms; longer timeout added unnecessary lag.
-        if (session._silenceTimer) clearTimeout(session._silenceTimer);
-        session._silenceTimer = setTimeout(async () => {
-          session._silenceTimer = null;
-          if (session.agentSpeaking) return;
-          const pending = session._lastSttTranscript;
-          if (!pending || pending.trim().length < 2) return;
-          if (session.isProcessing) return;
-          session._lastSttTranscript = '';
-          session.isProcessing = true;
-          session.latency.turnStartedAt = Date.now();
-          session.latency.llmStartedAt = null;
-          session.latency.firstTextChunkAt = null;
-          session.latency.firstAudioAt = null;
-          session._userSpeechStartTime = null;
-          session._backchannelTriggered = false;
-          console.log(`[STT] silence-timer triggered: "${pending}"`);
-          try {
-            await processTranscript(session, pending);
-          } catch (e) {
-            console.error("Error processing silence-timer transcript:", e);
-            session.isProcessing = false;
-          }
-        }, 600);
-
-      },
-    onError: (err) => {
-      session.sttUnavailable = true;
-      safeSend(session.ws, {
-        type: 'error',
-        message: `Deepgram Error: ${err?.message || 'Live transcription unavailable'}`,
-      });
-      safeSend(session.ws, {
-        type: 'status',
-        message: 'STT temporarily unavailable. You can continue in text mode.',
-      });
-      trySttFallbackReconnect(session, deepgramKey);
-    },
-    onClose: (closeInfo) => {
-      if (closeInfo && closeInfo.code && closeInfo.code !== 1000) {
-        safeSend(session.ws, {
-          type: 'status',
-          message: `STT connection closed (code ${closeInfo.code}).`,
-        });
-      }
-    },
     });
   }
 
@@ -767,6 +927,11 @@ async function handleTextInput(session, text) {
 
 function handleClientInterrupt(session) {
   session.currentGenerationId = uuidv4();
+  // Cancel any in-flight LLM HTTP request so it frees its slot.
+  if (session._currentAbortController) {
+    try { session._currentAbortController.abort(); } catch (_) {}
+    session._currentAbortController = null;
+  }
   session.agentSpeaking = false;
   session.isProcessing = false;
   session._lastSttTranscript = '';
@@ -786,7 +951,16 @@ function handleClientInterrupt(session) {
 
 async function processTranscript(session, transcript) {
   try {
-    // Cancel any ongoing generation
+    // Cancel any ongoing generation — both via the generationId guard
+    // (sync, used by audio queue) and an AbortController (HTTP-level,
+    // actually frees the upstream Groq SDK connection slot so a new
+    // request doesn't queue behind a half-dead old one).
+    if (session._currentAbortController) {
+      try { session._currentAbortController.abort(); } catch (_) {}
+    }
+    const abortController = new AbortController();
+    session._currentAbortController = abortController;
+
     const generationId = uuidv4();
     session.currentGenerationId = generationId;
 
@@ -954,7 +1128,8 @@ async function processTranscript(session, transcript) {
         history: session.history,
         userSettings: session.userSettings,
         memory: session.memory,
-        ragContext
+        ragContext,
+        abortSignal: abortController.signal,
       });
     }
 
@@ -1093,9 +1268,40 @@ async function processTranscript(session, transcript) {
 
   } catch (error) {
     console.error('Pipeline error:', error);
+
+    // Last-resort: speak the canned fallback so the user hears SOMETHING
+    // instead of a stuck "AI is thinking..." spinner. We tried Groq, we
+    // tried Gemini — both failed. The canned reply (cache → template →
+    // apology) lets the call stay alive for the next turn.
+    try {
+      const llmFallback = require('../services/llmFallback');
+      const fallback = llmFallback.getReply(transcript, session.agent);
+      safeSend(session.ws, { type: 'response_text', text: fallback.text });
+      session.history.push({ role: 'assistant', content: fallback.text, timestamp: new Date() });
+      queueCallLogUpdate(session, {
+        $push: { transcript: { role: 'assistant', content: fallback.text } }
+      }, 'assistant_fallback');
+
+      const audio = await ttsService.textToSpeech({
+        text: fallback.text,
+        voiceId: session.agent.voice?.voiceId,
+        provider: session.agent.voice?.provider || 'edge-tts',
+      });
+      if (audio && audio.length > 0) sendAudioBuffer(session, audio);
+    } catch (e) {
+      console.error('Last-resort fallback also failed:', e.message);
+    }
+
+    // CRITICAL: reset status so the UI doesn't stick on "AI is thinking".
     safeSend(session.ws, { type: 'error', message: 'AI processing failed: ' + error.message });
+    safeSend(session.ws, { type: 'status', message: '🎙️ Listening...' });
+    session.status = 'listening';
+    session.agentSpeaking = false;
   } finally {
     session.isProcessing = false;
+    if (session._currentAbortController) {
+      session._currentAbortController = null;
+    }
   }
 }
 
@@ -1309,6 +1515,19 @@ async function handleEndSession(session, reason = 'user_hangup') {
 }
 
 async function cleanupSession(session) {
+  // Cancel any in-flight LLM HTTP request so a dying call doesn't keep
+  // burning Groq/Gemini quota (the 429 we saw in production logs came
+  // from an idle-timer firing AFTER the WS had disconnected).
+  if (session._currentAbortController) {
+    try { session._currentAbortController.abort(); } catch (_) {}
+    session._currentAbortController = null;
+  }
+  // Stop the idle re-engagement timer — without this it would still fire
+  // 10s later and trigger processTranscript on a dead session.
+  if (session._idleTimer) { clearTimeout(session._idleTimer); session._idleTimer = null; }
+  if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
+  if (session._agentSpeakingTimer) { clearTimeout(session._agentSpeakingTimer); session._agentSpeakingTimer = null; }
+
   if (session.deepgramConn) {
     try { session.deepgramConn.finish(); } catch (e) {}
   }
@@ -1325,6 +1544,24 @@ function safeSend(ws, data) {
   } catch (e) {
     // Ignore send errors on closed connections
   }
+}
+
+/**
+ * Allocate the next audio sequence number for the current generation.
+ * Resets to 0 whenever the active generationId changes (interruption / new turn).
+ * Frontend WorkletJitterAudioPlayer uses (generationId, seq) to:
+ *   1. Detect a new turn and flush stale buffered audio
+ *   2. Order chunks deterministically inside a turn
+ */
+function nextAudioSeq(session) {
+  const gen = session.currentGenerationId || 'init';
+  if (session._audioSeqGenerationId !== gen) {
+    session._audioSeqGenerationId = gen;
+    session._audioSeqCounter = 0;
+  }
+  const seq = session._audioSeqCounter || 0;
+  session._audioSeqCounter = seq + 1;
+  return { seq, generationId: gen };
 }
 
 /**
@@ -1346,6 +1583,9 @@ function sendAudioChunkOnly(session, buffer) {
 
   session.agentSpeaking = true;
 
+  const { seq, generationId } = nextAudioSeq(session);
+  const timestamp = Date.now();
+
   const task = async () => {
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
     while (session.ws.readyState === 1 && session.ws.bufferedAmount > maxBufferedBytes) {
@@ -1357,9 +1597,9 @@ function sendAudioChunkOnly(session, buffer) {
     } else {
       const base64Audio = buffer.toString('base64');
       if (session.streamProtocol) {
-        safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio });
+        safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio, seq, generationId, timestamp });
       } else {
-        safeSend(session.ws, { type: 'audio', data: base64Audio });
+        safeSend(session.ws, { type: 'audio', data: base64Audio, seq, generationId, timestamp });
       }
     }
   };
@@ -1382,20 +1622,26 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
 
   session.agentSpeaking = true;
 
+  const { seq, generationId } = nextAudioSeq(session);
+  const timestamp = Date.now();
+
   const task = async () => {
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
     while (session.ws.readyState === 1 && session.ws.bufferedAmount > maxBufferedBytes) {
       await new Promise(r => setTimeout(r, 100)); // Backpressure pause
     }
 
-    if (session.prefersBinaryAudio) {
-      safeSendBinary(session.ws, buffer);
-    } else {
-      const base64Audio = buffer.toString('base64');
-      if (session.streamProtocol) {
-        safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio });
+    // Skip sending empty buffers — they exist only to flush isFinal markers
+    if (buffer && buffer.length > 0) {
+      if (session.prefersBinaryAudio) {
+        safeSendBinary(session.ws, buffer);
       } else {
-        safeSend(session.ws, { type: 'audio', data: base64Audio });
+        const base64Audio = buffer.toString('base64');
+        if (session.streamProtocol) {
+          safeSend(session.ws, { type: 'audio_stream', chunk: base64Audio, seq, generationId, timestamp });
+        } else {
+          safeSend(session.ws, { type: 'audio', data: base64Audio, seq, generationId, timestamp });
+        }
       }
     }
 
@@ -1405,10 +1651,17 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
         emitLatencyMetrics(session, 'first_audio');
       }
 
-      safeSend(session.ws, { type: session.streamProtocol ? 'audio_stream_end' : 'audio_end' });
+      // lastSeq lets the player know there is no more audio coming for this generation
+      // so it can drain its jitter buffer without waiting for a missing packet.
+      const lastSeq = Math.max(0, (session._audioSeqCounter || 1) - 1);
+      safeSend(session.ws, {
+        type: session.streamProtocol ? 'audio_stream_end' : 'audio_end',
+        generationId,
+        lastSeq,
+      });
 
       if (!session._audioQueueDurationMs) session._audioQueueDurationMs = 0;
-      const chunkDurationMs = Math.max(500, Math.round((buffer.length / 4000) * 1000));
+      const chunkDurationMs = Math.max(500, Math.round(((buffer?.length || 0) / 4000) * 1000));
       session._audioQueueDurationMs += chunkDurationMs;
 
       if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
@@ -1537,7 +1790,7 @@ function trySttFallbackReconnect(session, deepgramKey) {
 
   const fallbackLanguage = process.env.STT_FALLBACK_LANGUAGE || 'multi';
   const currentLanguage = session.agent.language || 'en';
-  
+
   // Always allow fallback if current language is problematic
   if (currentLanguage === fallbackLanguage && currentLanguage !== 'hi') return;
 
@@ -1551,53 +1804,21 @@ function trySttFallbackReconnect(session, deepgramKey) {
   } catch (_) {}
 
   console.log(`[STT Fallback] Retrying with language: ${fallbackLanguage} (was: ${currentLanguage})`);
-  
+
   safeSend(session.ws, {
     type: 'status',
     message: `🔄 Retrying STT with fallback language (${fallbackLanguage}) for better compatibility...`,
   });
 
-  session.deepgramConn = deepgramService.createLiveConnection({
-    apiKey: deepgramKey,
+  // Use shared helper so the fallback path retains all smart features
+  // (interruption, backchanneling, silence-timer, idle re-engagement).
+  // isReconnect=true prevents recursive fallback if this attempt also fails.
+  session.deepgramConn = createSessionDeepgramConn(session, {
+    deepgramKey,
     language: fallbackLanguage,
-    backgroundDenoising: session.agent.advanced?.backgroundDenoising || 'default',
-    onTranscript: async ({ transcript, isFinal, speechFinal }) => {
-      safeSend(session.ws, {
-        type: 'transcript',
-        text: transcript,
-        isFinal: false,
-        role: 'user',
-      });
-
-      const sensitivity = session.agent.advanced?.interruptionSensitivity ?? 0.5;
-      const interruptThreshold = Math.max(1, Math.round(15 * (1 - sensitivity)));
-      if (transcript.length >= interruptThreshold) {
-        safeSend(session.ws, { type: 'interrupt' });
-      }
-
-      if (isFinal && speechFinal && transcript.trim().length > 0) {
-        if (session.isProcessing) return;
-        session.isProcessing = true;
-        session.latency.turnStartedAt = Date.now();
-        session.latency.llmStartedAt = null;
-        session.latency.firstTextChunkAt = null;
-        session.latency.firstAudioAt = null;
-        try {
-          await processTranscript(session, transcript);
-        } catch (e) {
-          console.error('Error processing fallback live transcript:', e);
-          session.isProcessing = false;
-        }
-      }
-    },
-    onError: (err) => {
-      session.sttUnavailable = true;
-      safeSend(session.ws, {
-        type: 'error',
-        message: `Fallback STT Error: ${err?.message || 'unavailable'}`,
-      });
-    },
+    audioConfig: session._lastAudioConfig || null,
+    isReconnect: true,
   });
 }
 
-module.exports = { setupVoiceSession };
+module.exports = { setupVoiceSession, canAcceptNewSession, getActiveSessionCount };

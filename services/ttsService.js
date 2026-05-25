@@ -2,13 +2,16 @@
  * TTS Service using node-edge-tts
  * 100% FREE - Uses Microsoft Edge's online TTS service
  * No API key needed! Zero cost!
- * 
+ *
  * Install: npm install node-edge-tts
  */
 const { EdgeTTS } = require('node-edge-tts');
 const { Readable } = require('stream');
 const fetch = require('node-fetch');
 const crypto = require('crypto');
+const edgeTtsPool = require('./edgeTtsPool');
+
+const USE_TTS_POOL = String(process.env.EDGE_TTS_POOL_ENABLED || 'true').toLowerCase() === 'true';
 
 /**
  * LRU Cache for TTS audio buffers.
@@ -110,11 +113,23 @@ class TtsService {
 
     // Default to Edge TTS (Free)
     if (!audioBuffer) {
-      try {
-        audioBuffer = await this.edgeTTSInMemory(text, voiceId, speed, pitch);
-      } catch (e) {
-        console.error('Edge TTS in-memory failed, trying file fallback:', e.message);
-        audioBuffer = await this.edgeTTSFileFallback(text, voiceId, speed, pitch);
+      // Try pooled connection first — saves ~80-150ms WS handshake per call.
+      // Falls through to a fresh WS (in-memory then file) if the pool errors.
+      if (USE_TTS_POOL) {
+        try {
+          audioBuffer = await edgeTtsPool.synthesize({ text, voiceId, speed, pitch });
+        } catch (e) {
+          console.error('Edge TTS pool failed, falling back to fresh WS:', e.message);
+        }
+      }
+
+      if (!audioBuffer || audioBuffer.length === 0) {
+        try {
+          audioBuffer = await this.edgeTTSInMemory(text, voiceId, speed, pitch);
+        } catch (e) {
+          console.error('Edge TTS in-memory failed, trying file fallback:', e.message);
+          audioBuffer = await this.edgeTTSFileFallback(text, voiceId, speed, pitch);
+        }
       }
     }
 

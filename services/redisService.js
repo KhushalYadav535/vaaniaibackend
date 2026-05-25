@@ -14,8 +14,18 @@ class RedisService {
   }
 
   async connect() {
+    // Allow opt-out: if REDIS_URL is unset or REDIS_DISABLED=true,
+    // skip the connection entirely instead of spamming "Connection error"
+    // every retry. Free-tier setups typically don't have Redis.
+    const redisUrl = process.env.REDIS_URL;
+    const disabled = String(process.env.REDIS_DISABLED || '').toLowerCase() === 'true';
+    if (!redisUrl || disabled) {
+      console.log('[Redis] Disabled (no REDIS_URL set) — using in-memory fallback');
+      this.connected = false;
+      return;
+    }
+
     try {
-      const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
       this.client = new Redis(redisUrl, {
         retryDelayOnFailover: 100,
         maxRetriesPerRequest: 3,
@@ -29,9 +39,9 @@ class RedisService {
 
       let errorCount = 0;
       this.client.on('error', (err) => {
-        if (errorCount === 0 || errorCount % 100 === 0) {
-           // Only log occasionally to avoid console spam
-           console.error('[Redis] Connection error:', err.message);
+        if (errorCount === 0) {
+          // Log only the first error — Redis client retries internally.
+          console.error('[Redis] Connection error:', err.message || 'unknown');
         }
         errorCount++;
         this.connected = false;

@@ -1,9 +1,9 @@
 /**
  * Google Gemini LLM Service (FREE Tier)
  * - 60 requests/minute free
- * - gemini-1.5-flash (fast), gemini-1.5-pro (smart)
+ * - gemini-2.0-flash (latest, fast & free)
  * - Also provides FREE text embeddings via text-embedding-004
- * 
+ *
  * Get free API key: https://aistudio.google.com/apikey
  * Env: GEMINI_API_KEY
  */
@@ -20,7 +20,18 @@ class GeminiService {
     return userKey || process.env.GEMINI_API_KEY || '';
   }
 
+  /**
+   * Master switch — if USE_GEMINI=false (default), Gemini is treated
+   * as unavailable everywhere even when the API key is set.
+   * This protects the free-tier daily quota for cases where the user
+   * only wants Groq (with its own 3-model fallback chain).
+   */
+  isEnabled() {
+    return String(process.env.USE_GEMINI || 'false').toLowerCase() === 'true';
+  }
+
   isAvailable(userKey) {
+    if (!this.isEnabled()) return false;
     return !!this.getApiKey(userKey);
   }
 
@@ -68,7 +79,7 @@ class GeminiService {
   /**
    * Generate LLM response (non-streaming) — drop-in replacement for groqService.generateResponse
    */
-  async generateResponse({ messages, model = 'gemini-1.5-flash', temperature = 0.7, apiKey }) {
+  async generateResponse({ messages, model = 'gemini-2.0-flash', temperature = 0.7, apiKey }) {
     if (this.isCircuitOpen()) throw new Error('gemini_circuit_open');
 
     const key = this.getApiKey(apiKey);
@@ -128,7 +139,7 @@ class GeminiService {
   /**
    * Generate streaming response — async generator yielding text chunks
    */
-  async *generateStreamResponse({ messages, model = 'gemini-1.5-flash', temperature = 0.7, apiKey }) {
+  async *generateStreamResponse({ messages, model = 'gemini-2.0-flash', temperature = 0.7, apiKey }) {
     if (this.isCircuitOpen()) throw new Error('gemini_circuit_open');
 
     const key = this.getApiKey(apiKey);
@@ -248,9 +259,9 @@ class GeminiService {
 
   static getAvailableModels() {
     return [
-      { id: 'gemini-1.5-flash', name: 'Gemini 1.5 Flash (Fast & Free)', provider: 'gemini' },
-      { id: 'gemini-1.5-pro', name: 'Gemini 1.5 Pro (Smart & Free)', provider: 'gemini' },
-      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash (Latest)', provider: 'gemini' },
+      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash (Recommended — Fast & Free)', provider: 'gemini' },
+      { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (Latest)', provider: 'gemini' },
+      { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite (Cheapest)', provider: 'gemini' },
     ];
   }
 }

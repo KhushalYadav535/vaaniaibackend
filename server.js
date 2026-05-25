@@ -35,7 +35,7 @@ const knowledgeBaseRoutes = require('./routes/knowledgeBase');
 const callFlowsRoutes = require('./routes/callFlows');
 
 // ─── WebSocket Handlers ─────────────────────────────────────────────────────
-const { setupVoiceSession } = require('./websocket/voiceSession');
+const { setupVoiceSession, canAcceptNewSession, getActiveSessionCount } = require('./websocket/voiceSession');
 const { createWebRTCServer } = require('./websocket/webrtcSession');
 
 // ─── Worker ─────────────────────────────────────────────────────────────────
@@ -51,8 +51,14 @@ const wss = new WebSocket.Server({ noServer: true });
 // Register the voice session connection handler
 setupVoiceSession(wss);
 
-// Register the WebRTC server (handles its own upgrade internally)
-createWebRTCServer(server);
+// WebRTC: currently a stub (mock SDP, no real RTCPeerConnection on Node).
+// Proper implementation needs `wrtc` (heavy native build) or `mediasoup`.
+// Until that lands, the /ws/voice WebSocket pipeline is the supported path.
+// Toggle via WEBRTC_EXPERIMENTAL=true if you want to opt in for development.
+if (String(process.env.WEBRTC_EXPERIMENTAL || 'false').toLowerCase() === 'true') {
+  console.warn('⚠️  WEBRTC_EXPERIMENTAL=true — registering /webrtc stub. NOT production-ready.');
+  createWebRTCServer(server);
+}
 
 // Route WebSocket upgrade requests
 server.on('upgrade', (request, socket, head) => {
@@ -62,12 +68,40 @@ server.on('upgrade', (request, socket, head) => {
     console.log('🔌 WS Upgrade Request:', url);
 
     if (url === '/ws/voice' || url === '/voice') {
+      // Concurrency cap — reject politely if we're at max sessions.
+      // 1013 = "Try Again Later" per RFC 6455.
+      if (!canAcceptNewSession()) {
+        console.warn(`⚠️  WS upgrade rejected — concurrency cap reached (${getActiveSessionCount()})`);
+        socket.write(
+          'HTTP/1.1 503 Service Unavailable\r\n' +
+          'Content-Type: application/json\r\n' +
+          'Connection: close\r\n' +
+          '\r\n' +
+          JSON.stringify({ error: 'server_busy', message: 'Too many concurrent voice sessions. Please try again in a moment.' })
+        );
+        socket.destroy();
+        return;
+      }
+
       wss.handleUpgrade(request, socket, head, (ws) => {
         console.log('🔥 Voice WS Connected');
         wss.emit('connection', ws, request);
       });
     } else if (url === '/webrtc') {
-      // Handled by createWebRTCServer — do nothing here
+      // Handled by createWebRTCServer when WEBRTC_EXPERIMENTAL=true.
+      // Otherwise reject explicitly so clients don't hang on a half-open socket.
+      if (String(process.env.WEBRTC_EXPERIMENTAL || 'false').toLowerCase() !== 'true') {
+        socket.write(
+          'HTTP/1.1 501 Not Implemented\r\n' +
+          'Content-Type: application/json\r\n' +
+          'Connection: close\r\n' +
+          '\r\n' +
+          JSON.stringify({ error: 'webrtc_disabled', message: 'WebRTC endpoint is disabled. Use /ws/voice.' })
+        );
+        socket.destroy();
+        return;
+      }
+      // When experimental is on, createWebRTCServer registered its own upgrade handler.
       return;
     } else {
       console.log('❌ Unknown WS route:', url);

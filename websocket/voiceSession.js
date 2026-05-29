@@ -34,6 +34,7 @@ const CallFlow = require('../models/CallFlow');
 const callFlowEngine = require('../services/callFlowEngine');
 const webhookDispatcher = require('../services/webhookDispatcher');
 const ttsService = require('../services/ttsService');
+const serverEvents = require('../services/serverEventsDispatcher');
 
 // Track active sessions
 const activeSessions = new Map();
@@ -57,14 +58,35 @@ function canAcceptNewSession() {
 }
 
 // Reaper: every 30s, kill sessions whose last activity exceeded the idle window.
+// Aborts in-flight LLM HTTP requests and flushes any pending call-log writes
+// before closing — without these the reaper would leak Groq/Gemini quota and
+// silently lose the last few transcript turns.
 setInterval(() => {
   const now = Date.now();
   for (const [id, sess] of activeSessions.entries()) {
     const last = sess._lastActivityAt || sess.startTime || now;
     if (now - last > SESSION_HARD_IDLE_MS) {
       console.log(`[Reaper] Killing idle session ${id} (idle ${Math.round((now - last) / 1000)}s)`);
-      try { sess.ws?.close(1000, 'idle_timeout'); } catch (_) {}
+      // 1. Abort any in-flight LLM call so it stops burning quota
+      if (sess._currentAbortController) {
+        try { sess._currentAbortController.abort(); } catch (_) {}
+        sess._currentAbortController = null;
+      }
+      // 2. Clear pending timers so they can't fire on a dead session
+      if (sess._idleTimer)         { clearTimeout(sess._idleTimer);         sess._idleTimer = null; }
+      if (sess._silenceTimer)      { clearTimeout(sess._silenceTimer);      sess._silenceTimer = null; }
+      if (sess._agentSpeakingTimer){ clearTimeout(sess._agentSpeakingTimer);sess._agentSpeakingTimer = null; }
+      if (sess._dtmfFlushTimer)    { clearTimeout(sess._dtmfFlushTimer);    sess._dtmfFlushTimer = null; }
+      if (sess._softCommitTimer)   { clearTimeout(sess._softCommitTimer);   sess._softCommitTimer = null; }
+      if (sess._logFlushInterval)  { clearInterval(sess._logFlushInterval); sess._logFlushInterval = null; }
+      sess._softCommitBuffer = '';
+      // 3. Flush any pending transcript writes so we don't lose turns
+      flushCallLogWriteQueue(sess).catch(() => {});
+      // 4. Close Deepgram + WS politely
       try { sess.deepgramConn?.finish(); } catch (_) {}
+      try {
+        if (sess.ws && sess.ws.readyState === 1) sess.ws.close(1000, 'idle_timeout');
+      } catch (_) {}
       activeSessions.delete(id);
     }
   }
@@ -72,6 +94,168 @@ setInterval(() => {
 
 function touchSession(session) {
   session._lastActivityAt = Date.now();
+}
+
+/**
+ * Soft-commit window for utterances.
+ *
+ * Why this exists: Deepgram fires `speech_final` after ~400ms of silence,
+ * which is great for snappy turns but BAD when the user is thinking mid-
+ * thought. A real conversation looks like:
+ *   "मुझे school के लिए एक website..."  [pause 700ms — thinking]
+ *   "...इसमें..."                        [pause 600ms — recalling name]
+ *   "...है MDS Vidyapeeth aur city Prayagraj"
+ *
+ * Without soft-commit, the agent fires THREE replies — talking over each
+ * fragment. With soft-commit, we hold the speech_final for ~800ms; if the
+ * user resumes, we append and reset the timer. The agent only replies
+ * after the user has TRULY finished.
+ *
+ * Modes:
+ *   - speech_final → append to buffer, reset timer
+ *   - interim transcript with content → reset timer (user is still talking)
+ *   - timer fires → flush buffer through processTranscript
+ *   - interrupt (agent was speaking) → immediate fire, bypass soft-commit
+ */
+/**
+ * Decide how long to hold a finalized utterance before committing it.
+ *
+ * This is the core of human-like turn-taking (what Vapi/Retell tune
+ * heavily). A flat 800ms window cuts users off when they pause mid-number
+ * ("nau double zero... [pause] ...five seven five...") or mid-thought.
+ *
+ * We EXTEND the window when the buffer looks incomplete:
+ *   - ends in a digit  → user is likely reading a phone/account number
+ *   - ends in a connector (aur / और / lekin / and / comma) → more coming
+ *   - very short so far → give them a beat to continue
+ * Otherwise we use the snappy default so normal turns stay fast.
+ */
+function getSoftCommitWindowMs(text) {
+  const base = Number(process.env.UTTERANCE_SOFT_COMMIT_MS || 800);
+  const numericMs = Number(process.env.UTTERANCE_SOFT_COMMIT_NUMERIC_MS || 2400);
+  const connectorMs = Number(process.env.UTTERANCE_SOFT_COMMIT_CONNECTOR_MS || 1500);
+  const t = String(text || '').trim();
+  if (!t) return base;
+
+  // Mid-number: still being dictated. We extend ONLY when the trailing
+  // digit run looks incomplete (1-9 digits) — a full 10-digit Indian mobile
+  // (or longer) is treated as complete so the agent doesn't over-wait.
+  const lastNumberRun = (t.match(/(\d[\d\s,-]*)$/) || [''])[0].replace(/\D/g, '');
+  if (lastNumberRun.length > 0 && lastNumberRun.length < 10) {
+    return numericMs;
+  }
+
+  // Ends on a connector / clause-continuation word → user has more to say.
+  const connectorRe = /(,|;|aur|और|lekin|लेकिन|kyunki|क्योंकि|matlab|मतलब|phir|फिर|toh|तो|and|but|so|because)$/i;
+  if (connectorRe.test(t)) return connectorMs;
+
+  return base;
+}
+
+/**
+ * Merge a freshly finalized transcript fragment into the soft-commit buffer.
+ *
+ * Deepgram frequently re-fires speech_final for the SAME utterance with a
+ * corrected/extended transcript (e.g. "...number hai 9005754" then
+ * "...number hai 9005754137"). Blindly appending produced two bugs we saw
+ * in production:
+ *   1. Garbled numbers — "9005754 9005754137" → LLM thinks user gave two
+ *      different numbers and asks them to confirm.
+ *   2. Triple-repeated lines — the whole sentence re-fired and got appended
+ *      again as a "new" turn.
+ *
+ * Strategy: detect prefix/extension/subset relationships and REPLACE rather
+ * than concatenate. Only genuinely new content gets appended.
+ */
+function mergeUtterance(buffer, text) {
+  const a = String(buffer || '').trim();
+  const b = String(text || '').trim();
+  if (!a) return b;
+  if (!b) return a;
+  if (a === b) return a;
+
+  const an = a.toLowerCase();
+  const bn = b.toLowerCase();
+
+  // New text is an extension of what we have → take the fuller version.
+  if (bn.startsWith(an)) return b;
+  // New text is a subset/prefix of what we have → keep the fuller version.
+  if (an.startsWith(bn)) return a;
+  // Exact trailing duplicate.
+  if (an.endsWith(bn)) return a;
+
+  // Heuristic for re-dictated content: if both end in a digit run and one
+  // run is an extension of the other, replace the tail with the longer run.
+  const aDigits = (a.match(/(\d[\d\s,-]*)$/) || [''])[0].replace(/\D/g, '');
+  const bDigits = (b.match(/(\d[\d\s,-]*)$/) || [''])[0].replace(/\D/g, '');
+  if (aDigits && bDigits && (bDigits.startsWith(aDigits) || aDigits.startsWith(bDigits))) {
+    // Same number being dictated — prefer the longer digit run, rebuilt on
+    // top of whichever sentence carried it.
+    return bDigits.length >= aDigits.length ? b : a;
+  }
+
+  // Genuinely new content — append.
+  return `${a} ${b}`.replace(/\s+/g, ' ').trim();
+}
+
+function commitTranscript(session, transcript, { immediate = false } = {}) {
+  const text = (transcript || '').trim();
+  if (!text || text.length < 2) return;
+
+  // Smart-merge so re-fired / extended transcripts (especially numbers)
+  // don't duplicate or garble the buffer.
+  session._softCommitBuffer = mergeUtterance(session._softCommitBuffer, text);
+
+  // Bypass for interrupt path — fire immediately so the agent doesn't keep
+  // talking over a user who's clearly trying to interrupt.
+  if (immediate) {
+    flushSoftCommit(session);
+    return;
+  }
+
+  const windowMs = getSoftCommitWindowMs(session._softCommitBuffer);
+  if (session._softCommitTimer) clearTimeout(session._softCommitTimer);
+  session._softCommitTimer = setTimeout(() => {
+    flushSoftCommit(session);
+  }, windowMs);
+}
+
+/**
+ * Reset the soft-commit timer without changing the buffer. Called when
+ * the user is mid-utterance (interim transcript arrives with content) so
+ * the commit doesn't fire while they're still talking. Uses the same
+ * dynamic window so a mid-number pause doesn't trigger a premature commit.
+ */
+function bumpSoftCommitTimer(session) {
+  if (!session._softCommitBuffer || !session._softCommitTimer) return;
+  const windowMs = getSoftCommitWindowMs(session._softCommitBuffer);
+  clearTimeout(session._softCommitTimer);
+  session._softCommitTimer = setTimeout(() => {
+    flushSoftCommit(session);
+  }, windowMs);
+}
+
+/**
+ * Flush the accumulated transcript into the pipeline.
+ */
+function flushSoftCommit(session) {
+  if (session._softCommitTimer) { clearTimeout(session._softCommitTimer); session._softCommitTimer = null; }
+  const merged = (session._softCommitBuffer || '').trim();
+  session._softCommitBuffer = '';
+  if (!merged || merged.length < 2) return;
+  if (session.isProcessing) return;
+  if (session.status === 'ended') return;
+
+  // Reset per-turn STT scratch state. processTranscript now owns the
+  // isProcessing guard + latency timers (set atomically there) so we no
+  // longer pre-set them here — doing so was part of the double-fire race.
+  session._userSpeechStartTime = null;
+  session._backchannelTriggered = false;
+  session._lastSttTranscript = '';
+  console.log(`[STT] soft-commit flush → "${merged}"`);
+  processTranscript(session, merged).catch(e => {
+    console.error('Error processing soft-commit transcript:', e);
+  });
 }
 
 /**
@@ -105,10 +289,12 @@ function buildSessionOnTranscript(session) {
       const shouldInterrupt = hasStopWord || (!isJustNoise && (trimmedText.length >= charThreshold || wordCount >= 3));
 
       // ── Debounce: after firing one interrupt, suppress further filler+
-      // interrupt churn for 2.5s. The filler TTS itself sets agentSpeaking=true
-      // briefly which would otherwise re-trigger this branch on every new
-      // interim transcript and cause a "Haan boliye / Sorry, go ahead." loop.
-      const INTERRUPT_DEBOUNCE_MS = 2500;
+      // interrupt churn for a short window. The filler TTS itself sets
+      // agentSpeaking=true briefly which would otherwise re-trigger this
+      // branch on every new interim transcript and cause a "Haan boliye /
+      // Sorry, go ahead." loop. Default 1200ms — Vapi/Retell tune this between
+      // 800-1500ms; 2500ms felt sluggish on rapid-fire interrupts.
+      const INTERRUPT_DEBOUNCE_MS = Number(process.env.INTERRUPT_DEBOUNCE_MS || 1200);
       const recentlyInterrupted = session._interruptFiredAt && (Date.now() - session._interruptFiredAt < INTERRUPT_DEBOUNCE_MS);
 
       if (shouldInterrupt && !recentlyInterrupted) {
@@ -164,47 +350,34 @@ function buildSessionOnTranscript(session) {
 
         session._lastSttTranscript = transcript;
 
+        // Route interrupt utterances through the same soft-commit window
+        // so a user who interrupts mid-thought ("ruko... actually...") gets
+        // ONE merged turn instead of two fragments.
         if (isFinal && speechFinal && transcript.trim().length > 0) {
           if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
-          session.isProcessing = true;
-          session.latency.turnStartedAt = Date.now();
-          session.latency.llmStartedAt = null;
-          session.latency.firstTextChunkAt = null;
-          session.latency.firstAudioAt = null;
-          session._userSpeechStartTime = null;
-          session._backchannelTriggered = false;
-          console.log(`[STT] Interrupt speech_final: "${transcript}"`);
-          try {
-            await processTranscript(session, transcript);
-          } catch (e) {
-            console.error('Error processing interrupt transcript:', e);
-            session.isProcessing = false;
-          }
+          console.log(`[STT] Interrupt speech_final buffered: "${transcript}"`);
+          commitTranscript(session, transcript);
+          return;
+        }
+
+        if (session._softCommitBuffer && session._softCommitTimer) {
+          bumpSoftCommitTimer(session);
           return;
         }
 
         if (session._silenceTimer) clearTimeout(session._silenceTimer);
-        session._silenceTimer = setTimeout(async () => {
+        // Shorter fallback (700ms) on the interrupt path so a quiet
+        // interrupt ("ruko") that never gets a speech_final still flushes
+        // promptly. Soft-commit still wraps the actual processTranscript.
+        session._silenceTimer = setTimeout(() => {
           session._silenceTimer = null;
           const pending = session._lastSttTranscript;
           if (!pending || pending.trim().length < 2) return;
           if (session.isProcessing) return;
           session._lastSttTranscript = '';
-          session.isProcessing = true;
-          session.latency.turnStartedAt = Date.now();
-          session.latency.llmStartedAt = null;
-          session.latency.firstTextChunkAt = null;
-          session.latency.firstAudioAt = null;
-          session._userSpeechStartTime = null;
-          session._backchannelTriggered = false;
-          console.log(`[STT] Interrupt silence-timer: "${pending}"`);
-          try {
-            await processTranscript(session, pending);
-          } catch (e) {
-            console.error('Error processing interrupt silence-timer transcript:', e);
-            session.isProcessing = false;
-          }
-        }, 500);
+          console.log(`[STT] Interrupt silence-timer buffered: "${pending}"`);
+          commitTranscript(session, pending);
+        }, 700);
       }
       return;
     }
@@ -228,57 +401,79 @@ function buildSessionOnTranscript(session) {
       if (session._idleTimer) { clearTimeout(session._idleTimer); session._idleTimer = null; }
       session._lastSttTranscript = transcript;
 
-      // Active backchanneling (after 4s of continuous user speech)
+      // Active backchanneling — fires only when the user has been talking
+      // for a while AND the latest interim transcript looks like a
+      // complete-feeling clause (ended on a comma/and/aur/lekin/but).
+      // Random fillers feel intrusive; mid-thought pauses feel attentive.
+      // Also gated by a per-session cooldown so we don't double-fire on
+      // long monologues.
       if (!session._userSpeechStartTime) {
         session._userSpeechStartTime = Date.now();
         session._backchannelTriggered = false;
-      } else if (Date.now() - session._userSpeechStartTime > 4000 && !session._backchannelTriggered && !session.agentSpeaking) {
-        session._backchannelTriggered = true;
-        console.log('[Backchannel] Injecting active listening filler...');
-        const lang = agent.language || 'en';
-        const backchannels = {
-          'en': ['Mhmm...', 'Right.', 'I see.'],
-          'hi': ['Mhmm...', 'Accha.', 'Haan...'],
-          'hi-Latn': ['Mhmm...', 'Accha.', 'Haan...'],
-          'multi': ['Mhmm...', 'Accha.'],
-          'en-IN': ['Mhmm...', 'Right.']
-        };
-        const options = backchannels[lang] || backchannels['en'];
-        const backchannelText = options[Math.floor(Math.random() * options.length)];
-        ttsService.textToSpeech({
-          text: backchannelText,
-          voiceId: agent.voice?.voiceId,
-          speed: 0.9,
-          provider: agent.voice?.provider
-        }).then(audioBuffer => {
-          if (audioBuffer && audioBuffer.length > 0) sendAudioBuffer(session, audioBuffer);
-        }).catch(e => console.error('Backchannel TTS failed:', e));
+      } else {
+        const speechMs = Date.now() - session._userSpeechStartTime;
+        const enoughSilenceSinceLast = !session._lastBackchannelAt
+          || (Date.now() - session._lastBackchannelAt > 8000);
+        const trimmed = transcript.trim();
+        const looksLikeClauseEnd = /[,;:]$/.test(trimmed)
+          || /\b(and|but|so|because|aur|lekin|kyunki|matlab|toh)$/i.test(trimmed);
+        const shouldBackchannel =
+          speechMs > 4500
+          && !session._backchannelTriggered
+          && !session.agentSpeaking
+          && enoughSilenceSinceLast
+          && looksLikeClauseEnd;
+
+        if (shouldBackchannel) {
+          session._backchannelTriggered = true;
+          session._lastBackchannelAt = Date.now();
+          console.log('[Backchannel] Mid-thought pause detected — injecting active listening filler...');
+          const lang = agent.language || 'en';
+          const backchannels = {
+            'en':      ['Mhmm...', 'Right.', 'I see.'],
+            'hi':      ['Mhmm...', 'Accha.', 'Haan...'],
+            'hi-Latn': ['Mhmm...', 'Accha.', 'Haan...'],
+            'multi':   ['Mhmm...', 'Accha.'],
+            'en-IN':   ['Mhmm...', 'Right.'],
+          };
+          const options = backchannels[lang] || backchannels['en'];
+          const backchannelText = options[Math.floor(Math.random() * options.length)];
+          ttsService.textToSpeech({
+            text: backchannelText,
+            voiceId: agent.voice?.voiceId,
+            speed: 0.9,
+            provider: agent.voice?.provider,
+          }).then(audioBuffer => {
+            if (audioBuffer && audioBuffer.length > 0) sendAudioBuffer(session, audioBuffer);
+          }).catch(e => console.error('Backchannel TTS failed:', e));
+        }
       }
     }
 
     // Path 1: Deepgram speech_final
+    // Soft-commit window: don't fire processTranscript yet — buffer this
+    // utterance and let the soft-commit timer flush it after ~800ms of
+    // true silence. If user keeps talking, the buffer accumulates and we
+    // process ONE merged turn, not three fragments.
     if (isFinal && speechFinal && transcript.trim().length > 0) {
       if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
       if (session.isProcessing) return;
-      session.isProcessing = true;
-      session.latency.turnStartedAt = Date.now();
-      session.latency.llmStartedAt = null;
-      session.latency.firstTextChunkAt = null;
-      session.latency.firstAudioAt = null;
-      session._userSpeechStartTime = null;
-      session._backchannelTriggered = false;
-      console.log(`[STT] speech_final triggered: "${transcript}"`);
-      try {
-        await processTranscript(session, transcript);
-      } catch (e) {
-        console.error('Error processing live transcript:', e);
-        session.isProcessing = false;
-      }
+      console.log(`[STT] speech_final buffered: "${transcript}"`);
+      commitTranscript(session, transcript);
       return;
     }
 
-    // Path 2: Client-side silence-timer fallback (600ms)
+    // Path 2: Client-side silence-timer fallback. If we have a soft-commit
+    // buffer in flight, just bump its timer — the user is still on the
+    // same turn. Otherwise fall back to the legacy 900ms timer for the
+    // case where Deepgram never fires speech_final.
+    if (session._softCommitBuffer && session._softCommitTimer) {
+      bumpSoftCommitTimer(session);
+      return;
+    }
+
     if (session._silenceTimer) clearTimeout(session._silenceTimer);
+    const silenceFallbackMs = Number(process.env.STT_SILENCE_FALLBACK_MS || 900);
     session._silenceTimer = setTimeout(async () => {
       session._silenceTimer = null;
       if (session.agentSpeaking) return;
@@ -286,21 +481,9 @@ function buildSessionOnTranscript(session) {
       if (!pending || pending.trim().length < 2) return;
       if (session.isProcessing) return;
       session._lastSttTranscript = '';
-      session.isProcessing = true;
-      session.latency.turnStartedAt = Date.now();
-      session.latency.llmStartedAt = null;
-      session.latency.firstTextChunkAt = null;
-      session.latency.firstAudioAt = null;
-      session._userSpeechStartTime = null;
-      session._backchannelTriggered = false;
-      console.log(`[STT] silence-timer triggered: "${pending}"`);
-      try {
-        await processTranscript(session, pending);
-      } catch (e) {
-        console.error('Error processing silence-timer transcript:', e);
-        session.isProcessing = false;
-      }
-    }, 600);
+      console.log(`[STT] silence-timer (fallback) buffered: "${pending}"`);
+      commitTranscript(session, pending);
+    }, silenceFallbackMs);
   };
 }
 
@@ -468,7 +651,6 @@ function setupVoiceSession(wss) {
       isProcessing: false,
       status: 'connected',
       currentGenerationId: null, // Track current AI generation
-      fullAudioBuffer: [], // Accumulate audio for recording
       latency: {
         turnStartedAt: null,
         llmStartedAt: null,
@@ -585,6 +767,20 @@ async function handleMessage(session, message) {
       await handleEndSession(session, 'user_hangup');
       break;
 
+    case 'dtmf':
+      // User pressed a phone keypad digit mid-call. Treat the digit
+      // sequence as a transcript so the LLM (or CallFlow) can react —
+      // useful for IVR-style menus ("Press 1 for sales, 2 for support").
+      await handleDtmf(session, message);
+      break;
+
+    case 'language_switch':
+      // User asked to switch language mid-call ("English mein baat karo").
+      // Reinitialize Deepgram with the new language and update agent.language
+      // so TTS and humanizeText pick up the right voice.
+      await handleLanguageSwitch(session, message);
+      break;
+
     case 'user_speech_start':
       // Frontend VAD detected speech start
       if (session.agentSpeaking) {
@@ -595,13 +791,11 @@ async function handleMessage(session, message) {
 
     case 'user_speech_end':
       // Frontend VAD detected speech end
-      // Use this as a reliable trigger to process whatever Deepgram transcribed
+      // Use this as a reliable trigger to process whatever Deepgram transcribed.
+      // processTranscript owns the isProcessing guard atomically, so we just
+      // check for pending text and delegate — no pre-setting of flags here
+      // (that pre-set was half of the double-fire race with the soft-commit timer).
       if (!session.isProcessing && session._lastSttTranscript && session._lastSttTranscript.trim().length > 0) {
-        session.isProcessing = true;
-        session.latency.turnStartedAt = Date.now();
-        session.latency.llmStartedAt = null;
-        session.latency.firstTextChunkAt = null;
-        session.latency.firstAudioAt = null;
         const finalTranscript = session._lastSttTranscript;
         session._lastSttTranscript = '';
         console.log(`[VAD] user_speech_end triggered processing: "${finalTranscript}"`);
@@ -609,7 +803,6 @@ async function handleMessage(session, message) {
           await processTranscript(session, finalTranscript);
         } catch (e) {
           console.error('Error processing VAD transcript:', e);
-          session.isProcessing = false;
         }
       }
       break;
@@ -774,6 +967,36 @@ async function handleInit(session, message) {
     });
   }
 
+  // Pre-warm TTS in parallel with everything else. The cache lookup in
+  // ttsService is keyed on (text, voiceId, speed, provider), so warming
+  // the firstMessage NOW means the actual greeting TTS lookup below is
+  // a free instant cache hit (~5ms vs 200-300ms cold). Agent-language
+  // fillers (Hmm, Okay, Haan) are also pre-warmed so backchannels and
+  // tool-check phrases hit cache through the rest of the call.
+  // Fire-and-forget — don't block init on this.
+  (async () => {
+    try {
+      const lang = agent.language || 'en';
+      const voiceId = agent.voice?.voiceId || 'en-US-JennyNeural';
+      const provider = agent.voice?.provider || 'edge-tts';
+      const speed = agent.voice?.speed || 1.05;
+      const fillersByLang = {
+        en:      ['Hmm...', 'Okay so...', 'Sure.', 'Got it.', 'Right.'],
+        hi:      ['Hmm...', 'Accha...', 'Theek hai.', 'Haan...', 'Ek minute...'],
+        'hi-Latn': ['Hmm...', 'Accha...', 'Theek hai.', 'Haan...', 'Ek sec...'],
+        multi:   ['Hmm...', 'Accha...', 'Okay...', 'Haan...'],
+        'en-IN': ['Hmm...', 'Right.', 'Okay so...', 'Just a moment.'],
+      };
+      const phrases = [
+        agent.firstMessage,
+        ...(fillersByLang[lang] || fillersByLang.en),
+      ].filter(Boolean);
+      for (const phrase of phrases) {
+        ttsService.textToSpeech({ text: phrase, voiceId, speed, provider }).catch(() => {});
+      }
+    } catch (_) { /* swallow — pre-warm is best-effort */ }
+  })();
+
   // Create initial call log
   const callLog = await CallLog.create({
     userId: user._id,
@@ -876,6 +1099,15 @@ async function handleInit(session, message) {
     session.status = 'listening';
     startIdleTimer(session);
 
+    // Mid-call server event — fire AFTER ready so the customer doesn't
+    // pay the (small) cost of a slow webhook handshake on TTFA.
+    serverEvents.emit(session, 'call.started', {
+      agentName: agent.name,
+      language: agent.language || 'en',
+      direction: 'web',
+      firstMessage: firstMessageText,
+    });
+
   } catch (error) {
     throw new Error('Failed to initialize agent: ' + error.message);
   }
@@ -915,13 +1147,7 @@ async function handleTextInput(session, text) {
     throw new Error('Session not initialized. Please send an init message first.');
   }
   if (!text || typeof text !== 'string' || text.trim() === '') return;
-  if (session.isProcessing) return;
-
-  session.isProcessing = true;
-  session.latency.turnStartedAt = Date.now();
-  session.latency.llmStartedAt = null;
-  session.latency.firstTextChunkAt = null;
-  session.latency.firstAudioAt = null;
+  // processTranscript owns the atomic isProcessing guard + latency timers.
   await processTranscript(session, text.trim());
 }
 
@@ -936,6 +1162,11 @@ function handleClientInterrupt(session) {
   session.isProcessing = false;
   session._lastSttTranscript = '';
 
+  // Clear soft-commit state — explicit user interrupt means whatever was
+  // buffered is stale (different turn now).
+  if (session._softCommitTimer) { clearTimeout(session._softCommitTimer); session._softCommitTimer = null; }
+  session._softCommitBuffer = '';
+
   if (session._silenceTimer) {
     clearTimeout(session._silenceTimer);
     session._silenceTimer = null;
@@ -949,7 +1180,155 @@ function handleClientInterrupt(session) {
   safeSend(session.ws, { type: 'clear_audio' });
 }
 
+/**
+ * DTMF (keypad) input mid-call.
+ *
+ * Two modes:
+ *   1. Capture mode — frontend/Twilio sends a sequence ("1234") and we
+ *      treat it as a single transcript so the agent / CallFlow can react.
+ *   2. Buffered mode — single digits accumulate into session._dtmfBuffer
+ *      and flush after DTMF_FLUSH_MS of silence. Useful when the user is
+ *      entering a multi-digit code one digit at a time.
+ *
+ * Message shape: { type: 'dtmf', digit?: '1', digits?: '1234', flush?: true }
+ */
+async function handleDtmf(session, message) {
+  if (!session.agent) return;
+  const single = String(message.digit ?? '').replace(/[^0-9*#]/g, '');
+  const batch  = String(message.digits ?? '').replace(/[^0-9*#]/g, '');
+  const incoming = batch || single;
+  if (!incoming) return;
+
+  const flushMs = Number(process.env.DTMF_FLUSH_MS || 1500);
+  if (!session._dtmfBuffer) session._dtmfBuffer = '';
+  session._dtmfBuffer += incoming;
+
+  if (session._dtmfFlushTimer) clearTimeout(session._dtmfFlushTimer);
+
+  // If frontend explicitly asked for flush (e.g. user pressed #) or sent a
+  // batched sequence, process immediately. Otherwise debounce.
+  const shouldFlushNow = !!message.flush || batch.length > 0 || incoming.includes('#');
+  const finalize = async () => {
+    const digits = session._dtmfBuffer;
+    session._dtmfBuffer = '';
+    session._dtmfFlushTimer = null;
+    if (!digits) return;
+
+    safeSend(session.ws, { type: 'dtmf_received', digits });
+    queueCallLogUpdate(session, {
+      $push: { transcript: { role: 'user', content: `[DTMF: ${digits}]` } }
+    }, 'dtmf_input');
+
+    // Stop the agent if it was talking — DTMF is an explicit user signal.
+    if (session.agentSpeaking) handleClientInterrupt(session);
+
+    // Hand the digit string to the normal pipeline. The LLM will see
+    // "[User pressed: 1234]" and route accordingly. If a CallFlow is
+    // active, the flow engine can read session._lastDtmf for branching.
+    session._lastDtmf = digits;
+    if (!session.isProcessing) {
+      session.isProcessing = true;
+      session.latency.turnStartedAt = Date.now();
+      session.latency.llmStartedAt = null;
+      session.latency.firstTextChunkAt = null;
+      session.latency.firstAudioAt = null;
+      try {
+        await processTranscript(session, `[User pressed keypad: ${digits}]`);
+      } catch (e) {
+        console.error('DTMF processing error:', e);
+        session.isProcessing = false;
+      }
+    }
+  };
+
+  if (shouldFlushNow) {
+    await finalize();
+  } else {
+    session._dtmfFlushTimer = setTimeout(finalize, flushMs);
+  }
+}
+
+/**
+ * Mid-call language switch.
+ *
+ * Reinitializes Deepgram with the new language and updates agent.language
+ * so subsequent TTS picks the right voice and humanizeText applies the
+ * correct Hinglish substitutions. The agent doc itself is NOT persisted —
+ * we only mutate the in-session copy.
+ *
+ * Message shape: { type: 'language_switch', language: 'hi'|'en'|'multi'|... , voiceId?: '...' }
+ */
+async function handleLanguageSwitch(session, message) {
+  if (!session.agent || !session.deepgramConn) return;
+  const newLang = String(message.language || '').trim();
+  if (!newLang) {
+    safeSend(session.ws, { type: 'error', message: 'language_switch requires a language code' });
+    return;
+  }
+
+  const supported = ['en', 'en-IN', 'hi', 'hi-Latn', 'multi', 'ta', 'te', 'kn', 'ml', 'mr', 'gu', 'bn', 'ur', 'pa'];
+  if (!supported.includes(newLang)) {
+    safeSend(session.ws, { type: 'error', message: `Unsupported language: ${newLang}` });
+    return;
+  }
+
+  console.log(`[LanguageSwitch] ${session.agent.language || 'en'} → ${newLang}`);
+
+  // Tear down the old Deepgram connection cleanly.
+  try { session.deepgramConn.finish(); } catch (_) {}
+  session.deepgramConn = null;
+
+  // Mutate in-session agent (don't persist to DB — caller may want this
+  // to be temporary for one call only).
+  session.agent.language = newLang;
+  if (message.voiceId) {
+    session.agent.voice = session.agent.voice || {};
+    session.agent.voice.voiceId = message.voiceId;
+  }
+  session._sttLanguage = newLang;
+
+  // Reopen Deepgram with the new language. Reuse whatever audio config
+  // mic_config last established so we don't drop frames during the swap.
+  try {
+    const deepgramKey = session._deepgramKey || session.userSettings?.deepgramKey || process.env.DEEPGRAM_API_KEY;
+    session.deepgramConn = createSessionDeepgramConn(session, {
+      deepgramKey,
+      language: newLang,
+      audioConfig: session._lastAudioConfig || null,
+    });
+    session.sttUnavailable = false;
+    session.sttRetryAttempted = false;
+    safeSend(session.ws, {
+      type: 'language_switched',
+      language: newLang,
+      voiceId: session.agent.voice?.voiceId || null,
+    });
+  } catch (e) {
+    console.error('[LanguageSwitch] Reconnect failed:', e.message);
+    safeSend(session.ws, { type: 'error', message: `Language switch failed: ${e.message}` });
+  }
+}
+
 async function processTranscript(session, transcript) {
+  // ── Atomic re-entrancy guard ───────────────────────────────────────────
+  // MUST be the first synchronous statements (before any await). Node runs
+  // this check+set without interruption, so two concurrent entry points
+  // (VAD `user_speech_end` firing at the same instant as the soft-commit
+  // timer) can no longer BOTH start a turn — which previously double-fired
+  // the LLM, double-pushed history, and queued two Groq streams.
+  if (session.isProcessing) {
+    console.log('[processTranscript] Skipped — a turn is already in progress');
+    return;
+  }
+  if (!session.agent || !transcript || typeof transcript !== 'string' || transcript.trim() === '') {
+    return;
+  }
+  session.isProcessing = true;
+  session.latency.turnStartedAt = Date.now();
+  session.latency.llmStartedAt = null;
+  session.latency.firstTextChunkAt = null;
+  session.latency.firstAudioAt = null;
+
   try {
     // Cancel any ongoing generation — both via the generationId guard
     // (sync, used by audio queue) and an AbortController (HTTP-level,
@@ -1005,39 +1384,74 @@ async function processTranscript(session, transcript) {
       $push: { transcript: { role: 'user', content: transcript } }
     }, 'user_transcript');
 
-    // 🔴 REAL-TIME SENTIMENT ANALYSIS (non-blocking)
-    // Run sentiment classification in background — don't block the LLM pipeline
-    voicePipeline.classifySentiment(transcript).then(async (sentimentResult) => {
-      // Send live sentiment to frontend
-      safeSend(session.ws, {
-        type: 'sentiment',
-        sentiment: sentimentResult.sentiment,
-        score: sentimentResult.score,
-        text: transcript.substring(0, 100), // First 100 chars
-      });
+    // Mid-call event — every user utterance is forwarded to subscribers
+    serverEvents.emit(session, 'transcript.segment', {
+      role: 'user',
+      content: transcript,
+      ts: new Date().toISOString(),
+    });
 
-      // Track sentiment history on session for transfer checks
-      if (!session.sentimentHistory) session.sentimentHistory = [];
-      session.sentimentHistory.push({
-        sentiment: sentimentResult.sentiment,
-        score: sentimentResult.score,
-        timestamp: new Date(),
-      });
+    // 🔴 REAL-TIME SENTIMENT ANALYSIS + 📚 RAG CONTEXT FETCH (parallel, non-blocking for sentiment)
+    // Sentiment is fully fire-and-forget. RAG must be awaited because the LLM needs the
+    // context, but kicking it off here in parallel with sentiment shaves 100-300ms vs.
+    // the old order (sentiment .then() → RAG await).
+    const sentimentPromise = voicePipeline.classifySentiment(transcript)
+      .then(async (sentimentResult) => {
+        // Send live sentiment to frontend
+        safeSend(session.ws, {
+          type: 'sentiment',
+          sentiment: sentimentResult.sentiment,
+          score: sentimentResult.score,
+          text: transcript.substring(0, 100),
+        });
 
-      // Save to call log sentiment timeline
-      if (session.callLogId) {
-        await CallLog.findByIdAndUpdate(session.callLogId, {
-          $push: {
-            liveSentimentTimeline: {
-              timestamp: new Date(),
-              sentiment: sentimentResult.sentiment,
-              score: sentimentResult.score,
-              text: transcript.substring(0, 200),
+        // Track sentiment history on session for transfer checks
+        if (!session.sentimentHistory) session.sentimentHistory = [];
+        const prev = session.sentimentHistory[session.sentimentHistory.length - 1];
+        session.sentimentHistory.push({
+          sentiment: sentimentResult.sentiment,
+          score: sentimentResult.score,
+          timestamp: new Date(),
+        });
+
+        // Mid-call server event — fire ONLY on transitions so receivers
+        // don't get spammed with every neutral repeat.
+        if (!prev || prev.sentiment !== sentimentResult.sentiment) {
+          serverEvents.emit(session, 'sentiment.shift', {
+            from: prev?.sentiment || null,
+            to: sentimentResult.sentiment,
+            score: sentimentResult.score,
+            text: transcript.substring(0, 200),
+          });
+        }
+
+        // Save to call log sentiment timeline
+        if (session.callLogId) {
+          await CallLog.findByIdAndUpdate(session.callLogId, {
+            $push: {
+              liveSentimentTimeline: {
+                timestamp: new Date(),
+                sentiment: sentimentResult.sentiment,
+                score: sentimentResult.score,
+                text: transcript.substring(0, 200),
+              },
             },
-          },
-        }).catch(e => console.error('Sentiment save error:', e.message));
-      }
-    }).catch(e => console.error('Sentiment analysis error:', e.message));
+          }).catch(e => console.error('Sentiment save error:', e.message));
+        }
+        return sentimentResult;
+      })
+      .catch(e => { console.error('Sentiment analysis error:', e.message); return null; });
+
+    // Kick off RAG in parallel — we'll await it just before invoking the pipeline.
+    const _ragStart = Date.now();
+    const ragPromise = (session.agent?.knowledgeBaseId
+      ? ragService.getContextForQuery(transcript, session.agent.knowledgeBaseId)
+          .then(ctx => {
+            if (ctx) console.log(`[RAG] Retrieved context for session ${session.id} (${Date.now() - _ragStart}ms)`);
+            return ctx || '';
+          })
+          .catch(e => { console.error('[RAG] Context retrieval error:', e.message); return ''; })
+      : Promise.resolve(''));
 
     // 🔄 HUMAN HANDOFF CHECK
     // Check if call should be transferred to a human agent
@@ -1057,6 +1471,14 @@ async function processTranscript(session, transcript) {
           transferTo: session.agent.transferNumber,
           reason: transferCheck.reason,
           context: `Call transferred after ${session.history.length} messages. Reason: ${transferCheck.reason}`,
+        });
+
+        // Mid-call server event for external systems (CRM/ticketing)
+        serverEvents.emit(session, 'transferred', {
+          kind: 'human',
+          to: session.agent.transferNumber,
+          reason: transferCheck.reason,
+          messagesBeforeTransfer: session.history.length,
         });
 
         // Update call log
@@ -1098,20 +1520,11 @@ async function processTranscript(session, transcript) {
     session.latency.llmStartedAt = Date.now();
     console.log(`[⏱️ LATENCY] STT→Pipeline: ${session.latency.llmStartedAt - session.latency.turnStartedAt}ms`);
 
-    // FIX: RAG fetch runs here after sentiment (which is non-blocking via .then()).
-    // In future: can be kicked off simultaneously with sentiment using Promise.all.
-    let ragContext = '';
+    // RAG was kicked off in parallel with sentiment above. Now await it
+    // (sentiment continues in the background and is not blocking).
+    const ragContext = await ragPromise;
     if (session.agent?.knowledgeBaseId) {
-      const _ragStart = Date.now();
-      try {
-        ragContext = await ragService.getContextForQuery(transcript, session.agent.knowledgeBaseId);
-        if (ragContext) {
-          console.log(`[RAG] Retrieved context for session ${session.id} (${Date.now() - _ragStart}ms)`);
-        }
-      } catch (e) {
-        console.error(`[RAG] Context retrieval error:`, e.message);
-      }
-      console.log(`[⏱️ LATENCY] RAG lookup: ${Date.now() - _ragStart}ms`);
+      console.log(`[⏱️ LATENCY] RAG lookup (parallel): ${Date.now() - _ragStart}ms`);
     }
 
     // Process through voice pipeline using STREAMING (Much faster) or Call Flow Engine
@@ -1130,6 +1543,7 @@ async function processTranscript(session, transcript) {
         memory: session.memory,
         ragContext,
         abortSignal: abortController.signal,
+        sessionId: session.id,
       });
     }
 
@@ -1194,17 +1608,54 @@ async function processTranscript(session, transcript) {
         }
       } else if (chunk.type === 'final') {
         fullResponseText = chunk.fullText;
+      } else if (chunk.type === 'tool_called') {
+        // Mid-call server event — fire when the LLM invokes a tool so
+        // CRM/ticketing systems can react in real time (without waiting
+        // for the post-call webhook).
+        serverEvents.emit(session, 'tool.called', {
+          toolName: chunk.toolName,
+          args: chunk.args,
+          result: chunk.result,
+        });
       } else if (chunk.type === 'transfer') {
         safeSend(session.ws, { type: 'transfer_initiated', transferTo: chunk.transferTo, reason: chunk.reason });
       } else if (chunk.type === 'transfer_agent') {
         console.log(`[🔄 Multi-Agent Squad] Transferring session ${session.id} to agent ${chunk.agentId} (${chunk.reason})`);
         safeSend(session.ws, { type: 'transfer_initiated', transferToAgent: chunk.agentId, reason: chunk.reason });
-        
+
         const newAgent = await Agent.findById(chunk.agentId);
         if (newAgent) {
+          // Build a handoff summary so the destination agent doesn't have
+          // to ask the customer to repeat themselves. We use a fast Groq
+          // call (best-effort — even if it fails, we still hand off the
+          // last 6 messages verbatim).
+          let handoffSummary = '';
+          try {
+            const summary = await voicePipeline.compressHistory(session.history);
+            handoffSummary = summary?.summary || '';
+          } catch (_) { /* ignore */ }
+
+          const recentMessages = session.history.slice(-6);
+          const handoffContext = [
+            handoffSummary ? `Earlier conversation summary:\n${handoffSummary}` : '',
+            `Last few messages:\n${recentMessages.map(m => `${m.role}: ${m.content}`).join('\n')}`,
+            `Reason for transfer: ${chunk.reason}`,
+            (newAgent.squad?.handoffPrompt || 'You are continuing this call. Acknowledge the context briefly, then help.'),
+          ].filter(Boolean).join('\n\n');
+
+          // Mid-call server event — log the squad handoff for analytics
+          serverEvents.emit(session, 'transferred', {
+            kind: 'squad',
+            fromAgentId: session.agent?._id?.toString?.(),
+            toAgentId: chunk.agentId,
+            reason: chunk.reason,
+            handoffSummary,
+            messagesBeforeTransfer: session.history.length,
+          });
+
           const transferMsg = `I will transfer you to ${newAgent.name}. Please hold.`;
           safeSend(session.ws, { type: 'response_text', text: transferMsg });
-          
+
           try {
             const ttsService = require('../services/ttsService');
             const audioBuffer = await ttsService.textToSpeech({
@@ -1215,10 +1666,14 @@ async function processTranscript(session, transcript) {
             if (audioBuffer && audioBuffer.length > 0) sendAudioBuffer(session, audioBuffer);
           } catch (e) {}
 
-          // Swap agent
+          // Swap agent. Inject the handoff context as a system message so
+          // the next LLM call has the full picture without re-prompting.
           session.agent = newAgent;
-          session.history.push({ role: 'system', content: `[SYSTEM: Call transferred to you. Reason: ${chunk.reason}]` });
-          
+          session.history.push({
+            role: 'system',
+            content: `[SQUAD HANDOFF]\n${handoffContext}`,
+          });
+
           // Trigger new greeting after a short delay
           setTimeout(async () => {
             const { text, audioBuffer } = await voicePipeline.getFirstMessageAudio(session.agent);
@@ -1329,29 +1784,8 @@ async function handleEndSession(session, reason = 'user_hangup') {
     } catch (e) {}
   }
 
-  // Save call recording (streamed directly to disk)
-  let recordingUrl = '';
-  if (session.audioWriteStream) {
-    session.audioWriteStream.end();
-    recordingUrl = `/api/recordings/download/${require('path').basename(session.recordingFilepath)}`;
-    console.log(`[Recording] Stream saved to disk → ${recordingUrl}`);
-  } else if (session.fullAudioBuffer && session.fullAudioBuffer.length > 0 && session.callLogId) {
-    try {
-      const fs = require('fs');
-      const path = require('path');
-      const recordingsDir = process.env.RECORDINGS_DIR ? require('path').resolve(process.env.RECORDINGS_DIR) : path.join(__dirname, '..', 'recordings');
-      if (!fs.existsSync(recordingsDir)) fs.mkdirSync(recordingsDir, { recursive: true });
-
-      const filename = `call_${session.callLogId}_${Date.now()}.mp3`;
-      const filepath = path.join(recordingsDir, filename);
-      const fullBuffer = Buffer.concat(session.fullAudioBuffer);
-      fs.writeFileSync(filepath, fullBuffer);
-
-      recordingUrl = `/api/recordings/download/${filename}`;
-    } catch (recErr) {
-      console.error('[Recording] Failed to save:', recErr.message);
-    }
-  }
+  // Call recording is disabled — no audio is written to disk and no
+  // recordingUrl is stored on the call log.
 
   // Update call log
   const endTime = new Date();
@@ -1365,136 +1799,17 @@ async function handleEndSession(session, reason = 'user_hangup') {
       duration,
       endReason: reason,
     };
-    if (recordingUrl) updateData.recordingUrl = recordingUrl;
 
     const finalCallLog = await CallLog.findByIdAndUpdate(session.callLogId, updateData, { new: true });
 
-    // Background analysis
+    // Background analysis — fire-and-forget, but broken into focused helpers
+    // (instead of one deep nested .then chain) so a failure in one stage
+    // (memory / CRM / webhook / notifications) doesn't abort the others and
+    // is logged with clear context.
     if (!session.skipPostCallAnalysis && finalCallLog && finalCallLog.transcript.length > 0) {
-      voicePipeline.analyzeCall(finalCallLog.transcript).then(async (analysis) => {
-        if (analysis) {
-          // Save enhanced analysis fields
-          await CallLog.findByIdAndUpdate(session.callLogId, {
-            summary: analysis.summary,
-            sentiment: analysis.sentiment,
-            emotion: analysis.emotion,
-            metrics: analysis.metrics,
-            actionItems: analysis.actionItems,
-            extractedData: analysis.extractedData,
-            // New enhanced fields
-            topics: analysis.topics || [],
-            decisions: analysis.decisions || [],
-            customerIntent: analysis.customerIntent || '',
-            urgencyLevel: analysis.urgencyLevel || '',
-            followUpRequired: analysis.followUpRequired || false,
-            qa: {
-              score: analysis.qaScore || 0,
-              grade: analysis.qaGrade || '',
-            },
-            tags: analysis.tags || []
-          });
-
-          // Save to User Memory (Pichli baatein)
-          if (analysis.extractedData && Object.keys(analysis.extractedData).length > 0) {
-            const UserMemory = require('../models/UserMemory');
-            const userPhone = session.callParams?.from || 'test_user';
-            
-            const newFacts = Object.entries(analysis.extractedData).map(([key, value]) => ({
-              content: `${key}: ${value}`,
-              category: 'extracted',
-            }));
-            if (newFacts.length > 0) {
-              await UserMemory.findOneAndUpdate(
-                { userId: session.userId, phone: userPhone },
-                {
-                  $push: {
-                    facts: {
-                      $each: newFacts,
-                      $slice: -20,
-                    },
-                  },
-                },
-                { upsert: true, new: true, setDefaultsOnInsert: true }
-              );
-            }
-            console.log(`[Memory Updated] User: ${userPhone}`);
-          }
-
-          // 📋 AUTO-CREATE CRM LEAD from extracted data
-          // If the call extracted a name + phone, automatically create a lead in CRM
-          try {
-            const ed = analysis.extractedData || {};
-            const leadName = ed.name || '';
-            const leadPhone = ed.phone || '';
-
-            if (leadName && leadPhone) {
-              const Lead = require('../models/Lead');
-
-              // Avoid duplicates: check if a lead with same phone already exists for this user
-              const existingLead = await Lead.findOne({ userId: session.userId, phone: leadPhone });
-
-              if (!existingLead) {
-                await Lead.create({
-                  userId: session.userId,
-                  agentId: session.agent?._id,
-                  callLogId: session.callLogId,
-                  name: leadName,
-                  phone: leadPhone,
-                  email: ed.email || '',
-                  interest: analysis.customerIntent || ed.company || '',
-                  status: 'Warm',
-                  value: '',
-                  notes: analysis.summary || '',
-                });
-                console.log(`[CRM] Lead auto-created: ${leadName} (${leadPhone})`);
-              } else {
-                // Update existing lead notes with latest call summary
-                await Lead.findByIdAndUpdate(existingLead._id, {
-                  $set: {
-                    notes: analysis.summary || existingLead.notes,
-                    ...(ed.email && { email: ed.email }),
-                    ...(ed.company && { interest: ed.company }),
-                  },
-                });
-                console.log(`[CRM] Lead updated: ${leadName} (${leadPhone})`);
-              }
-            }
-          } catch (leadErr) {
-            console.error('[CRM] Auto lead creation error:', leadErr.message);
-          }
-
-          console.log(`[Analysis Complete] Session: ${session.id}`);
-
-          // 🔗 POST-CALL WEBHOOK (n8n / Zapier / Custom Backend)
-          // Fire after analysis so payload includes summary, sentiment, extractedData
-          try {
-            const freshCallLog = await CallLog.findById(session.callLogId);
-            if (freshCallLog) {
-              webhookDispatcher.dispatch(freshCallLog, session.agent, session.userSettings)
-                .catch(e => console.error('[Webhook Dispatch Error]', e.message));
-            }
-          } catch (e) {
-            console.error('[Webhook] Failed to load call log for dispatch:', e.message);
-          }
-
-          // 📱 POST-CALL NOTIFICATIONS (SMS/WhatsApp)
-          // Trigger after analysis so we have summary data
-          if (session.agent?.postCallActions?.sendSMS || session.agent?.postCallActions?.sendWhatsApp) {
-            const updatedCallLog = await CallLog.findById(session.callLogId);
-            if (updatedCallLog) {
-              notificationService.sendPostCallNotifications({
-                callLog: updatedCallLog,
-                agent: session.agent,
-                userSettings: session.userSettings,
-              }).then(results => {
-                if (results && results.length > 0) {
-                  console.log(`[Notifications] Sent ${results.length} post-call notifications`);
-                }
-              }).catch(err => console.error('Post-call notification error:', err.message));
-            }
-          }
-        }
-      }).catch(err => console.error('Background analysis error:', err));
+      runPostCallAnalysis(session).catch(err =>
+        console.error('[PostCall] Background analysis error:', err.message)
+      );
     }
 
     // Update agent stats
@@ -1514,6 +1829,163 @@ async function handleEndSession(session, reason = 'user_hangup') {
   });
 }
 
+/**
+ * Post-call analysis orchestrator. Runs the LLM analysis once, persists it,
+ * then fans out to memory / CRM / webhook / notifications. Each stage is
+ * independently guarded so one failure never blocks the rest.
+ */
+async function runPostCallAnalysis(session) {
+  const callLogId = session.callLogId;
+  const finalCallLog = await CallLog.findById(callLogId);
+  if (!finalCallLog || !finalCallLog.transcript?.length) return;
+
+  const analysis = await voicePipeline.analyzeCall(finalCallLog.transcript, session.agent);
+  if (!analysis) return;
+
+  // 1. Persist analysis fields
+  try {
+    await CallLog.findByIdAndUpdate(callLogId, {
+      summary: analysis.summary,
+      sentiment: analysis.sentiment,
+      emotion: analysis.emotion,
+      metrics: analysis.metrics,
+      actionItems: analysis.actionItems,
+      extractedData: analysis.extractedData,
+      topics: analysis.topics || [],
+      decisions: analysis.decisions || [],
+      customerIntent: analysis.customerIntent || '',
+      urgencyLevel: analysis.urgencyLevel || '',
+      followUpRequired: analysis.followUpRequired || false,
+      qa: { score: analysis.qaScore || 0, grade: analysis.qaGrade || '' },
+      tags: analysis.tags || [],
+    });
+  } catch (e) {
+    console.error('[PostCall] Save analysis failed:', e.message);
+  }
+
+  // 2. Run the independent fan-out stages in parallel; isolate failures.
+  await Promise.allSettled([
+    saveUserMemory(session, analysis),
+    upsertCrmLead(session, analysis),
+    dispatchPostCallWebhook(session, analysis),
+    sendPostCallNotifications(session, analysis),
+  ]);
+
+  console.log(`[Analysis Complete] Session: ${session.id}`);
+}
+
+/** Persist extracted facts to UserMemory ("pichli baatein"). */
+async function saveUserMemory(session, analysis) {
+  const ed = analysis.extractedData || {};
+  if (Object.keys(ed).length === 0) return;
+  try {
+    const UserMemory = require('../models/UserMemory');
+    const userPhone = session.callParams?.from || 'test_user';
+    const newFacts = Object.entries(ed).map(([key, value]) => ({
+      content: `${key}: ${value}`,
+      category: 'extracted',
+    }));
+    if (newFacts.length > 0) {
+      await UserMemory.findOneAndUpdate(
+        { userId: session.userId, phone: userPhone },
+        { $push: { facts: { $each: newFacts, $slice: -20 } } },
+        { upsert: true, new: true, setDefaultsOnInsert: true }
+      );
+      console.log(`[Memory Updated] User: ${userPhone}`);
+    }
+  } catch (err) {
+    console.error('[PostCall] UserMemory save error:', err.message);
+  }
+}
+
+/** Auto-create / update a CRM lead when name + phone were extracted. */
+async function upsertCrmLead(session, analysis) {
+  const ed = analysis.extractedData || {};
+  const leadName = ed.name || '';
+  const leadPhone = ed.phone || '';
+  if (!leadName || !leadPhone) return;
+
+  try {
+    const Lead = require('../models/Lead');
+    const existingLead = await Lead.findOne({ userId: session.userId, phone: leadPhone });
+
+    if (!existingLead) {
+      await Lead.create({
+        userId: session.userId,
+        agentId: session.agent?._id,
+        callLogId: session.callLogId,
+        name: leadName,
+        phone: leadPhone,
+        email: ed.email || '',
+        interest: analysis.customerIntent || ed.company || '',
+        status: 'Warm',
+        value: '',
+        notes: analysis.summary || '',
+      });
+      console.log(`[CRM] Lead auto-created: ${leadName} (${leadPhone})`);
+    } else {
+      await Lead.findByIdAndUpdate(existingLead._id, {
+        $set: {
+          notes: analysis.summary || existingLead.notes,
+          ...(ed.email && { email: ed.email }),
+          ...(ed.company && { interest: ed.company }),
+        },
+      });
+      console.log(`[CRM] Lead updated: ${leadName} (${leadPhone})`);
+    }
+  } catch (err) {
+    console.error('[CRM] Auto lead creation error:', err.message);
+  }
+}
+
+/** Fire the post-call webhook + emit the Vapi-compatible call.ended event. */
+async function dispatchPostCallWebhook(session, analysis) {
+  try {
+    const freshCallLog = await CallLog.findById(session.callLogId);
+    if (!freshCallLog) return;
+
+    webhookDispatcher.dispatch(freshCallLog, session.agent, session.userSettings)
+      .catch(e => console.error('[Webhook Dispatch Error]', e.message));
+
+    serverEvents.emit(session, 'call.ended', {
+      duration: freshCallLog.duration,
+      endReason: freshCallLog.endReason,
+      summary: analysis.summary,
+      sentiment: analysis.sentiment,
+      emotion: analysis.emotion,
+      topics: analysis.topics || [],
+      customerIntent: analysis.customerIntent,
+      urgencyLevel: analysis.urgencyLevel,
+      followUpRequired: !!analysis.followUpRequired,
+      actionItems: analysis.actionItems || [],
+      extractedData: analysis.extractedData || {},
+      qa: { score: analysis.qaScore, grade: analysis.qaGrade },
+      tags: analysis.tags || [],
+    });
+  } catch (e) {
+    console.error('[Webhook] Failed to load call log for dispatch:', e.message);
+  }
+}
+
+/** Send SMS/WhatsApp post-call notifications if the agent enabled them. */
+async function sendPostCallNotifications(session, analysis) {
+  if (!session.agent?.postCallActions?.sendSMS && !session.agent?.postCallActions?.sendWhatsApp) return;
+  try {
+    const updatedCallLog = await CallLog.findById(session.callLogId);
+    if (!updatedCallLog) return;
+    const results = await notificationService.sendPostCallNotifications({
+      callLog: updatedCallLog,
+      agent: session.agent,
+      userSettings: session.userSettings,
+    });
+    if (results && results.length > 0) {
+      console.log(`[Notifications] Sent ${results.length} post-call notifications`);
+    }
+  } catch (err) {
+    console.error('Post-call notification error:', err.message);
+  }
+}
+
 async function cleanupSession(session) {
   // Cancel any in-flight LLM HTTP request so a dying call doesn't keep
   // burning Groq/Gemini quota (the 429 we saw in production logs came
@@ -1524,13 +1996,24 @@ async function cleanupSession(session) {
   }
   // Stop the idle re-engagement timer — without this it would still fire
   // 10s later and trigger processTranscript on a dead session.
-  if (session._idleTimer) { clearTimeout(session._idleTimer); session._idleTimer = null; }
-  if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
+  if (session._idleTimer)          { clearTimeout(session._idleTimer);          session._idleTimer = null; }
+  if (session._silenceTimer)       { clearTimeout(session._silenceTimer);       session._silenceTimer = null; }
   if (session._agentSpeakingTimer) { clearTimeout(session._agentSpeakingTimer); session._agentSpeakingTimer = null; }
+  if (session._dtmfFlushTimer)     { clearTimeout(session._dtmfFlushTimer);     session._dtmfFlushTimer = null; }
+  if (session._softCommitTimer)    { clearTimeout(session._softCommitTimer);    session._softCommitTimer = null; }
+  if (session._logFlushInterval)   { clearInterval(session._logFlushInterval);  session._logFlushInterval = null; }
+  session._softCommitBuffer = '';
+
+  // Flush any pending transcript writes BEFORE we close so the last few
+  // turns don't get dropped on an abrupt disconnect.
+  await flushCallLogWriteQueue(session).catch(() => {});
 
   if (session.deepgramConn) {
     try { session.deepgramConn.finish(); } catch (e) {}
+    session.deepgramConn = null;
   }
+  // Drop the cached rolling summary for this session so it doesn't leak.
+  try { voicePipeline.clearSummaryCache(session.id); } catch (_) {}
   if (session.status !== 'ended') {
     await handleEndSession(session, 'connection_closed').catch(() => {});
   }
@@ -1565,22 +2048,34 @@ function nextAudioSeq(session) {
 }
 
 /**
+ * Wait until the WebSocket has drained below the soft cap. Uses a tight
+ * event-driven check (poll bufferedAmount on a 30ms tick) instead of the
+ * old 100ms blind sleep — that 100ms tick added 50-100ms of jitter to
+ * every audio chunk send when buffers were below threshold.
+ */
+function waitForWsDrain(ws, maxBufferedBytes) {
+  return new Promise((resolve) => {
+    if (ws.readyState !== 1 || ws.bufferedAmount <= maxBufferedBytes) {
+      resolve();
+      return;
+    }
+    const tick = () => {
+      if (ws.readyState !== 1 || ws.bufferedAmount <= maxBufferedBytes) {
+        resolve();
+        return;
+      }
+      setTimeout(tick, 30);
+    };
+    tick();
+  });
+}
+
+/**
  * Send audio chunk WITHOUT audio_end — used for intermediate chunks (backchannels, mid-stream).
  * Does NOT reset agentSpeaking timer.
  */
 function sendAudioChunkOnly(session, buffer) {
-  if (!session.audioWriteStream && session.callLogId) {
-    const fs = require('fs');
-    const path = require('path');
-    const recordingsDir = process.env.RECORDINGS_DIR ? require('path').resolve(process.env.RECORDINGS_DIR) : path.join(__dirname, '..', 'recordings');
-    if (!fs.existsSync(recordingsDir)) fs.mkdirSync(recordingsDir, { recursive: true });
-    session.recordingFilepath = path.join(recordingsDir, `call_${session.callLogId}_${Date.now()}.mp3`);
-    session.audioWriteStream = fs.createWriteStream(session.recordingFilepath);
-  }
-  if (session.audioWriteStream) {
-    session.audioWriteStream.write(buffer);
-  }
-
+  // Call recording is disabled — we never write audio to disk.
   session.agentSpeaking = true;
 
   const { seq, generationId } = nextAudioSeq(session);
@@ -1588,9 +2083,7 @@ function sendAudioChunkOnly(session, buffer) {
 
   const task = async () => {
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
-    while (session.ws.readyState === 1 && session.ws.bufferedAmount > maxBufferedBytes) {
-      await new Promise(r => setTimeout(r, 100)); // Backpressure pause, no dropping audio
-    }
+    await waitForWsDrain(session.ws, maxBufferedBytes);
 
     if (session.prefersBinaryAudio) {
       safeSendBinary(session.ws, buffer);
@@ -1608,18 +2101,7 @@ function sendAudioChunkOnly(session, buffer) {
 }
 
 function sendAudioBuffer(session, buffer, isFinal = true) {
-  if (!session.audioWriteStream && session.callLogId) {
-    const fs = require('fs');
-    const path = require('path');
-    const recordingsDir = process.env.RECORDINGS_DIR ? require('path').resolve(process.env.RECORDINGS_DIR) : path.join(__dirname, '..', 'recordings');
-    if (!fs.existsSync(recordingsDir)) fs.mkdirSync(recordingsDir, { recursive: true });
-    session.recordingFilepath = path.join(recordingsDir, `call_${session.callLogId}_${Date.now()}.mp3`);
-    session.audioWriteStream = fs.createWriteStream(session.recordingFilepath);
-  }
-  if (session.audioWriteStream) {
-    session.audioWriteStream.write(buffer);
-  }
-
+  // Call recording is disabled — we never write audio to disk.
   session.agentSpeaking = true;
 
   const { seq, generationId } = nextAudioSeq(session);
@@ -1627,9 +2109,7 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
 
   const task = async () => {
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
-    while (session.ws.readyState === 1 && session.ws.bufferedAmount > maxBufferedBytes) {
-      await new Promise(r => setTimeout(r, 100)); // Backpressure pause
-    }
+    await waitForWsDrain(session.ws, maxBufferedBytes);
 
     // Skip sending empty buffers — they exist only to flush isFinal markers
     if (buffer && buffer.length > 0) {

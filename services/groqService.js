@@ -49,13 +49,26 @@ class GroqService {
     }
   }
 
-  async withTimeout(promise, timeoutMs, label = 'groq_request') {
+  /**
+   * Race a promise against a timeout.
+   *
+   * CRITICAL: when the timeout wins, Promise.race does NOT cancel the
+   * losing promise — the underlying Groq HTTP request keeps running and
+   * keeps holding a slot in the SDK's shared connection pool. Over a long
+   * call those orphaned requests stack up and head-of-line block every
+   * subsequent request, which is exactly what makes latency climb from
+   * ~700ms to 7-10s mid-call. So we ALSO abort the request on timeout.
+   */
+  async withTimeout(promise, timeoutMs, label = 'groq_request', controller = null) {
     let timeoutHandle;
     try {
       return await Promise.race([
         promise,
         new Promise((_, reject) => {
-          timeoutHandle = setTimeout(() => reject(new Error(`${label}_timeout`)), timeoutMs);
+          timeoutHandle = setTimeout(() => {
+            if (controller) { try { controller.abort(); } catch (_) {} }
+            reject(new Error(`${label}_timeout`));
+          }, timeoutMs);
         }),
       ]);
     } finally {
@@ -63,12 +76,39 @@ class GroqService {
     }
   }
 
+  /**
+   * Build an AbortController whose .abort() also fires when an external
+   * signal aborts. Lets a single internal controller respond to BOTH the
+   * timeout (above) and a caller-supplied interrupt signal.
+   */
+  linkAbort(externalSignal = null) {
+    const controller = new AbortController();
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else externalSignal.addEventListener('abort', () => {
+        try { controller.abort(); } catch (_) {}
+      }, { once: true });
+    }
+    return controller;
+  }
+
   getClient(apiKey) {
     const key = apiKey || process.env.GROQ_API_KEY;
     if (!key) throw new Error('No Groq API key. Get one free at https://console.groq.com');
 
     if (!this.clients.has(key)) {
-      this.clients.set(key, new Groq({ apiKey: key }));
+      // maxRetries: 0 — the SDK's built-in retries (default 2) compound with
+      // OUR model-fallback chain and circuit breaker. During an outage that
+      // means up to 3 retries × 4 models all fighting for the same connection
+      // pool, which is exactly what produced the 9-11s latency spiral. We own
+      // retry/fallback policy ourselves, so disable the SDK's.
+      // timeout: a hard per-request ceiling as defense-in-depth on top of our
+      // Promise.race withTimeout (which can't always cancel a stuck socket).
+      this.clients.set(key, new Groq({
+        apiKey: key,
+        maxRetries: 0,
+        timeout: Number(process.env.GROQ_SDK_TIMEOUT_MS || 8000),
+      }));
     }
     return this.clients.get(key);
   }
@@ -108,10 +148,12 @@ class GroqService {
     }
 
     try {
+      const controller = new AbortController();
       const completion = await this.withTimeout(
-        client.chat.completions.create(options),
+        client.chat.completions.create(options, { signal: controller.signal }),
         this.getTimeoutMs(),
-        'groq_completion'
+        'groq_completion',
+        controller
       );
 
       const message = completion.choices[0]?.message;
@@ -144,6 +186,12 @@ class GroqService {
 
     const client = this.getClient(apiKey);
 
+    // Single internal controller that fires on EITHER the start-timeout OR
+    // the caller's interrupt signal. This guarantees the HTTP request is
+    // actually cancelled (and its pool slot freed) instead of being left
+    // to drain in the background.
+    const controller = this.linkAbort(abortSignal);
+
     let stream;
     try {
       stream = await this.withTimeout(
@@ -155,9 +203,10 @@ class GroqService {
           // Same stop sequences as non-streaming path. Groq's hard cap is 4.
           stop: ['\n- ', '\n* ', '\n1.', '\n#'],
           stream: true,
-        }, abortSignal ? { signal: abortSignal } : undefined),
+        }, { signal: controller.signal }),
         this.getTimeoutMs(),
-        'groq_stream_start'
+        'groq_stream_start',
+        controller
       );
       this.onRequestSuccess();
     } catch (error) {
@@ -167,15 +216,19 @@ class GroqService {
 
     try {
       for await (const chunk of stream) {
-        if (abortSignal?.aborted) break;
+        if (controller.signal.aborted) break;
         const text = chunk.choices[0]?.delta?.content || '';
         if (text) yield text;
       }
     } catch (e) {
       // AbortError on signal abort is expected — swallow it so the caller's
       // cancellation path runs cleanly without throwing into the pipeline.
-      if (e?.name === 'AbortError' || abortSignal?.aborted) return;
+      if (e?.name === 'AbortError' || controller.signal.aborted) return;
       throw e;
+    } finally {
+      // If the consumer stops pulling early (e.g. circuit breaker break),
+      // abort so the upstream request doesn't keep draining and holding a slot.
+      try { controller.abort(); } catch (_) {}
     }
   }
 

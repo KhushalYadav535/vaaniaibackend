@@ -18,9 +18,18 @@ class VoicePipeline {
     this._responseCacheEnabled = String(process.env.LLM_RESPONSE_CACHE_ENABLED || 'true').toLowerCase() === 'true';
     this._responseCacheTtlMs = Number(process.env.LLM_RESPONSE_CACHE_TTL_MS || 300000); // 5 min
 
+    // Per-session rolling-summary cache: sessionId → { summary, coveredCount, inFlight }.
+    // Keeps the expensive summary Groq call OFF the per-turn critical path.
+    this._summaryCache = new Map();
+
     // Rolling summary settings
     this._summaryThreshold = Number(process.env.ROLLING_SUMMARY_THRESHOLD || 12); // summarize after N messages
     this._summaryKeepRecent = Number(process.env.ROLLING_SUMMARY_KEEP_RECENT || 6); // keep last N messages verbatim
+    // Recompute the cached summary only after this many NEW older messages
+    // accumulate. Between recomputes we reuse the cached summary, so the
+    // expensive summary Groq call no longer fires on every single turn
+    // (that was flooding the free-tier TPM limit and starving the reply).
+    this._summaryRecomputeEvery = Number(process.env.ROLLING_SUMMARY_RECOMPUTE_EVERY || 6);
 
     // Language-specific filler words for natural turn-taking
     this._fillersByLang = {
@@ -33,6 +42,73 @@ class VoicePipeline {
   }
 
   /**
+   * Devnagari → Roman transliterator (last line of defense).
+   *
+   * Llama 3.1 8B mirrors the user's script even when system prompt says
+   * "Roman only". When STT gives us "विद्यापीठ" the model echoes it.
+   * Edge TTS then mispronounces or skips Devnagari glyphs entirely.
+   *
+   * This is a simple character-by-character map — not full ITRANS
+   * accuracy, but good enough that the TTS engine will speak something
+   * recognizable instead of going silent on a Devnagari word. Diacritics
+   * approximate (ज़ → z, फ़ → f).
+   */
+  _transliterateDevnagari(text) {
+    if (!text || !/[ऀ-ॿ]/.test(text)) return text; // Fast path: no Devnagari
+
+    // Independent vowels
+    const vowels = {
+      'अ':'a','आ':'aa','इ':'i','ई':'ee','उ':'u','ऊ':'oo','ऋ':'ri',
+      'ए':'e','ऐ':'ai','ओ':'o','औ':'au','ऍ':'e','ऑ':'o',
+    };
+    // Vowel signs (matras)
+    const matras = {
+      'ा':'aa','ि':'i','ी':'ee','ु':'u','ू':'oo','ृ':'ri',
+      'े':'e','ै':'ai','ो':'o','ौ':'au','ँ':'n','ं':'n','ः':'h','ॅ':'e','ॉ':'o',
+    };
+    // Consonants (with implicit 'a' that we strip when followed by matra/halant)
+    const consonants = {
+      'क':'k','ख':'kh','ग':'g','घ':'gh','ङ':'ng',
+      'च':'ch','छ':'chh','ज':'j','झ':'jh','ञ':'ny',
+      'ट':'t','ठ':'th','ड':'d','ढ':'dh','ण':'n',
+      'त':'t','थ':'th','द':'d','ध':'dh','न':'n',
+      'प':'p','फ':'ph','ब':'b','भ':'bh','म':'m',
+      'य':'y','र':'r','ल':'l','व':'v','श':'sh','ष':'sh','स':'s','ह':'h',
+      'क़':'q','ख़':'kh','ग़':'gh','ज़':'z','ड़':'r','ढ़':'rh','फ़':'f','य़':'y',
+    };
+    const halant = '्';
+    const out = [];
+    const chars = Array.from(text);
+    for (let i = 0; i < chars.length; i++) {
+      const c = chars[i];
+      const next = chars[i + 1];
+      if (consonants[c]) {
+        out.push(consonants[c]);
+        // Implicit 'a' unless followed by matra or halant
+        if (next && (matras[next] || next === halant)) {
+          // No implicit 'a'; if matra, will be appended next iteration
+          continue;
+        }
+        // Word-final consonant — drop schwa for natural sound (Hindi schwa-deletion)
+        const isWordEnd = !next || /[\s\.,!?;:]/.test(next) || /[ऀ-ॿ]/.test(next) === false;
+        if (!isWordEnd) out.push('a');
+        continue;
+      }
+      if (matras[c]) { out.push(matras[c]); continue; }
+      if (vowels[c]) { out.push(vowels[c]); continue; }
+      if (c === halant) continue; // suppress implicit 'a' between consonants
+      if (c === '़') continue;     // nukta — already absorbed where applicable
+      // Devnagari digits
+      if (c >= '०' && c <= '९') {
+        out.push(String.fromCharCode(c.charCodeAt(0) - 0x0966 + 0x30));
+        continue;
+      }
+      out.push(c); // pass through (whitespace, punctuation, Latin)
+    }
+    return out.join('');
+  }
+
+  /**
    * Humanize LLM text for natural speech.
    * Adds micro-pauses, forces contractions, formats numbers for speaking,
    * and removes any remaining markdown artifacts.
@@ -40,6 +116,16 @@ class VoicePipeline {
   humanizeText(text, lang = 'en') {
     if (!text) return text;
     let t = text;
+
+    // 0. CRITICAL: Strip Devnagari script — Llama 3.1 8B mirrors user's
+    //    script despite prompt instructions. Edge TTS struggles with
+    //    Devnagari and will mispronounce or skip those tokens entirely.
+    //    Transliterate to Roman so the voice stays consistent.
+    if (/[ऀ-ॿ]/.test(t)) {
+      const before = t;
+      t = this._transliterateDevnagari(t);
+      console.warn(`[humanize] Devnagari leak detected & transliterated:\n  before: "${before.slice(0, 120)}"\n  after:  "${t.slice(0, 120)}"`);
+    }
 
     // 1. Force contractions (formal → spoken)
     t = t.replace(/\bI would\b/gi, "I'd");
@@ -74,9 +160,17 @@ class VoicePipeline {
     t = t.replace(/Is there anything else I can help you with(\?|\.|!)?/gi, 'Anything else?');
     t = t.replace(/Is there anything else(\?|\.|!)?/gi, 'Anything else?');
 
-    // 3. Numbers ≥4 digits → spoken digit-by-digit (phone numbers, OTPs, codes)
-    t = t.replace(/\b(\d{4,})\b/g, (match) => {
-      return match.split('').join(', ');
+    // 3. Long digit sequences → spoken digit-by-digit (phone numbers, account
+    //    numbers, OTPs read out as individual digits). Threshold is tunable:
+    //    default 7 so that 4-digit years ("2024"), prices ("4500"), and small
+    //    quantities are spoken naturally instead of "2, 0, 2, 4". Phone and
+    //    account numbers (10+ digits) and 7+ digit codes still get spelled out.
+    const digitSpellThreshold = Number(process.env.HUMANIZE_DIGIT_SPELL_MIN || 7);
+    t = t.replace(/\b(\d+)\b/g, (match) => {
+      if (match.length >= digitSpellThreshold) {
+        return match.split('').join(', ');
+      }
+      return match;
     });
 
     // 4. Clean excess punctuation
@@ -118,6 +212,30 @@ class VoicePipeline {
     if (trimmed.endsWith('!'))  return 1;  // Excitement: +1Hz
     // Statements: alternate between -1Hz and 0Hz to prevent metronomic monotone
     return Math.random() > 0.5 ? -1 : 0;
+  }
+
+  /**
+   * Map detected emotion to a (speedDelta, pitchDelta) prosody adjustment.
+   *
+   * The agent already detects user emotion (detectEmotion) and biases the
+   * LLM. But the TTS voice still spoke the response at a flat baseline
+   * speed/pitch — so an angry customer got the same calm cadence as a
+   * happy one. That's the "uncanny" gap: words say "I'm so sorry" while
+   * the voice sounds chipper.
+   *
+   * Returns small deltas applied on top of the agent's configured speed
+   * and the per-sentence pitch variation. Keep magnitudes conservative —
+   * Edge TTS gets weird beyond ±15% rate or ±3Hz pitch.
+   */
+  getEmotionProsody(userEmotion) {
+    switch (userEmotion) {
+      case 'angry':
+      case 'frustrated': return { speedDelta: -0.05, pitchDelta: -1 }; // slow + lower = calming
+      case 'urgent':     return { speedDelta:  0.10, pitchDelta:  0 }; // faster, neutral pitch
+      case 'sad':        return { speedDelta: -0.07, pitchDelta: -1 }; // slower, softer
+      case 'happy':      return { speedDelta:  0.03, pitchDelta:  1 }; // slightly upbeat
+      default:           return { speedDelta:  0,    pitchDelta:  0 };
+    }
   }
 
   getGroqFallbackModels(primaryModel = 'llama-3.1-8b-instant') {
@@ -182,10 +300,11 @@ class VoicePipeline {
     const start = Date.now();
 
     // Build conversation messages
+    const lastReplies = history.filter(m => m.role === 'assistant').slice(-3).map(m => m.content);
     const messages = [
       {
         role: 'system',
-        content: this.buildSystemPrompt(agent, memory, ragContext),
+        content: this.buildSystemPrompt(agent, memory, ragContext, lastReplies),
       },
       ...history.map(msg => ({
         role: msg.role,
@@ -369,7 +488,7 @@ class VoicePipeline {
    *
    * Result: First audio arrives ~500ms instead of ~1000ms.
    */
-  async *processTextStream({ text, agent, history = [], userSettings = {}, memory = null, ragContext = '', abortSignal = null }) {
+  async *processTextStream({ text, agent, history = [], userSettings = {}, memory = null, ragContext = '', abortSignal = null, sessionId = null }) {
     // ── Emotion detection ──────────────────────────────────────────────────
     const currentEmotion = this.detectEmotion(text);
     let emotionPrompt = '';
@@ -377,14 +496,21 @@ class VoicePipeline {
     if (currentEmotion === 'urgent') emotionPrompt = '\n[SYSTEM DIRECTIVE]: The user has an urgent issue. Be extremely concise, fast, and helpful. Get straight to the point.';
 
     // ── Rolling conversation summary for long calls ──────────────────────
-    const { summary: rollingSummary, recentHistory } = await this.compressHistory(history);
+    // Pass sessionId so the summary is cached + refreshed in the background
+    // instead of making a blocking Groq call on every turn (which was
+    // starving the reply stream and causing the mid-call latency spiral).
+    const { summary: rollingSummary, recentHistory } = await this.compressHistory(history, sessionId);
     let summaryPrompt = '';
     if (rollingSummary) {
       summaryPrompt = `\n\n## EARLIER CONVERSATION SUMMARY:\n${rollingSummary}`;
     }
 
+    // Anti-repetition: feed the last 3 assistant lines into the system
+    // prompt so Llama 3.1 8B doesn't echo itself when the user acks.
+    const lastReplies = recentHistory.filter(m => m.role === 'assistant').slice(-3).map(m => m.content);
+
     const messages = [
-      { role: 'system', content: this.buildSystemPrompt(agent, memory, ragContext) + summaryPrompt + emotionPrompt },
+      { role: 'system', content: '' }, // filled in below once, after KB + tools are resolved
       ...recentHistory.map(msg => ({ role: msg.role, content: msg.content })),
       { role: 'user', content: text },
     ];
@@ -397,8 +523,12 @@ class VoicePipeline {
     const ttsApiKey     = userSettings.ttsKey    || process.env.ELEVENLABS_API_KEY;
 
     const fastFirstChunkMode       = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
-    const firstChunkCharThreshold  = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 24);
-    const firstChunkMaxWords       = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 10);
+    // Lowered defaults: 24→18 chars, 10→8 words. The original threshold
+    // was tuned to wait for "complete-feeling" first phrases — but the
+    // human ear is forgiving of half-thoughts when they arrive 100-150ms
+    // sooner. The remainder gets queued behind it via semantic chunking.
+    const firstChunkCharThreshold  = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 18);
+    const firstChunkMaxWords       = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 8);
 
     // ── Dynamic Knowledge (RAG 2.0) ────────────────────────────────────────
     let dynamicKnowledge = '';
@@ -419,7 +549,15 @@ class VoicePipeline {
       ? `\n[Tool Instructions]: You can call these tools if needed: ${agent.webhooks.map(w => w.name).join(', ')}. Format: <TOOL>function_name(args)</TOOL>`
       : '';
 
-    const systemPrompt = this.buildSystemPrompt(agent, memory, ragContext) + dynamicKnowledge + toolInstructions + emotionPrompt;
+    // Build the system prompt ONCE, including ALL context. Previously this
+    // was built twice and the second build OVERWROTE messages[0] — silently
+    // discarding the (expensive) rolling summary and the anti-repetition
+    // lastReplies. Now everything is composed in a single pass.
+    const systemPrompt = this.buildSystemPrompt(agent, memory, ragContext, lastReplies)
+      + summaryPrompt
+      + dynamicKnowledge
+      + toolInstructions
+      + emotionPrompt;
     messages[0].content = systemPrompt;
 
     // ── Filler word (fires synchronously before stream to reduce TTFA) ─────
@@ -434,6 +572,19 @@ class VoicePipeline {
     }
 
     // ── Select token stream (Custom URL or Groq with fallback) ────────────
+    // Pipeline-level abort: links the caller's interrupt signal with an
+    // internal controller we also trigger when the circuit breaker fires or
+    // the consumer stops draining early. Without this, an abandoned producer
+    // keeps `for await`-ing the Groq stream in the background, holding its
+    // connection-pool slot and causing latency to climb across the call.
+    const pipelineAbort = new AbortController();
+    if (abortSignal) {
+      if (abortSignal.aborted) pipelineAbort.abort();
+      else abortSignal.addEventListener('abort', () => {
+        try { pipelineAbort.abort(); } catch (_) {}
+      }, { once: true });
+    }
+
     let tokenStream;
     if (agent.advanced?.customLlmUrl) {
       tokenStream = (async function* () {
@@ -456,35 +607,73 @@ class VoicePipeline {
         apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
       });
     } else {
+      // ─── Groq streaming with REAL model rotation ──────────────────────
+      // BUG FIX: generateStreamResponse is a lazy async generator — building
+      // it never throws, so the old `try { gen() } catch` loop ALWAYS used
+      // the first model and never rotated. The actual request (and its
+      // timeout/429) only happens when we pull the first chunk. So we prime
+      // each candidate here: pull the first token inside try/catch and, on
+      // failure, rotate to the next model — which has a SEPARATE Groq token
+      // bucket, the whole point of the fallback chain when TPM is exhausted.
       const candidateModels = this.getGroqFallbackModels(llmModel);
-      let streamCreated = false;
-      let lastErr = null;
-      for (const modelCandidate of candidateModels) {
-        try {
-          tokenStream   = groqService.generateStreamResponse({
+      const apiKey = userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY;
+      const temperature = agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4);
+      const self = this;
+
+      tokenStream = (async function* () {
+        let lastErr = null;
+        for (const modelCandidate of candidateModels) {
+          if (pipelineAbort.signal.aborted) return;
+          const inner = groqService.generateStreamResponse({
             messages,
-            model:       modelCandidate,
-            // Default temperature 0.4 for business voice agents — high creativity
-          // (default 0.7) makes Llama drift into long, decorative essays.
-          // Tunable via agent.temperature in DB or LLM_DEFAULT_TEMPERATURE env.
-          temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
-            apiKey:      userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
-            abortSignal,
+            model: modelCandidate,
+            temperature,
+            apiKey,
+            abortSignal: pipelineAbort.signal,
           });
-          streamCreated = true;
-          break;
-        } catch (err) {
-          lastErr = err;
-          console.warn(`[LLM Stream Fallback] ${modelCandidate} failed -> ${err.message}`);
+          try {
+            // Prime: pull the first chunk. This forces the HTTP request to
+            // actually start and surfaces a throttle/timeout HERE so we can
+            // rotate. If it succeeds, yield it and stream the rest.
+            const first = await inner.next();
+            if (first.done) {
+              // Empty stream — treat as a soft failure, try next model.
+              lastErr = new Error(`${modelCandidate}_empty_stream`);
+              continue;
+            }
+            if (first.value) yield first.value;
+            for await (const tok of inner) {
+              if (pipelineAbort.signal.aborted) return;
+              yield tok;
+            }
+            return; // stream finished cleanly
+          } catch (err) {
+            lastErr = err;
+            console.warn(`[LLM Stream Fallback] ${modelCandidate} failed -> ${err.message} — rotating model`);
+            // try next candidate (fresh token bucket)
+          }
         }
-      }
-      // ─── Gemini auto-fallback for streaming ───────────────────────────
-      if (!streamCreated && geminiService.isAvailable()) {
-        console.log('[LLM Stream Fallback] All Groq models failed. Trying Gemini stream...');
-        tokenStream = geminiService.generateStreamResponse({ messages, temperature: agent.temperature || 0.7 });
-        streamCreated = true;
-      }
-      if (!streamCreated) throw lastErr || new Error('all_llm_stream_models_failed');
+
+        // ─── All Groq models exhausted — try Gemini stream if enabled ────
+        if (geminiService.isAvailable()) {
+          console.log('[LLM Stream Fallback] All Groq models failed. Trying Gemini stream...');
+          try {
+            const gem = geminiService.generateStreamResponse({ messages, temperature });
+            for await (const tok of gem) {
+              if (pipelineAbort.signal.aborted) return;
+              yield tok;
+            }
+            return;
+          } catch (gemErr) {
+            console.error('[LLM Stream Fallback] Gemini stream failed:', gemErr.message);
+            lastErr = gemErr;
+          }
+        }
+
+        // Nothing worked — throw so the drainer's catch fires the non-stream
+        // last-resort (cache → template → apology).
+        throw lastErr || new Error('all_llm_stream_models_failed');
+      })();
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -496,11 +685,16 @@ class VoicePipeline {
     // ─────────────────────────────────────────────────────────────────────
 
     /** Helper: kick off TTS without blocking; returns a Promise<{text,audio}> */
+    const emotionProsody = this.getEmotionProsody(currentEmotion);
     const fireTTS = (sentenceText) => {
       const lang = agent.language || 'en';
       const humanized = this.humanizeText(sentenceText, lang);
-      const pitch = this.getDynamicPitch(humanized);
-      return ttsService.textToSpeech({ text: humanized, voiceId, speed, pitch, apiKey: ttsApiKey, provider: voiceProvider })
+      // Apply emotion prosody on top of the agent's configured speed +
+      // per-sentence pitch variation. Clamp to safe Edge TTS bounds.
+      const dynamicPitch = this.getDynamicPitch(humanized);
+      const adjustedSpeed = Math.max(0.7, Math.min(1.6, speed + emotionProsody.speedDelta));
+      const adjustedPitch = Math.max(-3, Math.min(3, dynamicPitch + emotionProsody.pitchDelta));
+      return ttsService.textToSpeech({ text: humanized, voiceId, speed: adjustedSpeed, pitch: adjustedPitch, apiKey: ttsApiKey, provider: voiceProvider })
         .then(audio => ({ text: humanized, audio }))
         .catch(err  => {
           console.error(`[TTS Concurrent] Failed: "${humanized.substring(0, 40)}"`, err.message);
@@ -521,6 +715,7 @@ class VoicePipeline {
 
       try {
         for await (const token of tokenStream) {
+          if (pipelineAbort.signal.aborted) break;
           lastTokenTime = Date.now();
           fullResponseText  += token;
           currentSentence   += token;
@@ -547,14 +742,28 @@ class VoicePipeline {
 
               try {
                 const args       = JSON.parse(argsStr.replace(/'/g, '"'));
-                
+
                 // Prevent circuit breaker from tripping during long tool execution
                 let isToolRunning = true;
                 const keepAliveTimer = setInterval(() => { if (isToolRunning) lastTokenTime = Date.now(); }, 1000);
-                
+
+                // Hard timeout: if a tool hangs longer than TOOL_EXECUTION_TIMEOUT_MS,
+                // bail with an error result so the LLM can recover. Default 10s — long
+                // enough for most webhooks (Zapier, n8n, Slack), short enough that the
+                // user doesn't think the agent died.
+                const toolTimeoutMs = Number(process.env.TOOL_EXECUTION_TIMEOUT_MS || 10000);
                 let toolResult;
                 try {
-                  toolResult = await toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent });
+                  toolResult = await Promise.race([
+                    toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent }),
+                    new Promise((_, reject) => setTimeout(
+                      () => reject(new Error(`tool_timeout_${toolTimeoutMs}ms`)),
+                      toolTimeoutMs
+                    )),
+                  ]);
+                } catch (toolErr) {
+                  console.error(`[Tool Timeout/Error] ${name}: ${toolErr.message}`);
+                  toolResult = { success: false, tool: name, error: toolErr.message };
                 } finally {
                   isToolRunning = false;
                   clearInterval(keepAliveTimer);
@@ -569,6 +778,15 @@ class VoicePipeline {
                   }));
                   return; // Stop producing
                 }
+
+                // Emit a tool.called sentinel so subscribers (voiceSession
+                // → serverEventsDispatcher) can fire a webhook in real time.
+                ttsQueue.push(Promise.resolve({
+                  __special: 'tool_called',
+                  toolName: name,
+                  args:     argsStr,
+                  result:   toolResult,
+                }));
 
                 console.log('[Tool Executed] Result:', toolResult);
                 fullResponseText = fullResponseText.replace(toolMatch[0], ` [Result: ${JSON.stringify(toolResult)}] `);
@@ -633,18 +851,28 @@ class VoicePipeline {
           if (producerDone) break; // Producer is done and queue is drained
           
           // ── Circuit Breaker: Stop if LLM is stuck for >Ns ──
-          // Default 6s — long enough for slow Hindi/Hinglish responses,
-          // short enough that the Gemini/llmFallback path still feels live.
-          // Tunable via LLM_STREAM_HANG_TIMEOUT_MS.
-          const hangTimeoutMs = Number(process.env.LLM_STREAM_HANG_TIMEOUT_MS || 6000);
+          // Progressive timeout — fail FAST before first chunk so Gemini
+          // fallback kicks in quickly, but be patient mid-stream so slow
+          // Hindi/Hinglish/Llama-70B responses don't get cut off.
+          //   pre-first-chunk: LLM_PRECHUNK_HANG_TIMEOUT_MS  (default 3000ms)
+          //   mid-stream:      LLM_STREAM_HANG_TIMEOUT_MS    (default 6000ms)
+          const preChunkTimeoutMs = Number(process.env.LLM_PRECHUNK_HANG_TIMEOUT_MS || 3000);
+          const midStreamTimeoutMs = Number(process.env.LLM_STREAM_HANG_TIMEOUT_MS || 6000);
+          const hangTimeoutMs = hasEmittedAnyChunk ? midStreamTimeoutMs : preChunkTimeoutMs;
           if (Date.now() - lastTokenTime > hangTimeoutMs) {
-            console.error(`[Circuit Breaker] LLM stream hung for >${hangTimeoutMs}ms. Aborting.`);
+            console.error(`[Circuit Breaker] LLM stream hung for >${hangTimeoutMs}ms (${hasEmittedAnyChunk ? 'mid-stream' : 'pre-first-chunk'}). Aborting.`);
             producerError = new Error("LLM_TIMEOUT");
             producerDone = true;
-            
+
+            // Abort the underlying LLM request so the producer's background
+            // `for await` stops pulling and releases its connection-pool slot.
+            // Without this the orphaned stream keeps draining and head-of-line
+            // blocks the very fallback request we're about to make.
+            try { pipelineAbort.abort(); } catch (_) {}
+
             if (!hasEmittedAnyChunk) {
                // If it hung before even speaking, break completely to trigger the Fallback Engine (Gemini)
-               break; 
+               break;
             } else {
                // If it hung mid-sentence, apologize
                yield { type: 'chunk', text: "Sorry, my connection dropped for a second.", audio: Buffer.alloc(0) };
@@ -666,6 +894,13 @@ class VoicePipeline {
           return;
         }
 
+        // Handle tool.called sentinel — yield to voiceSession so it can
+        // fire a real-time server event, then continue draining.
+        if (result.__special === 'tool_called') {
+          yield { type: 'tool_called', toolName: result.toolName, args: result.args, result: result.result };
+          continue;
+        }
+
         yield { type: 'chunk', text: result.text, audio: result.audio };
         hasEmittedAnyChunk = true;
       }
@@ -679,42 +914,43 @@ class VoicePipeline {
     } catch (streamErr) {
       await producerPromise.catch(() => {});
 
+      // ── Abort path: the caller (interrupt / new turn / session end)
+      //    cancelled this generation. This is NOT a failure — do NOT spin up
+      //    a non-stream fallback. Doing so was the root cause of the latency
+      //    spiral: an interrupt aborted the stream, the pipeline fired a
+      //    zombie fallback Groq request that held a connection slot, and the
+      //    real (new) turn then timed out behind it (groq_completion_timeout).
+      //    NOTE: we check the EXTERNAL abortSignal specifically — the circuit
+      //    breaker aborts the internal pipelineAbort on a genuine hang, and
+      //    that case SHOULD still fall through to Gemini / canned reply.
+      if (abortSignal?.aborted) {
+        console.log('[Pipeline] Generation aborted by caller (interrupt/new turn) — no fallback.');
+        return;
+      }
+
       if (hasEmittedAnyChunk) throw streamErr;
 
-      // ── Fallback: non-streaming response if stream never started ─────────
-      console.warn('[Pipeline] Stream failed before first chunk — falling back to non-stream');
+      // ── Last-resort fallback ─────────────────────────────────────────────
+      // By the time we get here the streaming wrapper has ALREADY rotated
+      // through every Groq model AND tried Gemini (if enabled) and they all
+      // failed — almost always because the free-tier token bucket (6000 TPM)
+      // is momentarily empty. Retrying the same Groq models here just adds
+      // 4-8s of dead air. So we do ONE cheap thing: if Gemini is enabled try
+      // a single non-stream Gemini call (different provider, separate quota),
+      // otherwise go straight to the canned reply that keeps the call alive.
+      console.warn('[Pipeline] Stream chain exhausted — using last-resort fallback');
 
       let fallbackResponse;
       if (geminiService.isAvailable(userSettings.geminiKey)) {
-        console.warn('[Pipeline] Using Gemini for ultimate non-stream fallback');
         try {
-           fallbackResponse = await geminiService.generateResponse({
-             messages,
-             model: 'gemini-2.0-flash',
-             // Default temperature 0.4 for business voice agents — high creativity
-          // (default 0.7) makes Llama drift into long, decorative essays.
-          // Tunable via agent.temperature in DB or LLM_DEFAULT_TEMPERATURE env.
-          temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
-             apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
-           });
-        } catch(e) {
-           console.error('[Pipeline] Gemini fallback failed too:', e.message);
-        }
-      }
-
-      if (!fallbackResponse) {
-        try {
-          fallbackResponse = await this.generateGroqResponseWithFallback({
+          fallbackResponse = await geminiService.generateResponse({
             messages,
-            model:       llmModel,
-            // Default temperature 0.4 for business voice agents — high creativity
-          // (default 0.7) makes Llama drift into long, decorative essays.
-          // Tunable via agent.temperature in DB or LLM_DEFAULT_TEMPERATURE env.
-          temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
-            apiKey:      userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY,
+            model: 'gemini-2.0-flash',
+            temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
+            apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
           });
         } catch (e) {
-          console.error('[Pipeline] Groq retry also failed:', e.message);
+          console.error('[Pipeline] Gemini last-resort failed too:', e.message);
         }
       }
 
@@ -747,12 +983,40 @@ class VoicePipeline {
 
   /**
    * Post-call analysis (Enhanced — Summary, Sentiment, Topics, Decisions, Intent, Urgency)
+   *
+   * Optional `agent.extractionSchema` extends the default extractedData
+   * shape with custom typed fields (e.g. productInterest:enum, budget:number).
    */
-  async analyzeCall(transcript) {
+  async analyzeCall(transcript, agent = null) {
     if (!transcript || transcript.length === 0) return null;
 
     const formattedTranscript = transcript.map(m => `${m.role}: ${m.content}`).join('\n');
-    
+
+    // Build the extractedData schema description. Always includes the
+    // built-in PII fields (name/email/phone/company/date) for backwards
+    // compatibility, then appends agent-defined custom fields.
+    const customFields = Array.isArray(agent?.extractionSchema) ? agent.extractionSchema : [];
+    const customFieldDescriptions = customFields.map(f => {
+      const t = f.type || 'string';
+      const desc = f.description ? ` // ${f.description}` : '';
+      const enumPart = (t === 'enum' && Array.isArray(f.enumValues) && f.enumValues.length > 0)
+        ? ` (one of: ${f.enumValues.join(', ')})`
+        : '';
+      const requiredPart = f.required ? ' [REQUIRED]' : '';
+      return `        "${f.name}": <${t}${enumPart}>${requiredPart}${desc}`;
+    }).join(',\n');
+
+    const extractedDataBlock = customFieldDescriptions
+      ? `{
+        "name": "",
+        "email": "",
+        "phone": "",
+        "company": "",
+        "date": "",
+${customFieldDescriptions}
+      }`
+      : `{ "name": "", "email": "", "phone": "", "company": "", "date": "" }`;
+
     const prompt = `
       Analyze the following phone call transcript thoroughly and provide a structured analysis.
 
@@ -769,7 +1033,7 @@ class VoicePipeline {
         "urgencyLevel": "low" | "medium" | "high" | "critical",
         "followUpRequired": true | false,
         "actionItems": ["specific next steps or tasks"],
-        "extractedData": { "name": "", "email": "", "phone": "", "company": "", "date": "" },
+        "extractedData": ${extractedDataBlock},
         "emotion": "happy" | "angry" | "sad" | "frustrated" | "neutral",
         "metrics": { "nps": 0, "csat": 0 },
         "qaScore": 95,
@@ -799,7 +1063,28 @@ class VoicePipeline {
       });
 
       const cleanJson = response.text.replace(/```json|```/g, '').trim();
-      return JSON.parse(cleanJson);
+      const parsed = JSON.parse(cleanJson);
+
+      // Validate custom enum fields — drop any that don't match allowed values
+      // so we never persist garbage from a hallucinating LLM.
+      if (customFields.length > 0 && parsed.extractedData) {
+        for (const f of customFields) {
+          if (f.type === 'enum' && Array.isArray(f.enumValues) && parsed.extractedData[f.name]) {
+            const v = String(parsed.extractedData[f.name]);
+            if (!f.enumValues.includes(v)) delete parsed.extractedData[f.name];
+          }
+          if (f.type === 'number' && parsed.extractedData[f.name] != null) {
+            const num = Number(parsed.extractedData[f.name]);
+            parsed.extractedData[f.name] = Number.isFinite(num) ? num : null;
+          }
+          if (f.type === 'boolean' && parsed.extractedData[f.name] != null) {
+            const v = parsed.extractedData[f.name];
+            parsed.extractedData[f.name] = (v === true) || (typeof v === 'string' && /^(true|yes|haan)$/i.test(v));
+          }
+        }
+      }
+
+      return parsed;
     } catch (e) {
       console.error('Post-call analysis failed:', e.message);
       return null;
@@ -967,7 +1252,7 @@ class VoicePipeline {
    *
    * Returns: { summary: string|null, recentHistory: Array }
    */
-  async compressHistory(history) {
+  async compressHistory(history, sessionId = null) {
     if (!history || history.length <= this._summaryThreshold) {
       return { summary: null, recentHistory: history };
     }
@@ -975,35 +1260,89 @@ class VoicePipeline {
     const olderMessages = history.slice(0, history.length - this._summaryKeepRecent);
     const recentHistory = history.slice(-this._summaryKeepRecent);
 
-    const olderFormatted = olderMessages.map(m => `${m.role}: ${m.content}`).join('\n');
+    // ── Cached path (default) ───────────────────────────────────────────
+    // The summary is EXPENSIVE (re-sends the whole older history to Groq).
+    // Firing it on every turn floods the free-tier token-per-minute limit
+    // and starves the actual reply stream — that was the real cause of the
+    // mid-call latency spiral (9-10s). Instead we cache per session and
+    // recompute in the BACKGROUND only every N new older-messages, never
+    // blocking the turn.
+    if (sessionId) {
+      const cached = this._summaryCache.get(sessionId);
+      const olderCount = olderMessages.length;
 
+      // Decide if a (background) refresh is due.
+      const needsRefresh = !cached || (olderCount - cached.coveredCount) >= this._summaryRecomputeEvery;
+      if (needsRefresh && !cached?.inFlight) {
+        // Mark in-flight on the existing entry (or seed a new one) so we
+        // don't launch multiple concurrent summary calls.
+        const seed = cached || { summary: null, coveredCount: 0, inFlight: false };
+        seed.inFlight = true;
+        this._summaryCache.set(sessionId, seed);
+
+        // Fire-and-forget — do NOT await. The current turn uses whatever
+        // summary we already have (possibly null on the very first overflow).
+        this._computeSummary(olderMessages)
+          .then((summary) => {
+            this._summaryCache.set(sessionId, { summary, coveredCount: olderCount, inFlight: false });
+            console.log(`[Rolling Summary] (bg) refreshed for ${sessionId}: covered ${olderCount} older msgs`);
+          })
+          .catch((e) => {
+            const prev = this._summaryCache.get(sessionId) || seed;
+            prev.inFlight = false;
+            this._summaryCache.set(sessionId, prev);
+            console.error('[Rolling Summary] (bg) failed:', e.message);
+          });
+      }
+
+      // Always return immediately with whatever summary we have cached.
+      return { summary: cached?.summary || null, recentHistory };
+    }
+
+    // ── Legacy synchronous path (no sessionId provided) ─────────────────
+    // Kept for callers like squad-handoff that need a one-shot summary.
     try {
-      const response = await groqService.generateResponse({
-        messages: [
-          {
-            role: 'system',
-            content: 'Summarize this call conversation in 3-5 bullet points. Include key facts, decisions, and any data mentioned (names, numbers, dates). Be concise. Respond with ONLY the summary, no preamble.',
-          },
-          { role: 'user', content: olderFormatted },
-        ],
-        model: 'llama-3.1-8b-instant',
-        temperature: 0.1,
-      });
-
-      const summary = response.text.trim();
+      const summary = await this._computeSummary(olderMessages);
       console.log(`[Rolling Summary] Compressed ${olderMessages.length} older messages into summary`);
       return { summary, recentHistory };
     } catch (e) {
       console.error('[Rolling Summary] Failed:', e.message);
-      // Fallback: just truncate
       return { summary: null, recentHistory: history.slice(-10) };
     }
   }
 
+  /** Run the actual summary LLM call. Separated so it can run in background. */
+  async _computeSummary(olderMessages) {
+    const olderFormatted = olderMessages.map(m => `${m.role}: ${m.content}`).join('\n');
+    const response = await groqService.generateResponse({
+      messages: [
+        {
+          role: 'system',
+          content: 'Summarize this call conversation in 3-5 bullet points. Include key facts, decisions, and any data mentioned (names, numbers, dates). Be concise. Respond with ONLY the summary, no preamble.',
+        },
+        { role: 'user', content: olderFormatted },
+      ],
+      model: 'llama-3.1-8b-instant',
+      temperature: 0.1,
+    });
+    return (response.text || '').trim();
+  }
+
+  /** Drop a session's cached summary when its call ends. */
+  clearSummaryCache(sessionId) {
+    if (sessionId) this._summaryCache.delete(sessionId);
+  }
+
   /**
    * Build system prompt for the agent
+   *
+   * `lastReplies` = last 2-3 assistant responses. Used to bias the LLM
+   * away from saying the same line twice — Llama 3.1 8B has a strong
+   * tendency to repeat itself when the user gives a short ack ("ok",
+   * "haan"). Showing it the recent assistant lines as a "do not repeat"
+   * directive cuts repetition rate dramatically with no latency cost.
    */
-  buildSystemPrompt(agent, memory = null, ragContext = '') {
+  buildSystemPrompt(agent, memory = null, ragContext = '', lastReplies = []) {
     const lang = agent.language || 'en';
     const langInstruction = lang === 'en' ? 'English' : lang === 'hi' ? 'Hindi (MUST BE WRITTEN IN ROMAN/LATIN ALPHABET ONLY. NO DEVNAGARI SCRIPT ALLOWED)' : lang === 'hi-Latn' ? 'Hinglish (Hindi in Roman script)' : lang === 'multi' ? 'the same language the user speaks in (use Roman script for Hindi)' : lang;
 
@@ -1030,80 +1369,102 @@ ${agent.systemPrompt}
       prompt += `\n\n## KNOWLEDGE BASE CONTEXT (only quote when DIRECTLY asked; never summarize all of it):\n${ragContext}`;
     }
 
+    // Anti-repetition guard. Llama 3.1 8B in voice mode repeats its own
+    // last line when the user gives a short ack ("ok", "haan", "right").
+    // Showing the model exactly what it just said and naming the failure
+    // mode is the cheapest fix — costs ~30 tokens, zero latency.
+    if (lastReplies && lastReplies.length > 0) {
+      const recent = lastReplies
+        .filter(r => r && r.length > 5)
+        .slice(-3)
+        .map((r, i) => `${i + 1}. "${r.trim().slice(0, 140)}"`)
+        .join('\n');
+      if (recent) {
+        prompt += `\n\n## YOU JUST SAID — DO NOT REPEAT:\n${recent}\nRephrase or move forward. Don't echo the same line back when the user gives a short ack.`;
+      }
+    }
+
     // VOICE CONSTRAINTS LAST — recency bias makes these dominate behavior.
-    // Few-shot examples carry far more weight than abstract rules with
-    // Llama 3.1 8B — every "❌ → ✅" pair below is a tested correction
-    // for a specific failure mode we saw in production.
+    // Kept tight on purpose: every token here is re-sent on EVERY turn and
+    // Groq's free tier is only 6000 tokens/minute. A bloated prompt burns the
+    // budget in ~4 turns and then requests throttle/hang. Few-shot pairs are
+    // trimmed to the highest-signal ones.
     prompt += `
 
-## CRITICAL VOICE RULES — NON-NEGOTIABLE:
+## VOICE RULES (you are on a live phone call — NOT writing text):
+1. LENGTH: max 1 short sentence (≤15 words). Never list features; ask ONE qualifying question.
+2. NO markdown, bullets, dashes, asterisks. Spoken audio only.
+3. NO robotic openers ("Certainly", "I'd be happy to help"). Use "Sure", "Haan", "Theek hai", "Got it".
+4. Contractions always: don't, I'll, you're, that's.
+5. Phone numbers/OTPs: say digits separately. Emails: "name at gmail dot com".
+6. If unsure: "hmm, mujhe confirm karna padega" — never invent details.
+7. LANGUAGE: reply in ${langInstruction}. Match the user's code-switching.
+8. SCRIPT (critical): NEVER output Devnagari/Indic script even if the user does.
+   Transliterate to Roman ("विद्यापीठ"→"Vidyapeeth", "प्रयागराज"→"Prayagraj").
+   Devnagari breaks the TTS.
 
-You are on a phone call. You are NOT writing an article, list, or brochure.
-
-# RULE 1 — LENGTH: Maximum 1 sentence (≤15 words). Always.
-  ❌ "We offer website development, e-commerce, SEO, digital marketing, and member management services for your gym..."
-  ✅ "Sure — gym ke liye website ban jaayegi. Aap kis cheez ke liye chahiye — booking, ya basic info?"
-
-# RULE 2 — DISCOVERY MODE: When user mentions a need, DON'T list features.
-Ask ONE specific qualifying question. Treat it like a sales discovery call.
-The discovery order is: 1) what exactly 2) when 3) budget/scale 4) name+contact.
-  ❌ "We can build websites with: 1) Branding 2) Design 3) SEO 4) Hosting..."
-  ✅ "Theek hai. Aapka gym kis city mein hai?"
-  ✅ "Cool. Already website hai jisko upgrade karna hai, ya bilkul fresh?"
-
-# RULE 3 — NO ROBOTIC OPENERS: Never say "गुड", "Certainly", "Absolutely",
-"I'd be happy to help", "I understand your concern", "great question".
-Use natural human openers: "Sure", "Haan", "Theek hai", "Got it", "Okay so", "Hmm", "Right".
-
-# RULE 4 — NO MARKDOWN: Zero bullets, dashes, numbers, asterisks, hyphens.
-This is spoken audio — markdown sounds broken when read aloud.
-
-# RULE 5 — CONTRACTIONS ALWAYS: don't, I'll, you're, we've, that's, it's, can't.
-
-# RULE 6 — NUMBERS & EMAILS:
-Phone numbers / OTPs / codes — say each digit separately.
-Emails — spell out: "rahul at gmail dot com".
-
-# RULE 7 — WHEN UNSURE: "hmm, mujhe iska confirm karna padega" — never invent details.
-
-# RULE 8 — LANGUAGE: Reply in ${langInstruction}. Match user's energy and code-switching.
-
-## EXAMPLE DIALOGUES — Follow this pattern:
-
-USER: "मुझे gym के लिए website banwani hai"
-YOU: "Sure, gym ke liye website ban jaayegi. Aap basic info site chahte ho ya membership booking bhi?"
-
-USER: "Mujhe ek school ke liye website chahiye"
-YOU: "Theek hai. School ka naam aur kis city mein hai, batao?"
-
+Example:
+USER: "मुझे gym ke liye website banwani hai"
+YOU: "Sure, gym ke liye website ban jaayegi. Basic info chahiye ya booking bhi?"
 USER: "Pricing kya hai?"
-YOU: "Pricing aapke project pe depend karti hai. Aapko kya features chahiye, batao?"
+YOU: "Pricing project pe depend karti hai. Aapko kaunse features chahiye?"
 
-USER: "I want a basic ecommerce site"
-YOU: "Got it. Roughly kitne products list karne hain — under 50, ya more?"
-
-Today is ${new Date().toDateString()}.
-You are NOT an AI. Never say "As an AI" or "I'm an assistant".
+Today is ${new Date().toDateString()}. You are NOT an AI; never say "As an AI".
 `;
 
     return prompt;
   }
 
   /**
-   * Check if user wants to end the call
+   * Check if user wants to end the call.
+   *
+   * CRITICAL: this must be HIGH-PRECISION. A false positive hangs up on a
+   * paying customer mid-conversation. The old version used substring
+   * `includes()` which matched "bas" inside "Basic", "stop" inside "stopped",
+   * and treated conversational fillers ("theek hai", "namaste", "shukriya",
+   * "dhanyavaad") as hangups — all of which fire constantly during a normal
+   * call. We saw exactly this: user said "Basic inko chahiye bas" and the
+   * agent said "Goodbye!" and dropped the call.
+   *
+   * New approach:
+   *   - match WHOLE words/phrases only (word boundaries), not substrings
+   *   - only genuinely unambiguous hangup intents
+   *   - conversational acks are NOT end-call triggers
    */
   shouldEndCall(text, agent) {
-    const defaultEndPhrases = ['goodbye', 'bye', 'hang up', 'end call', 'stop', 'quit', 'exit'];
-    // Hindi end phrases — common ways to say bye/end in Hindi/Hinglish
-    const hindiEndPhrases = [
-      'alvida', 'namaste', 'dhanyavaad', 'shukriya', 'theek hai', 'bas', 
-      'band karo', 'ruk jao', 'rukiye', 'bye bye', 'chhodo', 'jane do',
-    ];
-    const agentEndPhrases = agent.endCallPhrases || [];
-    const allPhrases = [...defaultEndPhrases, ...hindiEndPhrases, ...agentEndPhrases];
+    const raw = String(text || '').toLowerCase().trim();
+    if (!raw) return false;
 
-    const lowerText = text.toLowerCase().trim();
-    return allPhrases.some(phrase => lowerText.includes(phrase));
+    // Normalize: strip punctuation to bare words for whole-word matching.
+    const normalized = ` ${raw.replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim()} `;
+
+    // Unambiguous single-word hangups (matched as whole words).
+    const endWords = [
+      'goodbye', 'bye', 'alvida',
+      // NOTE: deliberately NOT including: bas, stop, theek, namaste,
+      // dhanyavaad, shukriya, ok, okay — these occur in normal conversation.
+    ];
+    // Multi-word hangup phrases (clear intent to end).
+    const endPhrases = [
+      'hang up', 'end call', 'end the call', 'cut the call',
+      'bye bye', 'good bye',
+      'call band karo', 'call band kar do', 'band karo call',
+      'phone rakho', 'phone rakhta hoon', 'phone rakhti hoon',
+      'rakhta hoon', 'rakhti hoon', 'baat khatam',
+      'call kaat do', 'kaat do', 'call disconnect',
+    ];
+
+    const agentEndPhrases = (agent.endCallPhrases || []).map(p => String(p).toLowerCase());
+
+    // Whole-word match for single words.
+    for (const w of endWords) {
+      if (normalized.includes(` ${w} `)) return true;
+    }
+    // Phrase match (these are specific enough that substring is safe).
+    for (const p of [...endPhrases, ...agentEndPhrases]) {
+      if (p && raw.includes(p)) return true;
+    }
+    return false;
   }
 
   /**

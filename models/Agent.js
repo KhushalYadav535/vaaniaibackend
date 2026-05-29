@@ -141,6 +141,44 @@ const agentSchema = new mongoose.Schema({
     callEnded: { type: String, default: '' },
     transcriptReady: { type: String, default: '' },
   },
+
+  // Mid-call server event subscriptions (Vapi-style real-time webhooks).
+  // Each entry fires an HMAC-signed POST during the call lifecycle.
+  // Supported events: 'call.started', 'transcript.segment', 'sentiment.shift',
+  //                   'tool.called', 'transferred', 'call.ended'.
+  serverEvents: {
+    url:    { type: String, default: '' },
+    secret: { type: String, default: '' },
+    events: [{ type: String }], // subset of supported events; empty = all
+  },
+
+  // Squad: multi-agent orchestration. When transfer_to_agent fires, the
+  // destination agent inherits the conversation summary + last N messages
+  // so it can continue without asking the customer to repeat themselves.
+  squad: {
+    enabled:  { type: Boolean, default: false },
+    members:  [{
+      agentId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Agent' },
+      role:       { type: String, default: '' }, // e.g. 'billing', 'support'
+      conditions: { type: mongoose.Schema.Types.Mixed }, // free-form routing rules for the LLM
+    }],
+    handoffPrompt: {
+      type: String,
+      default: 'You are continuing a call from another agent. Acknowledge the context briefly, then help.',
+    },
+  },
+
+  // Configurable structured-data extraction schema. Used by post-call
+  // analysis (voicePipeline.analyzeCall) to produce typed JSON instead
+  // of the hardcoded {name, email, phone, company, date} shape.
+  extractionSchema: [{
+    name:        { type: String, required: true },        // e.g. 'productInterest'
+    description: { type: String, default: '' },           // hints to the LLM
+    type:        { type: String, enum: ['string', 'number', 'boolean', 'array', 'enum'], default: 'string' },
+    enumValues:  [{ type: String }],                      // when type==='enum'
+    required:    { type: Boolean, default: false },
+  }],
+
   // Function calling tools mapping
   tools: [{
     type: { type: String, default: 'function' },

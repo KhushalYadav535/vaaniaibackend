@@ -71,8 +71,15 @@ class DeepgramService {
     if (forceMulti) sttLanguage = 'multi';
 
     const fastTurnMode = String(process.env.FAST_TURN_MODE || 'false').toLowerCase() === 'true';
-    const defaultUtteranceEndMs = fastTurnMode ? 400 : 1200;
-    const defaultEndpointingMs  = fastTurnMode ? 200 : 400;
+    // Endpointing patience (how long Deepgram waits before declaring
+    // end-of-utterance). Bumped from 1200/400 → 1600/600 because the
+    // smaller window was firing speech_final mid-thought when users
+    // paused to recall a name or word ("मुझे school के लिए... [pause]
+    // ...इसमें... [pause] ...MDS Vidyapeeth"). voiceSession's
+    // commitTranscript adds a soft-commit window on top of this for an
+    // extra safety net.
+    const defaultUtteranceEndMs = fastTurnMode ? 400 : 1600;
+    const defaultEndpointingMs  = fastTurnMode ? 200 : 600;
     const utteranceEndMs = Number(process.env.DEEPGRAM_UTTERANCE_END_MS || defaultUtteranceEndMs);
     const endpointingMs  = Number(process.env.DEEPGRAM_ENDPOINTING_MS  || defaultEndpointingMs);
     const minFinalChars  = Number(process.env.MIN_TRANSCRIPT_CHARS_FOR_FINAL || 2);

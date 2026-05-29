@@ -24,7 +24,6 @@ const Agent = require('../models/Agent');
 const CallLog = require('../models/CallLog');
 const deepgramService = require('../services/deepgramService');
 const voicePipeline = require('../services/voicePipeline');
-const sessionStore = require('../services/sessionStore');
 const logger = require('../utils/logger');
 
 class WebRTCSession {

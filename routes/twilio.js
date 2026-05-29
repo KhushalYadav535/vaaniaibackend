@@ -582,49 +582,14 @@ router.post('/amd-callback', async (req, res) => {
  */
 router.post('/recording', async (req, res) => {
   try {
-    const { CallSid, RecordingUrl, RecordingSid, RecordingDuration } = req.body;
+    const { CallSid, RecordingSid } = req.body;
 
-    console.log(`🎙️ Recording complete: ${RecordingSid}`);
-
-    const callLog = await CallLog.findOne({ callSid: CallSid });
-
-    if (!callLog) {
-      console.warn(`⚠️ Call log not found: ${CallSid}`);
-      return res.sendStatus(404);
-    }
-
-    // Update recording info
-    callLog.recordingUrl = RecordingUrl;
-    callLog.recordingSid = RecordingSid;
-    callLog.recordingDuration = parseInt(RecordingDuration) || 0;
-    await callLog.save();
-
-    // Download and save to local storage
-    if (RecordingUrl) {
-      try {
-        const fetch = require('node-fetch');
-        const recordingResponse = await fetch(RecordingUrl);
-        const recordingBuffer = await recordingResponse.buffer();
-
-        const localResult = await localStorageService.saveRecording({
-          recordingBuffer,
-          callSid: CallSid,
-          userId: callLog.userId,
-          agentId: callLog.agentId,
-        });
-
-        console.log(`💾 Recording saved locally: ${localResult.relativePath}`);
-        callLog.localRecordingPath = localResult.relativePath;
-        callLog.recordingUrl = localResult.url;
-        await callLog.save();
-      } catch (storageError) {
-        console.warn(`⚠️ Local storage save failed: ${storageError.message}`);
-        // Don't fail the webhook even if storage fails
-      }
-    }
+    // Call recording storage is disabled platform-wide. If Twilio recording
+    // somehow fired (RECORD_CALLS should be false), we acknowledge the webhook
+    // but do NOT download or persist the audio to disk.
+    console.log(`🎙️ Recording webhook received (storage disabled): ${RecordingSid || 'n/a'} call=${CallSid || 'n/a'}`);
 
     res.sendStatus(204);
-
   } catch (error) {
     console.error('❌ Recording webhook error:', error);
     res.sendStatus(500);

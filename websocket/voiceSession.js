@@ -790,20 +790,21 @@ async function handleMessage(session, message) {
       break;
 
     case 'user_speech_end':
-      // Frontend VAD detected speech end
-      // Use this as a reliable trigger to process whatever Deepgram transcribed.
-      // processTranscript owns the isProcessing guard atomically, so we just
-      // check for pending text and delegate — no pre-setting of flags here
-      // (that pre-set was half of the double-fire race with the soft-commit timer).
+      // Frontend VAD detected an audio silence. This is a useful "user may
+      // have stopped" SIGNAL — but it must NOT immediately fire a response.
+      // The frontend VAD endpoints far more aggressively than our smart
+      // soft-commit window, so firing here directly was cutting users off
+      // mid-thought (especially during natural pauses or mid-number).
+      //
+      // Route it through commitTranscript instead, so the SAME dynamic
+      // window applies (800ms normal / 1500ms on connectors / 2400ms when a
+      // number is still being dictated) and the merge/dedup logic runs. If
+      // the user resumes, the window extends and we process ONE merged turn.
       if (!session.isProcessing && session._lastSttTranscript && session._lastSttTranscript.trim().length > 0) {
         const finalTranscript = session._lastSttTranscript;
         session._lastSttTranscript = '';
-        console.log(`[VAD] user_speech_end triggered processing: "${finalTranscript}"`);
-        try {
-          await processTranscript(session, finalTranscript);
-        } catch (e) {
-          console.error('Error processing VAD transcript:', e);
-        }
+        console.log(`[VAD] user_speech_end → soft-commit window: "${finalTranscript}"`);
+        commitTranscript(session, finalTranscript);
       }
       break;
 

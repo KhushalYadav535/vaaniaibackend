@@ -374,8 +374,18 @@ function buildSessionOnTranscript(session) {
           const pending = session._lastSttTranscript;
           if (!pending || pending.trim().length < 2) return;
           if (session.isProcessing) return;
-          session._lastSttTranscript = '';
-          console.log(`[STT] Interrupt silence-timer buffered: "${pending}"`);
+          if (session._softCommitBuffer && session._softCommitTimer) {
+            bumpSoftCommitTimer(session);
+            return;
+          }
+
+          const allowInterimFallback = String(process.env.STT_ALLOW_INTERIM_FALLBACK_COMMIT || 'false').toLowerCase() === 'true';
+          if (!allowInterimFallback) {
+            console.log('[STT] Interrupt silence fallback saw interim text but no speech_final; not committing interim transcript');
+            return;
+          }
+
+          console.warn(`[STT] Interrupt interim fallback commit enabled; buffering: "${pending}"`);
           commitTranscript(session, pending);
         }, 700);
       }
@@ -477,11 +487,21 @@ function buildSessionOnTranscript(session) {
     session._silenceTimer = setTimeout(async () => {
       session._silenceTimer = null;
       if (session.agentSpeaking) return;
+      if (session.isProcessing) return;
+      if (session._softCommitBuffer && session._softCommitTimer) {
+        bumpSoftCommitTimer(session);
+        return;
+      }
+
+      const allowInterimFallback = String(process.env.STT_ALLOW_INTERIM_FALLBACK_COMMIT || 'false').toLowerCase() === 'true';
+      if (!allowInterimFallback) {
+        console.log('[STT] silence fallback saw interim text but no speech_final; not committing interim transcript');
+        return;
+      }
+
       const pending = session._lastSttTranscript;
       if (!pending || pending.trim().length < 2) return;
-      if (session.isProcessing) return;
-      session._lastSttTranscript = '';
-      console.log(`[STT] silence-timer (fallback) buffered: "${pending}"`);
+      console.warn(`[STT] Interim fallback commit enabled; buffering: "${pending}"`);
       commitTranscript(session, pending);
     }, silenceFallbackMs);
   };
@@ -796,14 +816,30 @@ async function handleMessage(session, message) {
       // check for pending text and delegate — no pre-setting of flags here
       // (that pre-set was half of the double-fire race with the soft-commit timer).
       if (!session.isProcessing && session._lastSttTranscript && session._lastSttTranscript.trim().length > 0) {
-        const finalTranscript = session._lastSttTranscript;
-        session._lastSttTranscript = '';
-        console.log(`[VAD] user_speech_end triggered processing: "${finalTranscript}"`);
-        try {
-          await processTranscript(session, finalTranscript);
-        } catch (e) {
-          console.error('Error processing VAD transcript:', e);
-        }
+        const pendingTranscript = session._lastSttTranscript;
+        const delayMs = Number(process.env.STT_VAD_FINALIZATION_DELAY_MS || 250);
+        console.log(`[VAD] user_speech_end observed pending interim; waiting ${delayMs}ms for Deepgram speech_final: "${pendingTranscript}"`);
+
+        if (session._vadFinalizationTimer) clearTimeout(session._vadFinalizationTimer);
+        session._vadFinalizationTimer = setTimeout(() => {
+          session._vadFinalizationTimer = null;
+          if (session.isProcessing || session.agentSpeaking) return;
+          if (session._softCommitBuffer && session._softCommitTimer) {
+            bumpSoftCommitTimer(session);
+            return;
+          }
+
+          const allowInterimFallback = String(process.env.STT_ALLOW_INTERIM_FALLBACK_COMMIT || 'false').toLowerCase() === 'true';
+          if (!allowInterimFallback) {
+            console.log('[VAD] No Deepgram speech_final after VAD end; not committing interim transcript');
+            return;
+          }
+
+          const pending = session._lastSttTranscript;
+          if (!pending || pending.trim().length < 2) return;
+          console.warn(`[VAD] Interim fallback commit enabled; buffering: "${pending}"`);
+          commitTranscript(session, pending);
+        }, delayMs);
       }
       break;
 
@@ -833,12 +869,19 @@ async function handleMicConfig(session, message) {
   const configuredRate = Number(process.env.DEEPGRAM_SAMPLE_RATE || 48000);
   const configuredEncoding = process.env.DEEPGRAM_ENCODING || 'linear16';
   const configuredInputMode = String(process.env.DEEPGRAM_AUDIO_INPUT_MODE || 'webm').toLowerCase();
+  const effectiveConfiguredEncoding = configuredInputMode === 'webm' ? 'container' : configuredEncoding;
+  const effectiveBrowserEncoding = normalizedInputMode === 'webm' ? 'container' : normalizedEncoding;
 
-  console.log(`[MicConfig] Browser: mode=${normalizedInputMode} ${normalizedEncoding}@${normalizedSampleRate}Hz | Deepgram configured: mode=${configuredInputMode} ${configuredEncoding}@${configuredRate}Hz`);
+  console.log(`[MicConfig] Browser: mode=${normalizedInputMode} ${normalizedEncoding}@${normalizedSampleRate}Hz | Deepgram configured: mode=${configuredInputMode} ${effectiveConfiguredEncoding}@${configuredRate}Hz`);
 
   // If the rates already match, DON'T reinitialize — the handleInit connection is already
   // open and working. Reinitializing would close it and drop audio during reconnect.
-  if (normalizedInputMode === configuredInputMode && normalizedSampleRate === configuredRate && normalizedEncoding === configuredEncoding) {
+  const configAlreadyMatches = normalizedInputMode === configuredInputMode && (
+    normalizedInputMode === 'webm'
+      || (normalizedSampleRate === configuredRate && effectiveBrowserEncoding === effectiveConfiguredEncoding)
+  );
+
+  if (configAlreadyMatches) {
     console.log(`[MicConfig] Rates match — keeping existing Deepgram connection ✅`);
     safeSend(session.ws, { type: 'status', message: `STT ready (${normalizedInputMode}, ${normalizedSampleRate}Hz)` });
     return;
@@ -1160,12 +1203,10 @@ function handleClientInterrupt(session) {
   }
   session.agentSpeaking = false;
   session.isProcessing = false;
-  session._lastSttTranscript = '';
 
   // Clear soft-commit state — explicit user interrupt means whatever was
   // buffered is stale (different turn now).
-  if (session._softCommitTimer) { clearTimeout(session._softCommitTimer); session._softCommitTimer = null; }
-  session._softCommitBuffer = '';
+  // Keep STT buffers intact so barge-in speech can still finalize.
 
   if (session._silenceTimer) {
     clearTimeout(session._silenceTimer);
@@ -2084,6 +2125,10 @@ function sendAudioChunkOnly(session, buffer) {
   const task = async () => {
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
     await waitForWsDrain(session.ws, maxBufferedBytes);
+    if (session.currentGenerationId !== generationId) {
+      console.log(`[AudioQueue] Dropping stale audio chunk for generation ${generationId}`);
+      return;
+    }
 
     if (session.prefersBinaryAudio) {
       safeSendBinary(session.ws, buffer);
@@ -2110,6 +2155,10 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
   const task = async () => {
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
     await waitForWsDrain(session.ws, maxBufferedBytes);
+    if (session.currentGenerationId !== generationId) {
+      console.log(`[AudioQueue] Dropping stale audio buffer for generation ${generationId}`);
+      return;
+    }
 
     // Skip sending empty buffers — they exist only to flush isFinal markers
     if (buffer && buffer.length > 0) {
@@ -2241,6 +2290,7 @@ function allowAudioIngress(session, chunkBytes) {
 
   if (chunkBytes > maxChunkBytes) {
     session.droppedAudioChunks += 1;
+    console.warn(`[AudioIngress] Dropped oversized audio chunk: ${chunkBytes} bytes > ${maxChunkBytes} bytes (session=${session.id})`);
     return false;
   }
 
@@ -2252,6 +2302,7 @@ function allowAudioIngress(session, chunkBytes) {
   if (session.audioIngressBytesInWindow + chunkBytes > maxBytesPerSecond) {
     session.droppedAudioChunks += 1;
     if (session.droppedAudioChunks % 20 === 1) {
+      console.warn(`[AudioIngress] Rate limited audio: window=${session.audioIngressBytesInWindow} + chunk=${chunkBytes} > ${maxBytesPerSecond} bytes/s (session=${session.id})`);
       safeSend(session.ws, {
         type: 'status',
         message: 'Audio rate limited briefly to keep call stable.',

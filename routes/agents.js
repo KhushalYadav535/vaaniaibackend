@@ -1,10 +1,35 @@
 const express = require('express');
 const router = express.Router();
 const Agent = require('../models/Agent');
+const KnowledgeBase = require('../models/KnowledgeBase');
+const CallFlow = require('../models/CallFlow');
 const { protect } = require('../middleware/auth');
 
 // All routes require auth
 router.use(protect);
+
+/**
+ * Validate that any referenced resources (knowledge base, call flow, transfer
+ * target agent) actually belong to the requesting user. Returns an error
+ * message string if a reference is invalid, or null when everything is fine.
+ */
+async function validateAgentReferences(userId, body) {
+  const { knowledgeBaseId, workflowId, transferToAgentId } = body;
+
+  if (knowledgeBaseId) {
+    const kb = await KnowledgeBase.findOne({ _id: knowledgeBaseId, userId }).select('_id');
+    if (!kb) return 'Knowledge base not found';
+  }
+  if (workflowId) {
+    const flow = await CallFlow.findOne({ _id: workflowId, userId }).select('_id');
+    if (!flow) return 'Call flow not found';
+  }
+  if (transferToAgentId) {
+    const target = await Agent.findOne({ _id: transferToAgentId, userId }).select('_id');
+    if (!target) return 'Transfer target agent not found';
+  }
+  return null;
+}
 
 // @route   GET /api/agents
 router.get('/', async (req, res, next) => {
@@ -40,6 +65,11 @@ router.post('/', async (req, res, next) => {
   try {
     const { name, systemPrompt, firstMessage, language, voice, llm, temperature, maxDuration, endCallMessage, endCallPhrases, webhooks, tools, voicemailMessage, transferNumber, transferToAgentId, transferConditions, postCallActions, advanced, knowledgeBaseId, workflowId } = req.body;
 
+    const refError = await validateAgentReferences(req.user._id, req.body);
+    if (refError) {
+      return res.status(404).json({ success: false, message: refError });
+    }
+
     const agent = await Agent.create({
       userId: req.user._id,
       name,
@@ -73,6 +103,10 @@ router.post('/', async (req, res, next) => {
 // @route   PUT /api/agents/:id
 router.put('/:id', async (req, res, next) => {
   try {
+    const refError = await validateAgentReferences(req.user._id, req.body);
+    if (refError) {
+      return res.status(404).json({ success: false, message: refError });
+    }
     const agent = await Agent.findOneAndUpdate(
       { _id: req.params.id, userId: req.user._id },
       req.body,

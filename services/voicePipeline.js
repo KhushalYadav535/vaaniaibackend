@@ -109,22 +109,58 @@ class VoicePipeline {
   }
 
   /**
+   * Native script of an Edge TTS voice, derived from its locale prefix.
+   * Indic Edge voices are trained on their NATIVE script and mispronounce
+   * Latin/Roman text. So the agent's output script must match the voice.
+   * Returns: 'deva' | 'tamil' | 'telugu' | 'kannada' | 'malayalam' |
+   *          'gujarati' | 'bengali' | 'gurmukhi' | 'arabic' | 'latin'
+   */
+  _voiceNativeScript(voiceId = '') {
+    const v = String(voiceId || '');
+    if (v.startsWith('hi-IN') || v.startsWith('mr-IN')) return 'deva';
+    if (v.startsWith('ta-IN')) return 'tamil';
+    if (v.startsWith('te-IN')) return 'telugu';
+    if (v.startsWith('kn-IN')) return 'kannada';
+    if (v.startsWith('ml-IN')) return 'malayalam';
+    if (v.startsWith('gu-IN')) return 'gujarati';
+    if (v.startsWith('bn-IN')) return 'bengali';
+    if (v.startsWith('pa-IN')) return 'gurmukhi';
+    if (v.startsWith('ur-IN') || v.startsWith('ur-PK')) return 'arabic';
+    return 'latin'; // all en-* and others
+  }
+
+  /**
+   * The script the agent SHOULD produce for clear TTS, given the language
+   * setting and the selected voice.
+   *  - hi-Latn / en / en-IN  → 'latin' (Hinglish/English are Roman by design)
+   *  - hi / multi / regional → the voice's native script (Devnagari for a
+   *    Hindi voice, Tamil for a Tamil voice, etc.)
+   */
+  _targetScript(lang = 'en', voiceId = '') {
+    if (lang === 'hi-Latn' || lang === 'en' || lang === 'en-IN') return 'latin';
+    return this._voiceNativeScript(voiceId);
+  }
+
+  /**
    * Humanize LLM text for natural speech.
    * Adds micro-pauses, forces contractions, formats numbers for speaking,
    * and removes any remaining markdown artifacts.
    */
-  humanizeText(text, lang = 'en') {
+  humanizeText(text, lang = 'en', targetScript = 'latin') {
     if (!text) return text;
     let t = text;
 
-    // 0. CRITICAL: Strip Devnagari script — Llama 3.1 8B mirrors user's
-    //    script despite prompt instructions. Edge TTS struggles with
-    //    Devnagari and will mispronounce or skip those tokens entirely.
-    //    Transliterate to Roman so the voice stays consistent.
-    if (/[ऀ-ॿ]/.test(t)) {
+    // 0. SCRIPT NORMALIZATION — match the TTS voice's native script.
+    //    - targetScript 'latin' (English / Hinglish / Roman-Hindi voices):
+    //      strip any Devnagari the LLM leaked, since a Roman-script voice
+    //      (or our Hinglish design) needs Latin text.
+    //    - targetScript 'deva' etc. (native Indic voice): KEEP the native
+    //      script. The Hindi voice pronounces Devnagari CLEARLY but garbles
+    //      Roman text, so we must NOT transliterate away from it here.
+    if (targetScript === 'latin' && /[ऀ-ॿ]/.test(t)) {
       const before = t;
       t = this._transliterateDevnagari(t);
-      console.warn(`[humanize] Devnagari leak detected & transliterated:\n  before: "${before.slice(0, 120)}"\n  after:  "${t.slice(0, 120)}"`);
+      console.warn(`[humanize] Devnagari leak → Roman (latin voice):\n  before: "${before.slice(0, 120)}"\n  after:  "${t.slice(0, 120)}"`);
     }
 
     // 1. Force contractions (formal → spoken)
@@ -182,16 +218,24 @@ class VoicePipeline {
     t = t.replace(/#{1,6}\s/g, '');
     t = t.replace(/^- /gm, '');
 
-    // 6. Add micro-pause after commas for natural breathing rhythm
-    //    (Ellipsis triggers a slight pause in Edge TTS)
-    t = t.replace(/,\s(?!\.)/g, ',... ');
+    // 6. REMOVE comma-to-ellipsis substitution.
+    // The old ",... " trick was meant to add a micro-pause, but it actually:
+    //   a) Creates an audible "dot dot dot" breath artifact in Edge TTS
+    //   b) Compounds with the sentence-splitter — a comma at split-point
+    //      becomes ",... " which the next chunk starts with, producing
+    //      "...main check karta hun" spoken as "dot dot dot main check..."
+    // Edge TTS already pauses naturally at commas in SSML prosody.
+    // So we do NOTHING here — just let the comma be.
+    // t = t.replace(/,\s(?!\.)/g, ',... ');  // REMOVED
 
     // 7. Handle emotional tokens (Phase 3)
     t = t.replace(/\[LAUGH\]/gi, 'haha...');
     t = t.replace(/\[SIGH\]/gi, 'huff...');
 
     // 8. Hinglish Context Switching (Zoronal Speciality - Phase 4)
-    if (lang === 'hi' || lang === 'hi-Latn' || lang === 'multi') {
+    //    Only when we're producing ROMAN text. For a native Devnagari voice
+    //    these Roman words would be mispronounced, so skip them.
+    if (targetScript === 'latin' && (lang === 'hi' || lang === 'hi-Latn' || lang === 'multi')) {
       t = t.replace(/\b(Yes|Yeah)\b/gi, "Haan");
       t = t.replace(/\b(Okay|Ok)\b/gi, "Theek hai");
       t = t.replace(/\b(Sorry)\b/gi, "Maaf karna");
@@ -296,7 +340,7 @@ class VoicePipeline {
    * Process a text input through LLM → TTS
    * Used when we already have transcribed text
    */
-  async processText({ text, agent, history = [], userSettings = {}, memory = null, ragContext = '' }) {
+  async processText({ text, agent, history = [], userSettings = {}, memory = null, ragContext = '', callContext = {} }) {
     const start = Date.now();
 
     // Build conversation messages
@@ -304,7 +348,7 @@ class VoicePipeline {
     const messages = [
       {
         role: 'system',
-        content: this.buildSystemPrompt(agent, memory, ragContext, lastReplies),
+        content: this.buildSystemPrompt(agent, memory, ragContext, lastReplies, callContext.vars || {}),
       },
       ...history.map(msg => ({
         role: msg.role,
@@ -389,7 +433,7 @@ class VoicePipeline {
           let resultStr = '';
           try {
             const args = typeof fnArgs === 'string' ? JSON.parse(fnArgs) : fnArgs;
-            const result = await toolExecutor.executeTool({ toolName: fnName, toolInput: args, agentContext: agent });
+            const result = await toolExecutor.executeTool({ toolName: fnName, toolInput: args, agentContext: agent, callContext });
             resultStr = JSON.stringify(result);
           } catch (e) {
             resultStr = `{"status": "error", "message": "${e.message}"}`;
@@ -434,7 +478,8 @@ class VoicePipeline {
     const speed = agent.voice?.speed || 1.05;
 
     // Humanize LLM output for natural speech
-    const humanizedResponse = this.humanizeText(responseText, lang);
+    const targetScript = this._targetScript(lang, voiceId);
+    const humanizedResponse = this.humanizeText(responseText, lang, targetScript);
     const pitch = this.getDynamicPitch(humanizedResponse);
 
     let audioBuffer;
@@ -488,7 +533,7 @@ class VoicePipeline {
    *
    * Result: First audio arrives ~500ms instead of ~1000ms.
    */
-  async *processTextStream({ text, agent, history = [], userSettings = {}, memory = null, ragContext = '', abortSignal = null, sessionId = null }) {
+  async *processTextStream({ text, agent, history = [], userSettings = {}, memory = null, ragContext = '', abortSignal = null, sessionId = null, callContext = {} }) {
     // ── Emotion detection ──────────────────────────────────────────────────
     const currentEmotion = this.detectEmotion(text);
     let emotionPrompt = '';
@@ -522,15 +567,15 @@ class VoicePipeline {
     const speed         = agent.voice?.speed     || 1.05; // 1.05 = slightly faster than default, sounds more conversational
     const ttsApiKey     = userSettings.ttsKey    || process.env.ELEVENLABS_API_KEY;
 
-    const fastFirstChunkRequested  = String(process.env.FAST_FIRST_CHUNK_MODE || 'false').toLowerCase() === 'true';
-    const allowPreBoundaryTTS      = String(process.env.TTS_ALLOW_PRE_BOUNDARY_CHUNK || 'false').toLowerCase() === 'true';
-    const fastFirstChunkMode       = fastFirstChunkRequested && allowPreBoundaryTTS;
-    // Lowered defaults: 24→18 chars, 10→8 words. The original threshold
-    // was tuned to wait for "complete-feeling" first phrases — but the
-    // human ear is forgiving of half-thoughts when they arrive 100-150ms
-    // sooner. The remainder gets queued behind it via semantic chunking.
-    const firstChunkCharThreshold  = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 18);
-    const firstChunkMaxWords       = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 8);
+    const fastFirstChunkMode       = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
+    // Fast-first-chunk: fire TTS early so the user hears SOMETHING quickly.
+    // CRITICAL: firstChunkMaxWords must be large enough that the split point
+    // falls at a natural pause — cutting at 8 words produces "Sure, aapka" |
+    // "naam aur phone..." which sounds broken. 14 words covers most short
+    // sentences fully, so the "fast chunk" IS the complete first sentence.
+    // Only very long first sentences get split, and they split cleanly.
+    const firstChunkCharThreshold  = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 30);
+    const firstChunkMaxWords       = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 14);
 
     // ── Dynamic Knowledge (RAG 2.0) ────────────────────────────────────────
     let dynamicKnowledge = '';
@@ -555,22 +600,38 @@ class VoicePipeline {
     // was built twice and the second build OVERWROTE messages[0] — silently
     // discarding the (expensive) rolling summary and the anti-repetition
     // lastReplies. Now everything is composed in a single pass.
-    const systemPrompt = this.buildSystemPrompt(agent, memory, ragContext, lastReplies)
+    const systemPrompt = this.buildSystemPrompt(agent, memory, ragContext, lastReplies, callContext.vars || {})
       + summaryPrompt
       + dynamicKnowledge
       + toolInstructions
       + emotionPrompt;
     messages[0].content = systemPrompt;
 
-    // ── Filler word (fires synchronously before stream to reduce TTFA) ─────
-    //    Uses language-specific fillers spoken 15% slower for realistic "thinking" feel
-    if (agent.advanced?.fillerWords && Math.random() < 0.35) {
+    // ── Instant "thinking" filler to cut PERCEIVED latency ────────────────
+    // Research (Vapi/Retell): humans tolerate ~600ms; past that a turn feels
+    // laggy. Even when the LLM needs 800-1400ms, an INSTANT acknowledgment
+    // ("Hmm...", "Accha...") makes the turn feel responsive. Key: it must add
+    // ZERO latency itself, so we only use a CACHE HIT (prewarmed at init).
+    // No cache hit → skip silently rather than block on TTS generation.
+    const fillerEnabled = agent.advanced?.fillerWords !== false; // default ON
+    const fillerProb = Number(process.env.LLM_FILLER_PROBABILITY || 0.5);
+    if (fillerEnabled && Math.random() < fillerProb) {
       const lang = agent.language || 'en';
       const fillers = this._fillersByLang[lang] || this._fillersByLang['en'];
       const filler  = fillers[Math.floor(Math.random() * fillers.length)];
-      const fillerSpeed = Math.max(0.85, speed - 0.15); // 15% slower — like a real person pausing to think
-      const fillerAudio = await ttsService.textToSpeech({ text: filler, voiceId, speed: fillerSpeed, apiKey: ttsApiKey, provider: voiceProvider });
-      yield { type: 'chunk', text: filler + ' ', audio: fillerAudio };
+      const fillerSpeed = Math.max(0.85, speed - 0.15); // slightly slower = natural "thinking"
+      // Cache-only lookup — instant if prewarmed, otherwise we skip the filler
+      // entirely so we never ADD latency waiting for TTS synthesis.
+      let fillerAudio = null;
+      try {
+        fillerAudio = ttsService.cache?.get?.(filler, voiceId, fillerSpeed, voiceProvider) || null;
+      } catch (_) { fillerAudio = null; }
+      if (fillerAudio && fillerAudio.length > 0) {
+        yield { type: 'chunk', text: filler + ' ', audio: fillerAudio };
+      } else {
+        // Warm it in the background for next time — but DON'T await/emit now.
+        ttsService.textToSpeech({ text: filler, voiceId, speed: fillerSpeed, apiKey: ttsApiKey, provider: voiceProvider }).catch(() => {});
+      }
     }
 
     // ── Select token stream (Custom URL or Groq with fallback) ────────────
@@ -690,7 +751,8 @@ class VoicePipeline {
     const emotionProsody = this.getEmotionProsody(currentEmotion);
     const fireTTS = (sentenceText) => {
       const lang = agent.language || 'en';
-      const humanized = this.humanizeText(sentenceText, lang);
+      const targetScript = this._targetScript(lang, voiceId);
+      const humanized = this.humanizeText(sentenceText, lang, targetScript);
       // Apply emotion prosody on top of the agent's configured speed +
       // per-sentence pitch variation. Clamp to safe Edge TTS bounds.
       const dynamicPitch = this.getDynamicPitch(humanized);
@@ -757,7 +819,7 @@ class VoicePipeline {
                 let toolResult;
                 try {
                   toolResult = await Promise.race([
-                    toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent }),
+                    toolExecutor.executeTool({ toolName: name, toolInput: args, agentContext: agent, callContext }),
                     new Promise((_, reject) => setTimeout(
                       () => reject(new Error(`tool_timeout_${toolTimeoutMs}ms`)),
                       toolTimeoutMs
@@ -799,31 +861,56 @@ class VoicePipeline {
           }
 
           // ── Fast-first-chunk: fire TTS before sentence boundary ─────────
+          // Goal: user hears first audio within ~300-400ms.
+          // Strategy: wait until we have enough content (30+ chars) AND then
+          // split ONLY at a natural boundary (comma, clause end, or word limit).
+          // Splitting mid-word or too early sounds clipped/robotic.
           if (fastFirstChunkMode && !hasSpokenFirstChunk && currentSentence.trim().length >= firstChunkCharThreshold) {
             const words          = currentSentence.trim().split(/\s+/).filter(Boolean);
-            const firstChunkText = words.slice(0, firstChunkMaxWords).join(' ').trim();
-            const remainder      = words.slice(firstChunkMaxWords).join(' ').trim();
+
+            // Prefer splitting at a natural clause boundary within the first chunk
+            // so "Sure, main check karta hun" → first chunk = "Sure, main check karta hun"
+            // rather than cutting arbitrarily at word 14.
+            let firstChunkText = '';
+            let remainder = '';
+
+            if (words.length <= firstChunkMaxWords) {
+              // Short enough to send whole — don't split at all, wait for sentence end.
+              // (This avoids the "Sure, aapka" | "naam..." split for short sentences.)
+              // Fall through to sentence-boundary chunking below.
+            } else {
+              // Long sentence: split at firstChunkMaxWords boundary
+              firstChunkText = words.slice(0, firstChunkMaxWords).join(' ').trim();
+              remainder      = words.slice(firstChunkMaxWords).join(' ').trim();
+            }
 
             if (firstChunkText.length > 0) {
               ttsQueue.push(fireTTS(firstChunkText)); // fire immediately, don't await
               hasSpokenFirstChunk = true;
               currentSentence     = remainder ? `${remainder} ` : '';
-              console.log(`[Pipeline] Fast-chunk TTS fired (queue=${ttsQueue.length}): "${firstChunkText.substring(0, 50)}"`);
+              console.log(`[Pipeline] Fast-chunk TTS fired (queue=${ttsQueue.length}): "${firstChunkText.substring(0, 60)}"`);
             }
           }
 
-          // ── Phase 2: Semantic Chunking ──
-          // Split on sentence boundaries OR natural pausing clauses (commas)
-          // to dramatically lower TTFA and improve speaking rhythm
+          // ── Phase 2: Sentence-boundary Chunking ──
+          // ONLY split on TRUE sentence endings (.!?\n), NOT on commas.
+          // Comma splits create audible stitching gaps between Edge TTS chunks
+          // because each chunk is a separate WebSocket synthesis request.
+          // A natural sentence plays smoothly in one go; comma-split fragments
+          // sound like two people talking back-to-back with a micro-gap between.
+          // Example: "Sure, main check karta hun." → ONE chunk (natural)
+          //          vs "Sure," + "main check karta hun." → TWO chunks (gap audible)
           const isSentenceBoundary = /[.!?\n]/.test(token);
-          const isClauseBoundary = /[,;:]/.test(token);
 
-          if ((isSentenceBoundary && currentSentence.trim().length > 5) || 
-              (isClauseBoundary && currentSentence.trim().length > 25)) {
+          // Minimum sentence length before we split — too-short first chunks
+          // ("Sure.") sound clipped. 18 chars ≈ 3-4 words minimum.
+          const minChunkLen = Number(process.env.PIPELINE_MIN_CHUNK_CHARS || 18);
+
+          if (isSentenceBoundary && currentSentence.trim().length >= minChunkLen) {
             const sentenceToSpeak = currentSentence.trim();
             currentSentence = '';
             ttsQueue.push(fireTTS(sentenceToSpeak)); // fire immediately, don't await
-            console.log(`[Pipeline] Semantic chunk fired (queue=${ttsQueue.length}): "${sentenceToSpeak.substring(0, 50)}"`);
+            console.log(`[Pipeline] Sentence chunk fired (queue=${ttsQueue.length}): "${sentenceToSpeak.substring(0, 60)}"`);
           }
         }
 
@@ -1344,9 +1431,13 @@ ${customFieldDescriptions}
    * "haan"). Showing it the recent assistant lines as a "do not repeat"
    * directive cuts repetition rate dramatically with no latency cost.
    */
-  buildSystemPrompt(agent, memory = null, ragContext = '', lastReplies = []) {
+  buildSystemPrompt(agent, memory = null, ragContext = '', lastReplies = [], vars = {}) {
     const lang = agent.language || 'en';
     const langInstruction = lang === 'en' ? 'English' : lang === 'hi' ? 'Hindi (MUST BE WRITTEN IN ROMAN/LATIN ALPHABET ONLY. NO DEVNAGARI SCRIPT ALLOWED)' : lang === 'hi-Latn' ? 'Hinglish (Hindi in Roman script)' : lang === 'multi' ? 'the same language the user speaks in (use Roman script for Hindi)' : lang;
+
+    // Resolve {{placeholders}} in the (possibly template-derived) system prompt
+    // so the model never sees a literal "{{company}}".
+    const resolvedSystemPrompt = this.substituteVariables(agent.systemPrompt || '', vars);
 
     // Persona block first (sets identity), then domain context, then
     // voice constraints LAST. Llama 3.x has strong recency bias —
@@ -1355,7 +1446,7 @@ ${customFieldDescriptions}
     let prompt = `You are "${agent.name}", a real person on a live phone call.
 
 ## YOUR ROLE & PERSONA:
-${agent.systemPrompt}
+${resolvedSystemPrompt}
 `;
 
     if (agent.transferToAgentId) {
@@ -1369,6 +1460,27 @@ ${agent.systemPrompt}
 
     if (ragContext) {
       prompt += `\n\n## KNOWLEDGE BASE CONTEXT (only quote when DIRECTLY asked; never summarize all of it):\n${ragContext}`;
+    }
+
+    // ── STRICT GROUNDING (Vapi/Retell guardrails) ──────────────────────────
+    // Default ON. Forces the agent to answer ONLY from its system prompt +
+    // knowledge base, refuse to invent facts, and not ask for info it doesn't
+    // need. Can be disabled per-agent via advanced.strictGrounding = false.
+    const strictGrounding = agent.advanced?.strictGrounding !== false;
+    if (strictGrounding) {
+      const hasKb = !!ragContext;
+      const refusalLang = lang === 'en'
+        ? `"I'm sorry, I don't have that information."`
+        : `"Sorry, mere paas us baare mein jaankari nahi hai."`;
+      prompt += `
+
+## STRICT KNOWLEDGE BOUNDARY (follow exactly):
+- Answer ONLY using your role/persona above${hasKb ? ' and the Knowledge Base Context provided' : ''}. Treat that as your single source of truth.
+- If the answer is not covered there, DO NOT guess, assume, or use outside/general knowledge. Say ${refusalLang} and, if appropriate, offer to connect them or take a message.
+- NEVER invent facts: no prices, dates, names, policies, availability, or numbers that aren't given to you.
+- Do NOT volunteer extra information the user didn't ask for. Answer the actual question, nothing more.
+- Do NOT ask for information you don't need to fulfill your defined role. Only collect what your instructions require.
+- Stay strictly on the topics/tasks defined in your role. If asked something off-topic, briefly decline and steer back.`;
     }
 
     // Anti-repetition guard. Llama 3.1 8B in voice mode repeats its own
@@ -1391,25 +1503,52 @@ ${agent.systemPrompt}
     // Groq's free tier is only 6000 tokens/minute. A bloated prompt burns the
     // budget in ~4 turns and then requests throttle/hang. Few-shot pairs are
     // trimmed to the highest-signal ones.
+
+    // Script rule + few-shot must MATCH the TTS voice. A native Devnagari
+    // Hindi voice pronounces Devnagari clearly but garbles Roman text; a
+    // Roman/English voice is the opposite. So we flip the instruction based
+    // on the voice's native script.
+    const voiceId = agent.voice?.voiceId || '';
+    const targetScript = this._targetScript(lang, voiceId);
+
+    const scriptRules = {
+      deva: {
+        rule: `8. SCRIPT (critical): Write Hindi in DEVNAGARI script (देवनागरी). Your voice is a native Hindi voice and pronounces Devnagari clearly. Keep English brand/tech words in Roman (e.g. "website", "booking"). Do NOT romanize Hindi words.`,
+        example: `Example:
+USER: "मुझे gym ke liye website banwani hai"
+YOU: "ज़रूर, जिम के लिए website बन जाएगी। Basic जानकारी चाहिए या booking भी?"
+USER: "Pricing kya hai?"
+YOU: "Pricing project पर depend करती है। आपको कौन से features चाहिए?"`,
+      },
+      latin: {
+        rule: `8. SCRIPT (critical): NEVER output Devnagari/Indic script even if the user does. Write Hindi in ROMAN script ("विद्यापीठ"→"Vidyapeeth"). Devnagari breaks this voice's TTS.`,
+        example: `Example:
+USER: "मुझे gym ke liye website banwani hai"
+YOU: "Sure, gym ke liye website ban jaayegi. Basic info chahiye ya booking bhi?"
+USER: "Pricing kya hai?"
+YOU: "Pricing project pe depend karti hai. Aapko kaunse features chahiye?"`,
+      },
+    };
+    // Regional native scripts (Tamil/Telugu/etc.) — keep their own script.
+    const nativeScriptRule = `8. SCRIPT (critical): Write in the NATIVE script of your language (matching your voice). Keep English brand/tech words in Roman. Do NOT romanize native words — this voice pronounces its native script clearly.`;
+
+    const chosen = scriptRules[targetScript] || (targetScript === 'latin'
+      ? scriptRules.latin
+      : { rule: nativeScriptRule, example: '' });
+
     prompt += `
 
 ## VOICE RULES (you are on a live phone call — NOT writing text):
-1. LENGTH: max 1 short sentence (≤15 words). Never list features; ask ONE qualifying question.
+1. LENGTH: 1-2 short sentences max. Never list features; ask ONE qualifying question.
 2. NO markdown, bullets, dashes, asterisks. Spoken audio only.
 3. NO robotic openers ("Certainly", "I'd be happy to help"). Use "Sure", "Haan", "Theek hai", "Got it".
 4. Contractions always: don't, I'll, you're, that's.
 5. Phone numbers/OTPs: say digits separately. Emails: "name at gmail dot com".
-6. If unsure: "hmm, mujhe confirm karna padega" — never invent details.
+6. If unsure: never invent details — say you'll confirm.
 7. LANGUAGE: reply in ${langInstruction}. Match the user's code-switching.
-8. SCRIPT (critical): NEVER output Devnagari/Indic script even if the user does.
-   Transliterate to Roman ("विद्यापीठ"→"Vidyapeeth", "प्रयागराज"→"Prayagraj").
-   Devnagari breaks the TTS.
+${chosen.rule}
 
-Example:
-USER: "मुझे gym ke liye website banwani hai"
-YOU: "Sure, gym ke liye website ban jaayegi. Basic info chahiye ya booking bhi?"
-USER: "Pricing kya hai?"
-YOU: "Pricing project pe depend karti hai. Aapko kaunse features chahiye?"
+${chosen.example}
 
 Today is ${new Date().toDateString()}. You are NOT an AI; never say "As an AI".
 `;
@@ -1470,10 +1609,32 @@ Today is ${new Date().toDateString()}. You are NOT an AI; never say "As an AI".
   }
 
   /**
+   * Substitute {{var}} placeholders with provided values, and strip any
+   * placeholders that remain unfilled so the agent never speaks a literal
+   * "{{company}}". Used for firstMessage and systemPrompt — template agents
+   * ship with placeholders that must resolve (from campaign vars / call params)
+   * or be removed before TTS.
+   */
+  substituteVariables(text, vars = {}) {
+    if (!text || typeof text !== 'string') return text || '';
+    return text
+      .replace(/\{\{\s*([a-zA-Z0-9_.]+)\s*\}\}/g, (_, key) => {
+        const v = vars[key];
+        return v !== undefined && v !== null && String(v).length > 0 ? String(v) : '';
+      })
+      // Collapse the double spaces / dangling punctuation left where an empty
+      // placeholder used to be (e.g. "from  ." → "from.").
+      .replace(/\s{2,}/g, ' ')
+      .replace(/\s+([.,!?])/g, '$1')
+      .trim();
+  }
+
+  /**
    * Get the agent's first message as audio
    */
-  async getFirstMessageAudio(agent) {
-    const text = agent.firstMessage || 'Hello! How can I help you today?';
+  async getFirstMessageAudio(agent, vars = {}) {
+    const rawText = agent.firstMessage || 'Hello! How can I help you today?';
+    const text = this.substituteVariables(rawText, vars);
     
     const lang = agent.language || 'en';
     let defaultVoiceId = 'en-US-JennyNeural';

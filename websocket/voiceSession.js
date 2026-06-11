@@ -131,24 +131,64 @@ function touchSession(session) {
  * Otherwise we use the snappy default so normal turns stay fast.
  */
 function getSoftCommitWindowMs(text) {
-  const base = Number(process.env.UTTERANCE_SOFT_COMMIT_MS || 800);
-  const numericMs = Number(process.env.UTTERANCE_SOFT_COMMIT_NUMERIC_MS || 2400);
-  const connectorMs = Number(process.env.UTTERANCE_SOFT_COMMIT_CONNECTOR_MS || 1500);
+  const base       = Number(process.env.UTTERANCE_SOFT_COMMIT_MS || 800);
+  const numericMs  = Number(process.env.UTTERANCE_SOFT_COMMIT_NUMERIC_MS || 2400);
+  const connectorMs= Number(process.env.UTTERANCE_SOFT_COMMIT_CONNECTOR_MS || 1500);
+  const completeMs = Number(process.env.UTTERANCE_SOFT_COMMIT_COMPLETE_MS || 450);
   const t = String(text || '').trim();
   if (!t) return base;
 
-  // Mid-number: still being dictated. We extend ONLY when the trailing
-  // digit run looks incomplete (1-9 digits) — a full 10-digit Indian mobile
-  // (or longer) is treated as complete so the agent doesn't over-wait.
-  const lastNumberRun = (t.match(/(\d[\d\s,-]*)$/) || [''])[0].replace(/\D/g, '');
+  const lower = t.toLowerCase();
+  const words = lower.split(/\s+/).filter(Boolean);
+  const lastWord = words[words.length - 1] || '';
+
+  // ── 1. Mid-number (highest priority) ────────────────────────────────────
+  // An incomplete digit run (1-9 digits) means a phone/account/OTP is still
+  // being dictated. Wait long — getting cut off mid-number is the worst.
+  const lastNumberRun = (t.match(/([\d][\d\s,.:/-]*)$/) || [''])[0].replace(/\D/g, '');
   if (lastNumberRun.length > 0 && lastNumberRun.length < 10) {
     return numericMs;
   }
 
-  // Ends on a connector / clause-continuation word → user has more to say.
-  const connectorRe = /(,|;|aur|और|lekin|लेकिन|kyunki|क्योंकि|matlab|मतलब|phir|फिर|toh|तो|and|but|so|because)$/i;
-  if (connectorRe.test(t)) return connectorMs;
+  // ── 2. Hesitation / filler endings → user is THINKING, not done ─────────
+  // Retell calls this "filler-word panic" — jumping in on "um/uh/matlab".
+  // These almost always precede more speech, so wait longer.
+  const hesitationRe = /(um|uh|umm|uhh|hmm|er|aa+|matlab|maltab|yaani|woh|वो|मतलब|ã|एं| um+)$/i;
+  if (hesitationRe.test(lastWord)) return connectorMs;
 
+  // ── 3. Connector / clause-continuation endings → more coming ────────────
+  // Check the trailing word(s). Hindi postpositions (ke/ki/ka/liye/ko/se/me)
+  // and conjunctions almost always have more speech after them.
+  const connectorWords = new Set([
+    'aur','और','lekin','लेकिन','ki','कि','ke','का','ka','ko','को','se','से',
+    'me','mein','में','liye','लिए','kyunki','क्योंकि','matlab','मतलब','phir',
+    'फिर','toh','तो','ya','या','and','but','so','because','jaise','जैसे',
+    'that','with','for','to','ek','एक','par','पर','wala','wali','vala',
+  ]);
+  // last two words joined too (catches "ke liye", "ki taraf")
+  const lastTwo = words.slice(-2).join(' ');
+  if (connectorWords.has(lastWord) || /[,;:-]$/.test(t)
+      || lastTwo.endsWith('ke liye') || lastTwo.endsWith('के लिए')) {
+    return connectorMs;
+  }
+
+  // ── 4. Very short utterance with no terminal punctuation ────────────────
+  // 1-2 words and no '?'/'.' — likely the START of a longer thought
+  // ("Mujhe...", "Haan woh..."). Give a beat. But a clear short answer
+  // ("haan", "nahi", "theek hai") should still be snappy → handled in 5/6.
+  const shortAcks = ['haan','haa','nahi','nahin','ok','okay','theek','yes','no','sahi','bilkul','done'];
+  const isShortAck = words.length <= 2 && shortAcks.some(a => lower === a || lower.startsWith(a + ' ') || lower === a + '.');
+
+  // ── 5. Semantic completion → respond FAST ───────────────────────────────
+  // Ends in terminal punctuation (?/।/.) OR is a clear short ack → the turn
+  // looks complete, so use the snappy window for a responsive feel.
+  const endsComplete = /[.?!।]$/.test(t);
+  if (endsComplete || isShortAck) return completeMs;
+
+  // ── 6. Short, unpunctuated, non-ack → probably mid-thought ──────────────
+  if (words.length <= 2) return connectorMs;
+
+  // Default: normal complete-feeling statement.
   return base;
 }
 
@@ -186,8 +226,12 @@ function mergeUtterance(buffer, text) {
 
   // Heuristic for re-dictated content: if both end in a digit run and one
   // run is an extension of the other, replace the tail with the longer run.
-  const aDigits = (a.match(/(\d[\d\s,-]*)$/) || [''])[0].replace(/\D/g, '');
-  const bDigits = (b.match(/(\d[\d\s,-]*)$/) || [''])[0].replace(/\D/g, '');
+  // The separator class includes : . / because STT (smart_format) sometimes
+  // formats a spoken phone number as a time/date ("09:05 754137"); we strip
+  // those separators so the full digit run is compared, not just the tail.
+  const digitRunRe = /([\d][\d\s,.:/-]*)$/;
+  const aDigits = (a.match(digitRunRe) || [''])[0].replace(/\D/g, '');
+  const bDigits = (b.match(digitRunRe) || [''])[0].replace(/\D/g, '');
   if (aDigits && bDigits && (bDigits.startsWith(aDigits) || aDigits.startsWith(bDigits))) {
     // Same number being dictated — prefer the longer digit run, rebuilt on
     // top of whichever sentence carried it.
@@ -1032,18 +1076,22 @@ async function handleInit(session, message) {
       const voiceId = agent.voice?.voiceId || 'en-US-JennyNeural';
       const provider = agent.voice?.provider || 'edge-tts';
       const speed = agent.voice?.speed || 1.05;
-      const fillersByLang = {
-        en:      ['Hmm...', 'Okay so...', 'Sure.', 'Got it.', 'Right.'],
-        hi:      ['Hmm...', 'Accha...', 'Theek hai.', 'Haan...', 'Ek minute...'],
-        'hi-Latn': ['Hmm...', 'Accha...', 'Theek hai.', 'Haan...', 'Ek sec...'],
-        multi:   ['Hmm...', 'Accha...', 'Okay...', 'Haan...'],
-        'en-IN': ['Hmm...', 'Right.', 'Okay so...', 'Just a moment.'],
-      };
-      const phrases = [
-        agent.firstMessage,
-        ...(fillersByLang[lang] || fillersByLang.en),
-      ].filter(Boolean);
-      for (const phrase of phrases) {
+      // Use the SAME filler list and SAME fillerSpeed the pipeline will look
+      // up at runtime, otherwise the cache keys won't match and the instant-
+      // filler optimization silently misses every time.
+      const pipelineFillers = (voicePipeline._fillersByLang && voicePipeline._fillersByLang[lang])
+        || (voicePipeline._fillersByLang && voicePipeline._fillersByLang['en'])
+        || ['Hmm...', 'Okay...', 'Right.'];
+      const fillerSpeed = Math.max(0.85, speed - 0.15);
+
+      // Warm the greeting at normal speed (used as-is).
+      if (agent.firstMessage) {
+        ttsService.textToSpeech({ text: agent.firstMessage, voiceId, speed, provider }).catch(() => {});
+      }
+      // Warm each filler at BOTH the lookup speed (for the instant filler) and
+      // normal speed (for backchannels/tool-check phrases).
+      for (const phrase of pipelineFillers) {
+        ttsService.textToSpeech({ text: phrase, voiceId, speed: fillerSpeed, provider }).catch(() => {});
         ttsService.textToSpeech({ text: phrase, voiceId, speed, provider }).catch(() => {});
       }
     } catch (_) { /* swallow — pre-warm is best-effort */ }
@@ -1594,6 +1642,10 @@ async function processTranscript(session, transcript) {
         ragContext,
         abortSignal: abortController.signal,
         sessionId: session.id,
+        callContext: {
+          callLogId: session.callLogId,
+          callerPhone: session.callParams?.from || '',
+        },
       });
     }
 
@@ -2161,6 +2213,18 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
   const { seq, generationId } = nextAudioSeq(session);
   const timestamp = Date.now();
 
+  // Accumulate estimated audio duration for EVERY chunk (not just the final one).
+  // MP3 at ~32kbps: bytes / 4000 ≈ seconds. This must happen synchronously here
+  // (before the async task) so the timer gets the full total when isFinal fires.
+  // Previously this was inside the isFinal block only — so streaming chunks
+  // (isFinal=false) never accumulated, the timer was set to ~500ms regardless
+  // of how many chunks were queued, and agentSpeaking cleared mid-sentence.
+  if (buffer && buffer.length > 0) {
+    if (!session._audioQueueDurationMs) session._audioQueueDurationMs = 0;
+    const chunkDurationMs = Math.round((buffer.length / 4000) * 1000);
+    session._audioQueueDurationMs += Math.max(200, chunkDurationMs);
+  }
+
   const task = async () => {
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
     await waitForWsDrain(session.ws, maxBufferedBytes);
@@ -2198,17 +2262,16 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
         lastSeq,
       });
 
-      if (!session._audioQueueDurationMs) session._audioQueueDurationMs = 0;
-      const chunkDurationMs = Math.max(500, Math.round(((buffer?.length || 0) / 4000) * 1000));
-      session._audioQueueDurationMs += chunkDurationMs;
-
+      // Use the fully-accumulated duration (all chunks summed above) +
+      // a 600ms tail buffer so the last word finishes before we start listening.
+      const totalDuration = session._audioQueueDurationMs || 1000;
       if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
       session._agentSpeakingTimer = setTimeout(() => {
         session.agentSpeaking = false;
         session._lastSttTranscript = '';
         startIdleTimer(session);
         session._audioQueueDurationMs = 0;
-      }, session._audioQueueDurationMs + 500);
+      }, totalDuration + 600);
     }
   };
 

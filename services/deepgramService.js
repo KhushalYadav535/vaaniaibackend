@@ -19,7 +19,9 @@ class DeepgramService {
     if (!key) throw new Error('No Deepgram API key configured.');
 
     const fetch = require('node-fetch');
-    const res = await fetch('https://api.deepgram.com/v1/listen?model=nova-2&language=' + language + '&smart_format=true&punctuate=true', {
+    // numerals (not smart_format) so phone numbers/OTPs stay as plain digit
+    // runs instead of being reformatted into 09:05-style times.
+    const res = await fetch('https://api.deepgram.com/v1/listen?model=nova-2&language=' + language + '&numerals=true&punctuate=true', {
       method: 'POST',
       headers: {
         'Authorization': 'Token ' + key,
@@ -105,13 +107,31 @@ class DeepgramService {
     }
 
     // Build query string
+    // ── Number formatting strategy ──────────────────────────────────────
+    // smart_format is great for general readability BUT it formats spoken
+    // digit sequences as TIMES/DATES — e.g. a phone number "zero nine zero
+    // five..." becomes "09:05", which then corrupts phone/OTP capture and
+    // breaks CRM lead creation. `numerals=true` converts number words to
+    // digits WITHOUT the date/time smart formatting. For a phone-capturing
+    // voice agent, numerals (+ punctuate) is the safer default.
+    // Tunable via env if a deployment prefers full smart_format.
+    const smartFormat = String(process.env.DEEPGRAM_SMART_FORMAT || 'false').toLowerCase() === 'true';
+    const useNumerals = String(process.env.DEEPGRAM_NUMERALS || 'true').toLowerCase() === 'true';
+
     const params = new URLSearchParams({
       model: finalModel,
       language: sttLanguage,
-      smart_format: 'true',
       interim_results: 'true',
       endpointing: String(endpointingMs),
     });
+    if (smartFormat) {
+      params.set('smart_format', 'true');
+    } else {
+      // Keep readable punctuation, convert number-words to digits, but DON'T
+      // let Deepgram reformat digit runs into 09:05-style times/dates.
+      params.set('punctuate', 'true');
+      if (useNumerals) params.set('numerals', 'true');
+    }
 
     if (audioInputMode !== 'webm') {
       // raw mode: use specified encoding

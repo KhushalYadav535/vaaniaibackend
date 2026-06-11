@@ -7,13 +7,38 @@ const { protect } = require('../middleware/auth');
 router.use(protect);
 
 // @route   GET /api/crm/leads
-// @desc    Get all leads for the user
+// @desc    Get leads for the user (paginated + filterable)
 router.get('/leads', async (req, res, next) => {
   try {
-    const leads = await Lead.find({ userId: req.user._id })
-      .populate('agentId', 'name')
-      .sort('-createdAt');
-    res.json({ success: true, leads });
+    const { status, search, page = 1, limit = 50, sortBy = 'createdAt', order = 'desc' } = req.query;
+    const query = { userId: req.user._id };
+    if (status && status !== 'all') query.status = status;
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
+    const sort = { [sortBy]: order === 'asc' ? 1 : -1 };
+
+    const [leads, total] = await Promise.all([
+      Lead.find(query)
+        .populate('agentId', 'name')
+        .sort(sort)
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum),
+      Lead.countDocuments(query),
+    ]);
+
+    res.json({
+      success: true,
+      leads,
+      pagination: { page: pageNum, limit: limitNum, total, pages: Math.ceil(total / limitNum) },
+    });
   } catch (error) {
     next(error);
   }
@@ -70,13 +95,40 @@ router.delete('/leads/:id', async (req, res, next) => {
 });
 
 // @route   GET /api/crm/tickets
-// @desc    Get all tickets for the user
+// @desc    Get tickets for the user (paginated + filterable)
 router.get('/tickets', async (req, res, next) => {
   try {
-    const tickets = await Ticket.find({ userId: req.user._id })
-      .populate('agentId', 'name')
-      .sort('-createdAt');
-    res.json({ success: true, tickets });
+    const { status, priority, search, page = 1, limit = 50, sortBy = 'createdAt', order = 'desc' } = req.query;
+    const query = { userId: req.user._id };
+    if (status && status !== 'all') query.status = status;
+    if (priority && priority !== 'all') query.priority = priority;
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { phone: { $regex: search, $options: 'i' } },
+        { email: { $regex: search, $options: 'i' } },
+        { issue: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const pageNum = Math.max(1, parseInt(page, 10) || 1);
+    const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 50));
+    const sort = { [sortBy]: order === 'asc' ? 1 : -1 };
+
+    const [tickets, total] = await Promise.all([
+      Ticket.find(query)
+        .populate('agentId', 'name')
+        .sort(sort)
+        .skip((pageNum - 1) * limitNum)
+        .limit(limitNum),
+      Ticket.countDocuments(query),
+    ]);
+
+    res.json({
+      success: true,
+      tickets,
+      pagination: { page: pageNum, limit: limitNum, total, pages: Math.ceil(total / limitNum) },
+    });
   } catch (error) {
     next(error);
   }

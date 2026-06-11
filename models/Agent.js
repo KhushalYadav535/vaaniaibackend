@@ -25,7 +25,7 @@ const agentSchema = new mongoose.Schema({
   voice: {
     provider: {
       type: String,
-      enum: ['edge-tts', 'eleven-labs', 'google', 'azure'],
+      enum: ['edge-tts', 'eleven-labs', 'google', 'azure', 'cartesia'],
       default: 'edge-tts',
     },
     voiceId: {

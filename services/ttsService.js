@@ -13,6 +13,32 @@ const edgeTtsPool = require('./edgeTtsPool');
 
 const USE_TTS_POOL = String(process.env.EDGE_TTS_POOL_ENABLED || 'true').toLowerCase() === 'true';
 
+class Semaphore {
+  constructor(max) {
+    this.max = max;
+    this.active = 0;
+    this.queue = [];
+  }
+  async acquire() {
+    if (this.active < this.max) {
+      this.active++;
+      return;
+    }
+    return new Promise(resolve => this.queue.push(resolve));
+  }
+  release() {
+    if (this.queue.length > 0) {
+      const next = this.queue.shift();
+      next();
+    } else {
+      this.active--;
+    }
+  }
+}
+
+// Cartesia Free tier allows max 2 concurrent connections.
+const cartesiaSemaphore = new Semaphore(2);
+
 /**
  * LRU Cache for TTS audio buffers.
  * Avoids regenerating audio for repeated phrases (fillers, greetings, FAQ answers).
@@ -108,6 +134,12 @@ class TtsService {
         audioBuffer = await this.elevenLabsTTS(text, voiceId, apiKey || process.env.ELEVENLABS_API_KEY);
       } catch (e) {
         console.error('ElevenLabs TTS failed, falling back to Edge:', e.message);
+      }
+    } else if (provider === 'cartesia' && (apiKey || process.env.CARTESIA_API_KEY)) {
+      try {
+        audioBuffer = await this.cartesiaTTS(text, voiceId, apiKey || process.env.CARTESIA_API_KEY);
+      } catch (e) {
+        console.error('Cartesia TTS failed, falling back to Edge:', e.message);
       }
     }
 
@@ -285,6 +317,56 @@ class TtsService {
     }
 
     return await response.buffer();
+  }
+
+  /**
+   * Cartesia TTS Implementation
+   * Uses REST API for low latency TTS
+   */
+  async cartesiaTTS(text, voiceId, apiKey) {
+    // If voiceId looks like an Edge TTS voice, fallback to a default Cartesia voice
+    const isEdgeVoice = voiceId.includes('Neural');
+    // We map specific Edge voices to Cartesia voice IDs.
+    // Nisha (F) is the default native Indian female voice.
+    const cartesiaVoiceId = isEdgeVoice ? '0f14d8cb-f039-41fe-a813-a9b4bee7eed8' : voiceId;
+    
+    // Cartesia consolidated their models into a single 'sonic-3.5' model.
+    // 'sonic-english' and 'sonic-multilingual' are sunsetted.
+    const modelId = 'sonic-3.5';
+
+    await cartesiaSemaphore.acquire();
+    try {
+      const response = await fetch('https://api.cartesia.ai/tts/bytes', {
+        method: 'POST',
+        headers: {
+          'Cartesia-Version': '2024-06-10',
+          'Content-Type': 'application/json',
+          'X-API-Key': apiKey,
+        },
+        body: JSON.stringify({
+          model_id: modelId,
+          transcript: text,
+          voice: {
+            mode: 'id',
+            id: cartesiaVoiceId
+          },
+          output_format: {
+            container: 'mp3',
+            encoding: 'pcm_f32le',
+            sample_rate: 44100
+          }
+        }),
+      });
+
+      if (!response.ok) {
+        const error = await response.text();
+        throw new Error(`Cartesia API error (${response.status}): ${error}`);
+      }
+
+      return await response.buffer();
+    } finally {
+      cartesiaSemaphore.release();
+    }
   }
 
   /**

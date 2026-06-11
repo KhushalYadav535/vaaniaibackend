@@ -4,6 +4,7 @@ const chunkSchema = new mongoose.Schema({
   text: { type: String, required: true },       // The chunk text (~500 chars)
   summary: { type: String, default: '' },        // LLM-generated keywords/summary
   keywords: [{ type: String }],                  // Extracted keywords for search
+  embedding: { type: [Number], default: [] },    // Semantic vector (Gemini text-embedding-004, 768 dims)
   index: { type: Number, required: true },       // Position in original document
 }, { _id: false });
 
@@ -30,6 +31,7 @@ const knowledgeBaseSchema = new mongoose.Schema({
   content: { type: String, default: '' },        // Original full text
   chunks: [chunkSchema],                          // Processed chunks for RAG
   totalChunks: { type: Number, default: 0 },
+  hasEmbeddings: { type: Boolean, default: false }, // True once semantic vectors are generated
   
   // Processing status
   status: {

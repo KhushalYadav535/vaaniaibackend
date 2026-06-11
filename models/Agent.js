@@ -118,7 +118,7 @@ const agentSchema = new mongoose.Schema({
   },
   workflowId: {
     type: mongoose.Schema.Types.ObjectId,
-    ref: 'Workflow',
+    ref: 'CallFlow',
     default: null,
   },
   // Advanced Config (Retell/Vapi style)
@@ -134,6 +134,11 @@ const agentSchema = new mongoose.Schema({
     customLlmUrl: { type: String, default: '' }, // Custom Webhook for Bring Your Own LLM
     sttKeywords: [{ type: String }], // Domain-specific terms for Deepgram keyword boosting (e.g. product names, company name)
     responseCacheEnabled: { type: Boolean, default: true }, // Cache FAQ-type LLM responses for speed
+
+    // Strict grounding (Vapi/Retell "guardrails" style). When true (default),
+    // the agent answers ONLY from its system prompt + attached knowledge base,
+    // refuses to invent facts, and won't ask for information it doesn't need.
+    strictGrounding: { type: Boolean, default: true },
   },
   // Webhook URLs for this agent
   webhooks: {

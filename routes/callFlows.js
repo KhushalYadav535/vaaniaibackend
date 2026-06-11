@@ -1,10 +1,19 @@
 const express = require('express');
 const router = express.Router();
 const CallFlow = require('../models/CallFlow');
+const Agent = require('../models/Agent');
 const { protect } = require('../middleware/auth');
 
 // All routes require auth
 router.use(protect);
+
+// Validate that any attached agentId belongs to the requesting user.
+// Returns true when no agentId is supplied (it's optional).
+async function ownsAgentOrNull(userId, agentId) {
+  if (!agentId) return true;
+  const agent = await Agent.findOne({ _id: agentId, userId }).select('_id');
+  return !!agent;
+}
 
 // @route   GET /api/call-flows
 // @desc    Get user's call flows
@@ -35,6 +44,9 @@ router.get('/:id', async (req, res, next) => {
 // @desc    Create a new call flow
 router.post('/', async (req, res, next) => {
   try {
+    if (!(await ownsAgentOrNull(req.user._id, req.body.agentId))) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
     const flowData = { ...req.body, userId: req.user._id };
     const flow = await CallFlow.create(flowData);
     res.status(201).json({ success: true, flow });
@@ -47,6 +59,9 @@ router.post('/', async (req, res, next) => {
 // @desc    Update a call flow
 router.put('/:id', async (req, res, next) => {
   try {
+    if (!(await ownsAgentOrNull(req.user._id, req.body.agentId))) {
+      return res.status(404).json({ success: false, message: 'Agent not found' });
+    }
     let flow = await CallFlow.findOneAndUpdate(
       { _id: req.params.id, userId: req.user._id },
       req.body,

@@ -23,18 +23,22 @@ class VoicePipeline {
     this._summaryCache = new Map();
 
     // Rolling summary settings
-    this._summaryThreshold = Number(process.env.ROLLING_SUMMARY_THRESHOLD || 12); // summarize after N messages
-    this._summaryKeepRecent = Number(process.env.ROLLING_SUMMARY_KEEP_RECENT || 6); // keep last N messages verbatim
+    // Llama 3.1 8B has an 8k context window. We can safely keep 15-20 short
+    // conversational messages verbatim without blowing the TPM budget.
+    this._summaryThreshold = Number(process.env.ROLLING_SUMMARY_THRESHOLD || 25); // summarize after N messages
+    this._summaryKeepRecent = Number(process.env.ROLLING_SUMMARY_KEEP_RECENT || 15); // keep last N messages verbatim
     // Recompute the cached summary only after this many NEW older messages
     // accumulate. Between recomputes we reuse the cached summary, so the
     // expensive summary Groq call no longer fires on every single turn
     // (that was flooding the free-tier TPM limit and starving the reply).
-    this._summaryRecomputeEvery = Number(process.env.ROLLING_SUMMARY_RECOMPUTE_EVERY || 6);
+    this._summaryRecomputeEvery = Number(process.env.ROLLING_SUMMARY_RECOMPUTE_EVERY || 10);
 
     // Language-specific filler words for natural turn-taking
     this._fillersByLang = {
       'en':      ['Hmm...', 'Let me see...', 'Umm...', 'So...', 'Well...', 'Right...', 'Okay so...'],
-      'hi':      ['Hmm...', 'Dekhte hain...', 'Ek minute...', 'Accha...', 'Toh...', 'Haan...', 'Ji...'],
+      // hi = pure Devnagari Hindi → fillers must be Devnagari so they cache-hit
+      // with the same voice+script used for main responses
+      'hi':      ['हम्म...', 'एक सेकंड...', 'अच्छा...', 'देखते हैं...', 'हाँ...', 'जी...', 'ठीक है...'],
       'hi-Latn': ['Hmm...', 'Ek sec...', 'Acchaa...', 'Toh basically...', 'Haan...', 'Dekho...'],
       'multi':   ['Hmm...', 'Accha...', 'Let me check...', 'Toh...', 'Okay...', 'Haan...'],
       'en-IN':   ['Hmm...', 'One second...', 'Okay so...', 'Let me check...', 'Right...'],
@@ -56,17 +60,115 @@ class VoicePipeline {
   _transliterateDevnagari(text) {
     if (!text || !/[ऀ-ॿ]/.test(text)) return text; // Fast path: no Devnagari
 
-    // Independent vowels
-    const vowels = {
-      'अ':'a','आ':'aa','इ':'i','ई':'ee','उ':'u','ऊ':'oo','ऋ':'ri',
-      'ए':'e','ऐ':'ai','ओ':'o','औ':'au','ऍ':'e','ऑ':'o',
+    // ── Common word dictionary ──────────────────────────────────────
+    // Character-by-character transliteration can't handle schwa deletion
+    // and vowel quality perfectly for every word. This dictionary maps
+    // frequently-used Devnagari words/phrases to their natural Hinglish
+    // spelling — the way a real person would type them on WhatsApp.
+    const wordMap = {
+      // Greetings
+      'नमस्ते':'namaste', 'नमस्कार':'namaskar', 'धन्यवाद':'dhanyavaad',
+      'शुक्रिया':'shukriya', 'माफ़':'maaf', 'माफ':'maaf', 'कृपया':'kripya',
+      'स्वागत':'swaagat', 'अलविदा':'alvida',
+      // Pronouns
+      'मैं':'main', 'हम':'hum', 'आप':'aap', 'तुम':'tum', 'तू':'tu',
+      'वो':'wo', 'वह':'woh', 'यह':'yeh', 'ये':'ye', 'वे':'ve',
+      // Possessives
+      'मेरा':'mera', 'मेरी':'meri', 'मेरे':'mere',
+      'आपका':'aapka', 'आपकी':'aapki', 'आपके':'aapke',
+      'आपको':'aapko', 'आपने':'aapne', 'आपसे':'aapse',
+      'हमारा':'hamara', 'हमारी':'hamari', 'हमारे':'hamare',
+      'उसका':'uska', 'उसकी':'uski', 'उसके':'uske',
+      'इसका':'iska', 'इसकी':'iski', 'इसके':'iske',
+      'उनका':'unka', 'उनकी':'unki', 'उनके':'unke',
+      'किसी':'kisi', 'किसका':'kiska', 'किसको':'kisko', 'किसने':'kisne',
+      // Postpositions / particles
+      'में':'mein', 'से':'se', 'को':'ko', 'का':'ka', 'की':'ki', 'के':'ke',
+      'पर':'par', 'और':'aur', 'या':'ya', 'तो':'to', 'भी':'bhi', 'ही':'hi',
+      'तक':'tak', 'साथ':'saath', 'बाद':'baad', 'पहले':'pehle',
+      'लिए':'liye', 'बारे':'baare', 'बीच':'beech', 'ऊपर':'upar', 'नीचे':'neeche',
+      // Verbs
+      'है':'hai', 'हैं':'hain', 'हो':'ho', 'हूँ':'hoon', 'था':'tha', 'थी':'thi', 'थे':'the',
+      'कर':'kar', 'करें':'karein', 'करो':'karo', 'करूँ':'karoon',
+      'करती':'karti', 'करता':'karta', 'करते':'karte', 'करना':'karna', 'करके':'karke',
+      'सकती':'sakti', 'सकता':'sakta', 'सकते':'sakte', 'सकूँ':'sakoon',
+      'रही':'rahi', 'रहा':'raha', 'रहे':'rahe', 'रहेंगे':'rahenge', 'रहेगा':'rahega', 'रहेगी':'rahegi',
+      'बताइए':'bataiye', 'बताइये':'bataiye', 'बताएं':'batayein', 'बताओ':'batao', 'बता':'bata',
+      'बोल':'bol', 'बोलिए':'boliye', 'बोलिये':'boliye', 'बोलो':'bolo',
+      'दीजिए':'dijiye', 'दीजिये':'dijiye', 'दें':'dein', 'दो':'do', 'दूँ':'doon',
+      'कीजिए':'kijiye', 'कीजिये':'kijiye',
+      'लेती':'leti', 'लेता':'leta', 'लेते':'lete',
+      'देती':'deti', 'देता':'deta', 'देते':'dete',
+      'चाहिए':'chahiye', 'चाहिये':'chahiye', 'चाहते':'chahte', 'चाहती':'chahti',
+      'चाहेंगे':'chahenge', 'चाहेंगी':'chahengi',
+      'किया':'kiya', 'दिया':'diya', 'लिया':'liya', 'गया':'gaya', 'गई':'gayi', 'गए':'gaye',
+      'आई':'aayi', 'आया':'aaya', 'आए':'aaye', 'आता':'aata', 'आती':'aati',
+      'मिला':'mila', 'मिली':'mili', 'मिलेगा':'milega', 'मिलेगी':'milegi',
+      'लगता':'lagta', 'लगती':'lagti',
+      'समझ':'samajh', 'समझा':'samjha', 'समझे':'samjhe', 'समझें':'samjhein',
+      'चुनी':'chuni', 'चुना':'chuna', 'चुने':'chune',
+      // Negation / fillers
+      'नहीं':'nahi', 'नही':'nahi', 'मत':'mat', 'ना':'na', 'जी':'ji', 'हाँ':'haan', 'हां':'haan',
+      // Adjectives
+      'अच्छा':'achha', 'अच्छी':'achhi', 'अच्छे':'achhe',
+      'ठीक':'theek', 'सही':'sahi', 'गलत':'galat',
+      'बहुत':'bahut', 'ज़्यादा':'zyada', 'ज्यादा':'zyada', 'कम':'kam',
+      'बड़ा':'bada', 'बड़ी':'badi', 'बड़े':'bade',
+      'छोटा':'chhota', 'छोटी':'chhoti', 'छोटे':'chhote',
+      'पूरा':'poora', 'पूरी':'poori', 'पूरे':'poore',
+      'कुछ':'kuchh', 'कोई':'koi', 'दूसरा':'doosra', 'दूसरी':'doosri', 'दूसरे':'doosre',
+      'जल्द':'jald', 'जल्दी':'jaldi', 'अभी':'abhi', 'तुरंत':'turant',
+      'शुभ':'shubh', 'आगे':'aage',
+      // Question words
+      'क्या':'kya', 'कौन':'kaun', 'कहाँ':'kahan', 'कब':'kab',
+      'कितना':'kitna', 'कितनी':'kitni', 'कैसे':'kaise', 'कैसा':'kaisa', 'कैसी':'kaisi', 'क्यों':'kyon',
+      // Connectors
+      'लेकिन':'lekin', 'इसलिए':'isliye', 'क्योंकि':'kyonki', 'अगर':'agar',
+      'फिर':'phir', 'जिसके':'jiske', 'अपना':'apna', 'अपनी':'apni', 'अपने':'apne',
+      // Banking / support
+      'नंबर':'number', 'नम्बर':'number', 'फोन':'phone', 'मोबाइल':'mobile',
+      'खाता':'khaata', 'बैंक':'bank', 'लोन':'loan', 'अकाउंट':'account',
+      'पैसे':'paise', 'पैसा':'paisa', 'रुपये':'rupaye', 'लाख':'laakh', 'हज़ार':'hazaar', 'हजार':'hazaar',
+      'निकालने':'nikalne', 'दर्ज':'darj', 'जमा':'jama',
+      'ब्याज':'byaaj', 'किस्त':'kist', 'अवधि':'avadhi',
+      'अधिकारी':'adhikari', 'सहायता':'sahayata', 'मदद':'madad',
+      'समस्या':'samasya', 'शिकायत':'shikayat', 'सवाल':'sawaal',
+      'जानकारी':'jaankari', 'विवरण':'vivran', 'प्रकार':'prakaar',
+      'प्रक्रिया':'prakriya', 'संपर्क':'sampark',
+      'काट':'kaat', 'बंद':'band', 'चालू':'chaalu', 'शुरू':'shuru',
+      'जुड़ने':'judne', 'जुड़े':'jude', 'पर्सनल':'personal', 'ईमेल':'email',
+      // Time
+      'आज':'aaj', 'कल':'kal', 'साल':'saal', 'महीना':'mahina', 'दिन':'din',
+      // Misc common
+      'यहाँ':'yahan', 'वहाँ':'wahan', 'ज़रूर':'zaroor', 'जरूर':'zaroor',
+      'बात':'baat', 'काम':'kaam', 'नाम':'naam', 'घर':'ghar',
+      'चरणों':'charnon', 'बोल':'bol',
     };
-    // Vowel signs (matras)
-    const matras = {
-      'ा':'aa','ि':'i','ी':'ee','ु':'u','ू':'oo','ृ':'ri',
-      'े':'e','ै':'ai','ो':'o','ौ':'au','ँ':'n','ं':'n','ः':'h','ॅ':'e','ॉ':'o',
-    };
-    // Consonants (with implicit 'a' that we strip when followed by matra/halant)
+
+    // First pass: replace whole Devnagari words using the dictionary.
+    // Split on word boundaries, replace known words, transliterate the rest.
+    const tokens = text.split(/(\s+|[.,!?;:।]+)/);
+    const result = tokens.map(token => {
+      // Whitespace / punctuation — pass through
+      if (!token || !/[ऀ-ॿ]/.test(token)) return token;
+
+      // Exact dictionary match (whole token is a known word)
+      if (wordMap[token]) return wordMap[token];
+
+      // Token might have punctuation attached: strip trailing punct, lookup, re-attach
+      const trailingPunct = token.match(/([.,!?;:।]+)$/);
+      const bare = trailingPunct ? token.slice(0, -trailingPunct[0].length) : token;
+      if (wordMap[bare]) return wordMap[bare] + (trailingPunct ? trailingPunct[0] : '');
+
+      // ── Character-by-character fallback ─────────────────────────
+      return this._transliterateWord(bare) + (trailingPunct ? trailingPunct[0] : '');
+    });
+
+    return result.join('');
+  }
+
+  /** Transliterate a single Devnagari word (no dictionary match). */
+  _transliterateWord(word) {
     const consonants = {
       'क':'k','ख':'kh','ग':'g','घ':'gh','ङ':'ng',
       'च':'ch','छ':'chh','ज':'j','झ':'jh','ञ':'ny',
@@ -76,34 +178,87 @@ class VoicePipeline {
       'य':'y','र':'r','ल':'l','व':'v','श':'sh','ष':'sh','स':'s','ह':'h',
       'क़':'q','ख़':'kh','ग़':'gh','ज़':'z','ड़':'r','ढ़':'rh','फ़':'f','य़':'y',
     };
+    const vowels = {
+      'अ':'a','आ':'aa','इ':'i','ई':'i','उ':'u','ऊ':'u','ऋ':'ri',
+      'ए':'e','ऐ':'ai','ओ':'o','औ':'au','ऍ':'e','ऑ':'o',
+    };
+    // ALL matras — ा/ी/ू are context-aware (null here, handled below)
+    // ं (anusvara) is also null — handled context-aware (m before labials, n otherwise)
+    const allMatras = {
+      'ा':null, 'ी':null, 'ू':null,
+      'ि':'i', 'ु':'u', 'ृ':'ri',
+      'े':'e', 'ै':'ai', 'ो':'o', 'ौ':'au',
+      'ँ':'n', 'ं':null, 'ः':'h', 'ॅ':'e', 'ॉ':'o',
+    };
+    // Labial consonants — anusvara (ं) becomes 'm' before these
+    const labials = new Set(['प','फ','ब','भ','म','फ़']);
     const halant = '्';
+
+    const isMatra = (ch) => ch && allMatras.hasOwnProperty(ch);
+    const isConsonant = (ch) => ch && consonants.hasOwnProperty(ch);
+
+    const chars = Array.from(word);
     const out = [];
-    const chars = Array.from(text);
+
     for (let i = 0; i < chars.length; i++) {
       const c = chars[i];
       const next = chars[i + 1];
-      if (consonants[c]) {
+      const isLast = !next || !/[ऀ-ॿ]/.test(next);
+
+      if (isConsonant(c)) {
         out.push(consonants[c]);
-        // Implicit 'a' unless followed by matra or halant
-        if (next && (matras[next] || next === halant)) {
-          // No implicit 'a'; if matra, will be appended next iteration
+
+        // If followed by any matra or halant → no implicit 'a'
+        if (next && (isMatra(next) || next === halant)) {
           continue;
         }
-        // Word-final consonant — drop schwa for natural sound (Hindi schwa-deletion)
-        const isWordEnd = !next || /[\s\.,!?;:]/.test(next) || /[ऀ-ॿ]/.test(next) === false;
-        if (!isWordEnd) out.push('a');
+
+        // Word-final → drop schwa (Hindi schwa deletion at end only).
+        // Internal schwa deletion is word-specific and too risky to
+        // automate — the dictionary above handles common words.
+        // Keeping internal 'a' is always understandable ("madad" not "mdd").
+        if (isLast) continue;
+
+        // Otherwise KEEP implicit 'a'
+        out.push('a');
         continue;
       }
-      if (matras[c]) { out.push(matras[c]); continue; }
+
+      // Context-aware long matras (ा, ी, ू):
+      // Inside word → double vowel (baat, theek, phool)
+      // Word-final → single vowel (neha, rahi, guru)
+      // Context-aware anusvara (ं): 'm' before labials, 'n' otherwise
+      // नंबर → nam-bar (not nan-bar), संपर्क → sam-park (not san-park)
+      if (c === 'ं') {
+        if (next && labials.has(next)) {
+          out.push('m');
+        } else {
+          out.push('n');
+        }
+        continue;
+      }
+
+      // Context-aware long matras (ा, ी, ू):
+      // Inside word → double vowel (baat, theek, phool)
+      // Word-final → single vowel (neha, rahi, guru)
+      if (c === 'ा') { out.push(isLast ? 'a' : 'aa'); continue; }
+      if (c === 'ी') { out.push(isLast ? 'i' : 'ee'); continue; }
+      if (c === 'ू') { out.push(isLast ? 'u' : 'oo'); continue; }
+
+      // Other matras
+      if (isMatra(c) && allMatras[c] !== null) { out.push(allMatras[c]); continue; }
+      if (isMatra(c)) continue;
+
       if (vowels[c]) { out.push(vowels[c]); continue; }
-      if (c === halant) continue; // suppress implicit 'a' between consonants
-      if (c === '़') continue;     // nukta — already absorbed where applicable
+      if (c === halant) continue;
+      if (c === '़') continue;
+
       // Devnagari digits
       if (c >= '०' && c <= '९') {
         out.push(String.fromCharCode(c.charCodeAt(0) - 0x0966 + 0x30));
         continue;
       }
-      out.push(c); // pass through (whitespace, punctuation, Latin)
+      out.push(c);
     }
     return out.join('');
   }
@@ -137,7 +292,11 @@ class VoicePipeline {
    *    Hindi voice, Tamil for a Tamil voice, etc.)
    */
   _targetScript(lang = 'en', voiceId = '') {
+    // hi-Latn and English variants always want Roman (Latin) output
     if (lang === 'hi-Latn' || lang === 'en' || lang === 'en-IN') return 'latin';
+    // For pure Hindi (lang='hi'), multi, and regional languages:
+    // return the TTS voice's native script so no unnecessary transliteration happens.
+    // e.g. hi-IN-SwaraNeural → 'deva', en-IN-NeerjaNeural → 'latin'
     return this._voiceNativeScript(voiceId);
   }
 
@@ -462,7 +621,14 @@ class VoicePipeline {
     // Convert to speech
     const lang = agent.language || 'en';
     let defaultVoiceId = 'en-US-JennyNeural';
-    if (lang === 'hi' || lang === 'hi-Latn' || lang === 'multi') defaultVoiceId = 'hi-IN-SwaraNeural';
+    if (lang === 'hi') defaultVoiceId = 'hi-IN-SwaraNeural';
+    // hi-Latn = Hinglish / Roman-script Hindi. The LLM output gets
+    // transliterated to Roman by humanizeText, so we need a LATIN-script
+    // voice. hi-IN-SwaraNeural is a Devnagari-trained voice and mispronounces
+    // Roman text. en-IN-NeerjaNeural is an Indian English voice that handles
+    // Roman/Hinglish naturally — correct accent, correct script.
+    else if (lang === 'hi-Latn') defaultVoiceId = 'en-IN-NeerjaNeural';
+    else if (lang === 'multi') defaultVoiceId = 'hi-IN-SwaraNeural';
     else if (lang === 'ta') defaultVoiceId = 'ta-IN-PallaviNeural';
     else if (lang === 'te') defaultVoiceId = 'te-IN-ShrutiNeural';
     else if (lang === 'kn') defaultVoiceId = 'kn-IN-SapnaNeural';
@@ -544,7 +710,7 @@ class VoicePipeline {
     // Pass sessionId so the summary is cached + refreshed in the background
     // instead of making a blocking Groq call on every turn (which was
     // starving the reply stream and causing the mid-call latency spiral).
-    const { summary: rollingSummary, recentHistory } = await this.compressHistory(history, sessionId);
+    const { summary: rollingSummary, recentHistory } = await this.compressHistory(history, sessionId, agent);
     let summaryPrompt = '';
     if (rollingSummary) {
       summaryPrompt = `\n\n## EARLIER CONVERSATION SUMMARY:\n${rollingSummary}`;
@@ -560,10 +726,29 @@ class VoicePipeline {
       { role: 'user', content: text },
     ];
 
-    const llmProvider   = agent.llm?.provider   || 'groq';
+    const llmProvider   = agent.llm?.provider   || 'gemini';
     const llmModel      = agent.llm?.model       || 'llama-3.1-8b-instant';
-    const voiceProvider = agent.voice?.provider  || 'edge-tts';
-    const voiceId       = agent.voice?.voiceId   || 'en-US-JennyNeural';
+    const voiceProvider = agent.voice?.provider  || (process.env.CARTESIA_API_KEY ? 'cartesia' : 'edge-tts');
+    // Language-aware voice default — must match the target script that humanizeText
+    // will produce. hi-Latn outputs Roman text (transliterated), so it needs a
+    // Latin-script voice (en-IN-NeerjaNeural). Using a Devnagari voice (hi-IN-*)
+    // with Roman input causes garbled/cut pronunciation.
+    const streamLang = agent.language || 'en';
+    let streamDefaultVoiceId = 'en-US-JennyNeural';
+    if      (streamLang === 'hi')      streamDefaultVoiceId = 'hi-IN-SwaraNeural';
+    else if (streamLang === 'hi-Latn') streamDefaultVoiceId = 'en-IN-NeerjaNeural';
+    else if (streamLang === 'multi')   streamDefaultVoiceId = 'hi-IN-SwaraNeural';
+    else if (streamLang === 'en-IN')   streamDefaultVoiceId = 'en-IN-NeerjaNeural';
+    else if (streamLang === 'ta')      streamDefaultVoiceId = 'ta-IN-PallaviNeural';
+    else if (streamLang === 'te')      streamDefaultVoiceId = 'te-IN-ShrutiNeural';
+    else if (streamLang === 'kn')      streamDefaultVoiceId = 'kn-IN-SapnaNeural';
+    else if (streamLang === 'ml')      streamDefaultVoiceId = 'ml-IN-SobhanaNeural';
+    else if (streamLang === 'mr')      streamDefaultVoiceId = 'mr-IN-AarohiNeural';
+    else if (streamLang === 'gu')      streamDefaultVoiceId = 'gu-IN-DhwaniNeural';
+    else if (streamLang === 'bn')      streamDefaultVoiceId = 'bn-IN-TanishaaNeural';
+    else if (streamLang === 'ur')      streamDefaultVoiceId = 'ur-IN-GulNeural';
+    else if (streamLang === 'pa')      streamDefaultVoiceId = 'pa-IN-OjasNeural';
+    const voiceId       = agent.voice?.voiceId   || streamDefaultVoiceId;
     const speed         = agent.voice?.speed     || 1.05; // 1.05 = slightly faster than default, sounds more conversational
     const ttsApiKey     = userSettings.ttsKey    || process.env.ELEVENLABS_API_KEY;
 
@@ -577,19 +762,8 @@ class VoicePipeline {
     const firstChunkCharThreshold  = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 30);
     const firstChunkMaxWords       = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 14);
 
-    // ── Dynamic Knowledge (RAG 2.0) ────────────────────────────────────────
-    let dynamicKnowledge = '';
-    if (agent.knowledgeBaseId) {
-      const kb = await KnowledgeBase.findById(agent.knowledgeBaseId);
-      if (kb) {
-        // Cap at 400 chars — the 1000 cap was making Llama 3.1 8B
-        // dump the whole KB into every reply ("brochure mode").
-        // RAG already runs hybrid search separately and injects
-        // relevant chunks via getContextForQuery; this static fallback
-        // exists only to seed the agent with a basic awareness.
-        dynamicKnowledge = `\n[Dynamic Knowledge Context]:\n${kb.content.substring(0, 400)}`;
-      }
-    }
+    // ── Dynamic Knowledge (RAG) ────────────────────────────────────────────
+    // (Handled via ragContext passed from voiceSession.js Hybrid Search)
 
     // ── Tool instructions ──────────────────────────────────────────────────
     const toolInstructions = agent.webhooks?.length > 0
@@ -602,7 +776,6 @@ class VoicePipeline {
     // lastReplies. Now everything is composed in a single pass.
     const systemPrompt = this.buildSystemPrompt(agent, memory, ragContext, lastReplies, callContext.vars || {})
       + summaryPrompt
-      + dynamicKnowledge
       + toolInstructions
       + emotionPrompt;
     messages[0].content = systemPrompt;
@@ -887,7 +1060,7 @@ class VoicePipeline {
             if (firstChunkText.length > 0) {
               ttsQueue.push(fireTTS(firstChunkText)); // fire immediately, don't await
               hasSpokenFirstChunk = true;
-              currentSentence     = remainder ? `${remainder} ` : '';
+              currentSentence     = remainder; // CRITICAL: Do not append ' ' here, it breaks partially streamed words!
               console.log(`[Pipeline] Fast-chunk TTS fired (queue=${ttsQueue.length}): "${firstChunkText.substring(0, 60)}"`);
             }
           }
@@ -1341,7 +1514,7 @@ ${customFieldDescriptions}
    *
    * Returns: { summary: string|null, recentHistory: Array }
    */
-  async compressHistory(history, sessionId = null) {
+  async compressHistory(history, sessionId = null, agent = null) {
     if (!history || history.length <= this._summaryThreshold) {
       return { summary: null, recentHistory: history };
     }
@@ -1371,7 +1544,7 @@ ${customFieldDescriptions}
 
         // Fire-and-forget — do NOT await. The current turn uses whatever
         // summary we already have (possibly null on the very first overflow).
-        this._computeSummary(olderMessages)
+        this._computeSummary(olderMessages, agent?.llm?.provider || 'gemini')
           .then((summary) => {
             this._summaryCache.set(sessionId, { summary, coveredCount: olderCount, inFlight: false });
             console.log(`[Rolling Summary] (bg) refreshed for ${sessionId}: covered ${olderCount} older msgs`);
@@ -1385,7 +1558,12 @@ ${customFieldDescriptions}
       }
 
       // Always return immediately with whatever summary we have cached.
-      return { summary: cached?.summary || null, recentHistory };
+      // If we don't have a summary yet, fall back to a larger recent history (up to 20 msgs)
+      // so we don't create a "blind spot" for the LLM while the summary generates.
+      return { 
+        summary: cached?.summary || null, 
+        recentHistory: cached?.summary ? recentHistory : history.slice(-Math.max(this._summaryKeepRecent, 20))
+      };
     }
 
     // ── Legacy synchronous path (no sessionId provided) ─────────────────
@@ -1401,9 +1579,9 @@ ${customFieldDescriptions}
   }
 
   /** Run the actual summary LLM call. Separated so it can run in background. */
-  async _computeSummary(olderMessages) {
+  async _computeSummary(olderMessages, llmProvider = 'gemini') {
     const olderFormatted = olderMessages.map(m => `${m.role}: ${m.content}`).join('\n');
-    const response = await groqService.generateResponse({
+    const params = {
       messages: [
         {
           role: 'system',
@@ -1411,9 +1589,17 @@ ${customFieldDescriptions}
         },
         { role: 'user', content: olderFormatted },
       ],
-      model: 'llama-3.1-8b-instant',
+      model: llmProvider === 'gemini' ? 'gemini-2.0-flash' : 'llama-3.1-8b-instant',
       temperature: 0.1,
-    });
+    };
+    
+    let response;
+    if (llmProvider === 'gemini' && geminiService.isAvailable()) {
+      response = await geminiService.generateResponse(params);
+    } else {
+      response = await groqService.generateResponse(params);
+    }
+    
     return (response.text || '').trim();
   }
 
@@ -1433,7 +1619,20 @@ ${customFieldDescriptions}
    */
   buildSystemPrompt(agent, memory = null, ragContext = '', lastReplies = [], vars = {}) {
     const lang = agent.language || 'en';
-    const langInstruction = lang === 'en' ? 'English' : lang === 'hi' ? 'Hindi (MUST BE WRITTEN IN ROMAN/LATIN ALPHABET ONLY. NO DEVNAGARI SCRIPT ALLOWED)' : lang === 'hi-Latn' ? 'Hinglish (Hindi in Roman script)' : lang === 'multi' ? 'the same language the user speaks in (use Roman script for Hindi)' : lang;
+    // langInstruction MUST match the targetScript logic:
+    // - hi-Latn (Hinglish): Roman script → tell LLM to write in Roman
+    // - hi (pure Hindi): Devnagari voice → tell LLM to write in Devnagari
+    // - BUG WAS: 'hi' was also forced to ROMAN, which made hi-IN-SwaraNeural
+    //   (a native Devnagari voice) receive garbled transliterated text → bad pronunciation
+    const langInstruction = lang === 'en'
+      ? 'English'
+      : lang === 'hi'
+        ? 'Hindi (देवनागरी / Devnagari script ONLY. Do NOT romanize Hindi words.)'
+        : lang === 'hi-Latn'
+          ? 'Hinglish (Hindi in Roman script ONLY — no Devnagari)'
+          : lang === 'multi'
+            ? 'the same language the user speaks in (use Roman script for Hindi, native script for other languages)'
+            : lang;
 
     // Resolve {{placeholders}} in the (possibly template-derived) system prompt
     // so the model never sees a literal "{{company}}".
@@ -1459,7 +1658,10 @@ ${resolvedSystemPrompt}
     }
 
     if (ragContext) {
-      prompt += `\n\n## KNOWLEDGE BASE CONTEXT (only quote when DIRECTLY asked; never summarize all of it):\n${ragContext}`;
+      prompt += `\n\n## KNOWLEDGE BASE CONTEXT:
+Use the following information to answer the user's questions. 
+CRITICAL: You must incorporate this knowledge naturally into your assigned ROLE & PERSONA above. Do not break character. Do not explicitly say "According to the knowledge base", just answer as if you naturally know it.
+${ragContext}`;
     }
 
     // ── STRICT GROUNDING (Vapi/Retell guardrails) ──────────────────────────
@@ -1470,17 +1672,20 @@ ${resolvedSystemPrompt}
     if (strictGrounding) {
       const hasKb = !!ragContext;
       const refusalLang = lang === 'en'
-        ? `"I'm sorry, I don't have that information."`
-        : `"Sorry, mere paas us baare mein jaankari nahi hai."`;
+        ? `"I'm sorry, I don't have that information right now."`
+        : `"Maaf kijiye, mere paas is baare mein abhi jaankari nahi hai."`;
       prompt += `
 
-## STRICT KNOWLEDGE BOUNDARY (follow exactly):
-- Answer ONLY using your role/persona above${hasKb ? ' and the Knowledge Base Context provided' : ''}. Treat that as your single source of truth.
-- If the answer is not covered there, DO NOT guess, assume, or use outside/general knowledge. Say ${refusalLang} and, if appropriate, offer to connect them or take a message.
-- NEVER invent facts: no prices, dates, names, policies, availability, or numbers that aren't given to you.
-- Do NOT volunteer extra information the user didn't ask for. Answer the actual question, nothing more.
-- Do NOT ask for information you don't need to fulfill your defined role. Only collect what your instructions require.
-- Stay strictly on the topics/tasks defined in your role. If asked something off-topic, briefly decline and steer back.`;
+## STRICT KNOWLEDGE BOUNDARY (CRITICAL — follow EXACTLY):
+- Your ONLY source of truth is: (1) Your Role/Persona above${hasKb ? ', and (2) the Knowledge Base Context provided above' : ''}. 
+- You have ZERO general knowledge. You know NOTHING beyond what is written above.
+- If the user asks something NOT covered in your role${hasKb ? ' or knowledge base' : ''}, you MUST say ${refusalLang}. Then offer to take a message or connect to a human.
+- NEVER guess, assume, or use outside/general/world knowledge — even if you "know" the answer. You are a phone agent, not a search engine.
+- NEVER invent: prices, dates, names, policies, availability, phone numbers, addresses, timings, or ANY facts not explicitly given to you.
+- Do NOT volunteer extra information the user didn't ask for.
+- Do NOT ask for information you don't need to fulfill your defined role.
+- Stay strictly on-topic. If asked something off-topic (weather, cricket, politics, jokes), politely say: "Main sirf ${agent.name || 'is service'} ke baare mein baat kar sakti hoon." and redirect.
+- If user insists on off-topic info, DO NOT give in. Repeat your refusal politely but firmly.`;
     }
 
     // Anti-repetition guard. Llama 3.1 8B in voice mode repeats its own
@@ -1638,7 +1843,14 @@ Today is ${new Date().toDateString()}. You are NOT an AI; never say "As an AI".
     
     const lang = agent.language || 'en';
     let defaultVoiceId = 'en-US-JennyNeural';
-    if (lang === 'hi' || lang === 'hi-Latn' || lang === 'multi') defaultVoiceId = 'hi-IN-SwaraNeural';
+    if (lang === 'hi') defaultVoiceId = 'hi-IN-SwaraNeural';
+    // hi-Latn = Hinglish / Roman-script Hindi. The LLM output gets
+    // transliterated to Roman by humanizeText, so we need a LATIN-script
+    // voice. hi-IN-SwaraNeural is a Devnagari-trained voice and mispronounces
+    // Roman text. en-IN-NeerjaNeural is an Indian English voice that handles
+    // Roman/Hinglish naturally — correct accent, correct script.
+    else if (lang === 'hi-Latn') defaultVoiceId = 'en-IN-NeerjaNeural';
+    else if (lang === 'multi') defaultVoiceId = 'hi-IN-SwaraNeural';
     else if (lang === 'ta') defaultVoiceId = 'ta-IN-PallaviNeural';
     else if (lang === 'te') defaultVoiceId = 'te-IN-ShrutiNeural';
     else if (lang === 'kn') defaultVoiceId = 'kn-IN-SapnaNeural';
@@ -1652,11 +1864,21 @@ Today is ${new Date().toDateString()}. You are NOT an AI; never say "As an AI".
 
     const voiceId = agent.voice?.voiceId || defaultVoiceId;
     const provider = agent.voice?.provider || 'edge-tts';
+    const speed = agent.voice?.speed || 1.05;
+
+    // Humanize the greeting text exactly like processTextStream does —
+    // this is critical for hi-Latn agents whose firstMessage may contain
+    // Devnagari characters. Edge TTS for a Latin-script voice will produce
+    // silence / empty audio if sent raw Devnagari; humanizeText
+    // transliterates it to Roman so the voice can speak it clearly.
+    const targetScript = this._targetScript(lang, voiceId);
+    const humanizedText = this.humanizeText(text, lang, targetScript);
 
     try {
-      const audioBuffer = await ttsService.textToSpeech({ text, voiceId, provider });
+      const audioBuffer = await ttsService.textToSpeech({ text: humanizedText, voiceId, speed, provider });
       return { text, audioBuffer };
     } catch (error) {
+      console.error('[getFirstMessageAudio] TTS failed:', error.message);
       return { text, audioBuffer: Buffer.alloc(0) };
     }
   }

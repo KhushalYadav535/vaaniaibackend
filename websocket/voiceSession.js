@@ -1073,7 +1073,30 @@ async function handleInit(session, message) {
   (async () => {
     try {
       const lang = agent.language || 'en';
-      const voiceId = agent.voice?.voiceId || 'en-US-JennyNeural';
+      // Use the same language-aware voice correction as voicePipeline so the
+      // TTS cache keys match. If the agent has hi-IN-SwaraNeural in DB but
+      // language is hi-Latn, we must prewarm en-IN-NeerjaNeural instead —
+      // otherwise every greeting is a cache miss and sounds garbled.
+      let defaultVoiceId = agent.voice?.voiceId || 'en-US-JennyNeural';
+      if (!agent.voice?.voiceId) {
+        if      (lang === 'hi')      defaultVoiceId = 'hi-IN-SwaraNeural';
+        else if (lang === 'hi-Latn') defaultVoiceId = 'en-IN-NeerjaNeural';
+        else if (lang === 'multi')   defaultVoiceId = 'hi-IN-SwaraNeural';
+        else if (lang === 'en-IN')   defaultVoiceId = 'en-IN-NeerjaNeural';
+        else if (lang === 'ta')      defaultVoiceId = 'ta-IN-PallaviNeural';
+        else if (lang === 'te')      defaultVoiceId = 'te-IN-ShrutiNeural';
+        else if (lang === 'kn')      defaultVoiceId = 'kn-IN-SapnaNeural';
+        else if (lang === 'ml')      defaultVoiceId = 'ml-IN-SobhanaNeural';
+        else if (lang === 'mr')      defaultVoiceId = 'mr-IN-AarohiNeural';
+        else if (lang === 'gu')      defaultVoiceId = 'gu-IN-DhwaniNeural';
+        else if (lang === 'bn')      defaultVoiceId = 'bn-IN-TanishaaNeural';
+        else if (lang === 'ur')      defaultVoiceId = 'ur-IN-GulNeural';
+        else if (lang === 'pa')      defaultVoiceId = 'pa-IN-OjasNeural';
+      }
+      // Also correct explicit Devnagari voices used in hi-Latn mode (script mismatch).
+      const voiceNeedsCorrection = lang === 'hi-Latn' &&
+        defaultVoiceId.startsWith('hi-IN') || defaultVoiceId.startsWith('mr-IN');
+      const voiceId = voiceNeedsCorrection ? 'en-IN-NeerjaNeural' : defaultVoiceId;
       const provider = agent.voice?.provider || 'edge-tts';
       const speed = agent.voice?.speed || 1.05;
       // Use the SAME filler list and SAME fillerSpeed the pipeline will look
@@ -1085,8 +1108,13 @@ async function handleInit(session, message) {
       const fillerSpeed = Math.max(0.85, speed - 0.15);
 
       // Warm the greeting at normal speed (used as-is).
+      // IMPORTANT: use the SAME humanized text that getFirstMessageAudio will
+      // produce — raw Devnagari and humanized Roman have different cache keys,
+      // so warming the wrong form means a 100% cache miss on every greeting.
       if (agent.firstMessage) {
-        ttsService.textToSpeech({ text: agent.firstMessage, voiceId, speed, provider }).catch(() => {});
+        const greetingTargetScript = voicePipeline._targetScript(lang, voiceId);
+        const humanizedGreeting = voicePipeline.humanizeText(agent.firstMessage, lang, greetingTargetScript);
+        ttsService.textToSpeech({ text: humanizedGreeting, voiceId, speed, provider }).catch(() => {});
       }
       // Warm each filler at BOTH the lookup speed (for the instant filler) and
       // normal speed (for backchannels/tool-check phrases).
@@ -1159,6 +1187,11 @@ async function handleInit(session, message) {
       });
 
       if (audioBuffer && audioBuffer.length > 0) {
+        // Assign a stable greeting generationId BEFORE sendAudioBuffer so the
+        // async queue task's post-drain check (currentGenerationId !== generationId)
+        // doesn't drop the greeting. Without this, currentGenerationId=null and
+        // nextAudioSeq returns 'init', making the check null!=='init' → true → drop.
+        session.currentGenerationId = session.currentGenerationId || 'greeting-' + session.id;
         sendAudioBuffer(session, audioBuffer);
       }
     } else {
@@ -1184,6 +1217,11 @@ async function handleInit(session, message) {
 
       // Send audio
       if (audioBuffer && audioBuffer.length > 0) {
+        // Assign a stable greeting generationId BEFORE sendAudioBuffer so the
+        // async queue task's post-drain check (currentGenerationId !== generationId)
+        // doesn't drop the greeting. Without this, currentGenerationId=null and
+        // nextAudioSeq returns 'init', making the check null!=='init' → true → drop.
+        session.currentGenerationId = session.currentGenerationId || 'greeting-' + session.id;
         sendAudioBuffer(session, audioBuffer);
       }
     }
@@ -1468,14 +1506,57 @@ async function processTranscript(session, transcript) {
       }
     }
 
-    // Check for end call
-    if (voicePipeline.shouldEndCall(transcript, session.agent)) {
-      await handleEndSession(session, 'user_hangup');
-      return;
+    // ── CALL END CONFIRMATION FLOW ──────────────────────────────────────
+    // Two-step process to prevent accidental hangups:
+    //  Step 1: User says "call cut karo" → we set pendingEndCallConfirmation = true
+    //          and let the LLM ask for confirmation ("Kya aap sure hain?")
+    //  Step 2: On the NEXT turn, if user confirms (haan/yes/ok), THEN we end.
+    //          If user says something else, we cancel the pending flag.
+
+    if (session.pendingEndCallConfirmation) {
+      // Step 2: Check if user confirmed the end-call
+      const confirmWords = [
+        'haan', 'ha', 'haa', 'han', 'yes', 'yeah', 'yep', 'ok', 'okay',
+        'theek', 'theek hai', 'thik', 'thik hai', 'sahi', 'bilkul',
+        'kar do', 'kaat do', 'band karo', 'bye', 'goodbye', 'alvida',
+        'ji', 'ji haan', 'sure',
+      ];
+      const normalizedTranscript = ` ${transcript.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim()} `;
+      const isConfirmed = confirmWords.some(w => normalizedTranscript.includes(` ${w} `));
+      
+      if (isConfirmed) {
+        console.log(`[Call End] User confirmed call end: "${transcript}"`);
+        // Let agent say goodbye first, then end
+        session.pendingEndCallConfirmation = false;
+        session.endCallAfterResponse = true;
+        // Don't return — let the LLM generate a farewell response
+        // The session will end after the response is sent (checked in processTextStream callback)
+      } else {
+        // User said something else — cancel the pending end
+        console.log(`[Call End] User did NOT confirm, cancelling: "${transcript}"`);
+        session.pendingEndCallConfirmation = false;
+        // Continue normal conversation
+      }
+    } else if (voicePipeline.shouldEndCall(transcript, session.agent)) {
+      // Step 1: End-call intent detected — set pending flag, DON'T hang up yet
+      console.log(`[Call End] Intent detected, asking confirmation: "${transcript}"`);
+      session.pendingEndCallConfirmation = true;
+      // Inject a system hint so the LLM asks for confirmation
+      session.history.push({ role: 'user', content: transcript, timestamp: new Date() });
+      session.history.push({
+        role: 'system',
+        content: 'The user just indicated they want to end the call. You MUST ask them to confirm ONCE: "Kya aap sure hain ki call end karni hai?" or similar. Do NOT end the call yourself. Wait for their answer.',
+        timestamp: new Date(),
+      });
+      // Skip the normal history push below (already done above)
+      // Process through LLM so it asks for confirmation
+      // Fall through to the LLM processing below but skip the history push
     }
 
-    // Add user message to history
-    session.history.push({ role: 'user', content: transcript, timestamp: new Date() });
+    // Add user message to history (skip if step 1 above already pushed it)
+    if (!session.pendingEndCallConfirmation) {
+      session.history.push({ role: 'user', content: transcript, timestamp: new Date() });
+    }
 
     // Update call log
     queueCallLogUpdate(session, {
@@ -1822,6 +1903,19 @@ async function processTranscript(session, transcript) {
 
     session.status = 'listening';
     safeSend(session.ws, { type: 'status', message: '🎙️ Listening...' });
+
+    // ── End call after farewell response ────────────────────────────
+    // If the user confirmed they want to end the call, wait a few seconds
+    // for the farewell audio to play, then gracefully disconnect.
+    if (session.endCallAfterResponse) {
+      session.endCallAfterResponse = false;
+      console.log(`[Call End] Farewell sent, ending session in 3s...`);
+      setTimeout(() => {
+        handleEndSession(session, 'user_hangup').catch(e =>
+          console.error('[Call End] Error ending session:', e.message)
+        );
+      }, 3000); // 3s delay so farewell audio plays fully
+    }
 
   } catch (error) {
     console.error('Pipeline error:', error);

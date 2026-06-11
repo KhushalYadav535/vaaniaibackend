@@ -522,7 +522,9 @@ class VoicePipeline {
     const speed         = agent.voice?.speed     || 1.05; // 1.05 = slightly faster than default, sounds more conversational
     const ttsApiKey     = userSettings.ttsKey    || process.env.ELEVENLABS_API_KEY;
 
-    const fastFirstChunkMode       = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
+    const fastFirstChunkRequested  = String(process.env.FAST_FIRST_CHUNK_MODE || 'false').toLowerCase() === 'true';
+    const allowPreBoundaryTTS      = String(process.env.TTS_ALLOW_PRE_BOUNDARY_CHUNK || 'false').toLowerCase() === 'true';
+    const fastFirstChunkMode       = fastFirstChunkRequested && allowPreBoundaryTTS;
     // Lowered defaults: 24→18 chars, 10→8 words. The original threshold
     // was tuned to wait for "complete-feeling" first phrases — but the
     // human ear is forgiving of half-thoughts when they arrive 100-150ms

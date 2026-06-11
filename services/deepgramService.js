@@ -133,12 +133,7 @@ class DeepgramService {
       if (useNumerals) params.set('numerals', 'true');
     }
 
-    if (audioInputMode === 'webm') {
-      // webm mode: use opus params that Deepgram accepts for webm streams
-      params.set('encoding', 'opus');
-      params.set('sample_rate', '48000');
-      params.set('channels', '1');
-    } else {
+    if (audioInputMode !== 'webm') {
       // raw mode: use specified encoding
       params.set('encoding', encoding);
       params.set('sample_rate', String(sampleRate));

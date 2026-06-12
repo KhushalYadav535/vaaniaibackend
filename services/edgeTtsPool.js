@@ -139,7 +139,14 @@ class EdgeTtsPool {
         const slot = { ws, busy: true, voiceId, lastUsedAt: Date.now() };
         this.slots.push(slot);
         // Drop dead sockets out of the pool immediately so they're never reused
-        ws.on('close', () => this._removeSlot(slot));
+        ws.on('close', () => {
+          this._removeSlot(slot);
+          // Reject any waiters blocked on this slot that just died
+          if (slot.busy && this.waiters.length > 0) {
+            const waiter = this.waiters.shift();
+            waiter(null, new Error('edge_tts_socket_closed'));
+          }
+        });
         ws.on('error', () => this._removeSlot(slot));
         return slot;
       } finally {
@@ -154,7 +161,12 @@ class EdgeTtsPool {
         if (idx >= 0) this.waiters.splice(idx, 1);
         reject(new Error('edge_tts_pool_acquire_timeout'));
       }, POOL_MAX_WAIT_MS);
-      const waiter = (slot) => { clearTimeout(timer); slot.voiceId = voiceId; resolve(slot); };
+      const waiter = (slot, err) => {
+        clearTimeout(timer);
+        if (err || !slot) return reject(err || new Error('edge_tts_pool_slot_dead'));
+        slot.voiceId = voiceId;
+        resolve(slot);
+      };
       this.waiters.push(waiter);
     });
   }
@@ -167,7 +179,7 @@ class EdgeTtsPool {
     if (this.waiters.length > 0 && slot.ws.readyState === WebSocket.OPEN) {
       const waiter = this.waiters.shift();
       slot.busy = true;
-      waiter(slot);
+      waiter(slot, null);
     }
   }
 
@@ -196,10 +208,16 @@ class EdgeTtsPool {
     const pitchStr = `${pitch >= 0 ? '+' : ''}${pitch}Hz`;
 
     // Two retries: handles the race where a pooled socket gets closed by
-    // the server right as we send. The retry will get a fresh socket.
+    // the server right as we send. The retry will open a fresh socket.
     let lastErr;
     for (let attempt = 0; attempt < 2; attempt++) {
-      const slot = await this._acquire(voiceId);
+      let slot;
+      try {
+        slot = await this._acquire(voiceId);
+      } catch (acquireErr) {
+        // Could not get a slot (timeout, all dead) — bail out immediately
+        throw acquireErr;
+      }
       try {
         const audio = await this._synthesizeOnSocket(slot.ws, { text, voiceId, rate, pitchStr });
         this._release(slot);
@@ -209,6 +227,8 @@ class EdgeTtsPool {
         try { slot.ws.close(); } catch (_) {}
         this._removeSlot(slot);
         lastErr = err;
+        // Small back-off before retry so a new socket has time to open
+        if (attempt === 0) await new Promise(r => setTimeout(r, 200));
       }
     }
     throw lastErr || new Error('edge_tts_synthesis_failed');

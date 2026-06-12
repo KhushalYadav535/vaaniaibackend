@@ -255,7 +255,7 @@ class TtsService {
       
       return audio;
     } catch (e) {
-      console.error('Edge TTS file fallback error:', e.message);
+      console.error('Edge TTS file fallback error:', e?.message || String(e));
       return Buffer.alloc(0);
     }
   }

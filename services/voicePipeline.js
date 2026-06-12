@@ -728,7 +728,11 @@ class VoicePipeline {
 
     const llmProvider   = agent.llm?.provider   || 'gemini';
     const llmModel      = agent.llm?.model       || 'llama-3.1-8b-instant';
-    const voiceProvider = agent.voice?.provider  || (process.env.CARTESIA_API_KEY ? 'cartesia' : 'edge-tts');
+    // Default to edge-tts (free, no API key needed).
+    // Cartesia is only used when the agent explicitly sets voice.provider = 'cartesia'.
+    // Never auto-select Cartesia from env alone — an invalid/expired key causes every
+    // TTS call to fail with 401, then retry through the full Edge TTS fallback chain.
+    const voiceProvider = agent.voice?.provider || 'edge-tts';
     // Language-aware voice default — must match the target script that humanizeText
     // will produce. hi-Latn outputs Roman text (transliterated), so it needs a
     // Latin-script voice (en-IN-NeerjaNeural). Using a Devnagari voice (hi-IN-*)
@@ -750,7 +754,11 @@ class VoicePipeline {
     else if (streamLang === 'pa')      streamDefaultVoiceId = 'pa-IN-OjasNeural';
     const voiceId       = agent.voice?.voiceId   || streamDefaultVoiceId;
     const speed         = agent.voice?.speed     || 1.05; // 1.05 = slightly faster than default, sounds more conversational
-    const ttsApiKey     = userSettings.ttsKey    || process.env.ELEVENLABS_API_KEY;
+    // Select the correct default API key based on the voice provider
+    let defaultTtsKey = '';
+    if (voiceProvider === 'cartesia') defaultTtsKey = process.env.CARTESIA_API_KEY;
+    else if (voiceProvider === 'eleven-labs') defaultTtsKey = process.env.ELEVENLABS_API_KEY;
+    const ttsApiKey     = userSettings.ttsKey || defaultTtsKey;
 
     const fastFirstChunkMode       = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
     // Fast-first-chunk: fire TTS early so the user hears SOMETHING quickly.

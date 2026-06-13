@@ -571,7 +571,19 @@ function buildSessionOnVADEvent(session) {
  * extractAgentKeywords() below — instead of being hardcoded here.
  */
 const UNIVERSAL_HINGLISH_SEED = [
+  // Universal digital/business terms every Indian user says
   'website', 'app', 'call', 'email', 'phone', 'service', 'business',
+  // Banking-specific Hinglish
+  'account', 'bank', 'loan', 'saving', 'current', 'net banking', 'UPI',
+  'IFSC', 'balance', 'transfer', 'deposit', 'withdraw', 'ATM', 'card',
+  'debit', 'credit', 'interest', 'EMI', 'KYC', 'passbook', 'statement',
+  'cheque', 'NEFT', 'RTGS', 'IMPS', 'OTP', 'PIN', 'password', 'mobile',
+  // Common English words in Hinglish conversations
+  'problem', 'issue', 'help', 'support', 'status', 'update', 'check',
+  'form', 'document', 'ID', 'proof', 'number', 'detail', 'information',
+  'online', 'offline', 'submit', 'apply', 'register', 'login', 'link',
+  'branch', 'manager', 'officer', 'complaint', 'request', 'cancel',
+  'block', 'close', 'open', 'start', 'stop', 'change', 'update', 'add',
 ];
 
 /**
@@ -1114,13 +1126,13 @@ async function handleInit(session, message) {
       if (agent.firstMessage) {
         const greetingTargetScript = voicePipeline._targetScript(lang, voiceId);
         const humanizedGreeting = voicePipeline.humanizeText(agent.firstMessage, lang, greetingTargetScript);
-        ttsService.textToSpeech({ text: humanizedGreeting, voiceId, speed, provider }).catch(() => {});
+        await ttsService.textToSpeech({ text: humanizedGreeting, voiceId, speed, provider }).catch(() => {});
       }
       // Warm each filler at BOTH the lookup speed (for the instant filler) and
       // normal speed (for backchannels/tool-check phrases).
       for (const phrase of pipelineFillers) {
-        ttsService.textToSpeech({ text: phrase, voiceId, speed: fillerSpeed, provider }).catch(() => {});
-        ttsService.textToSpeech({ text: phrase, voiceId, speed, provider }).catch(() => {});
+        await ttsService.textToSpeech({ text: phrase, voiceId, speed: fillerSpeed, provider }).catch(() => {});
+        await ttsService.textToSpeech({ text: phrase, voiceId, speed, provider }).catch(() => {});
       }
     } catch (_) { /* swallow — pre-warm is best-effort */ }
   })();
@@ -1478,6 +1490,7 @@ async function processTranscript(session, transcript) {
 
     const generationId = uuidv4();
     session.currentGenerationId = generationId;
+    session.mainPipelineResponded = false;
 
     // Send transcript to client
     safeSend(session.ws, {
@@ -1492,15 +1505,24 @@ async function processTranscript(session, transcript) {
       const backchannel = voicePipeline.getBackchannel(transcript);
       if (backchannel) {
         console.log(`[Backchannel] Sending (async): ${backchannel}`);
+        let defaultTtsKey = '';
+        if (session.agent.voice?.provider === 'cartesia') defaultTtsKey = process.env.CARTESIA_API_KEY;
+        else if (session.agent.voice?.provider === 'eleven-labs') defaultTtsKey = process.env.ELEVENLABS_API_KEY;
+        const apiKeyToUse = session.userSettings.ttsKey || defaultTtsKey;
+
         ttsService.textToSpeech({
           text: backchannel,
           voiceId: session.agent.voice?.voiceId,
           speed: 1.2,
-          apiKey: session.userSettings.ttsKey || process.env.ELEVENLABS_API_KEY,
+          apiKey: apiKeyToUse,
           provider: session.agent.voice?.provider || 'edge-tts',
         }).then(audio => {
           if (audio && session.currentGenerationId === generationId) {
-            sendAudioChunkOnly(session, audio);
+            if (!session.mainPipelineResponded) {
+              sendAudioChunkOnly(session, audio);
+            } else {
+              console.log(`[Backchannel] Dropped "${backchannel}" because main pipeline already started streaming.`);
+            }
           }
         }).catch(e => console.error('[Backchannel TTS Error]', e.message));
       }
@@ -1748,6 +1770,7 @@ async function processTranscript(session, transcript) {
 
         if (!session.latency.firstTextChunkAt) {
           session.latency.firstTextChunkAt = Date.now();
+          session.mainPipelineResponded = true;
           console.log(`[⏱️ LATENCY] Pipeline→FirstText: ${session.latency.firstTextChunkAt - session.latency.llmStartedAt}ms | Total STT→Text: ${session.latency.firstTextChunkAt - session.latency.turnStartedAt}ms`);
           emitLatencyMetrics(session, 'first_text_chunk');
         }
@@ -1988,7 +2011,6 @@ async function handleEndSession(session, reason = 'user_hangup') {
   const duration = Math.round((endTime - new Date(session.startTime)) / 1000);
 
   if (session.callLogId) {
-    await flushCallLogWriteQueue(session);
     const updateData = {
       status: 'completed',
       endTime,

@@ -294,9 +294,15 @@ class VoicePipeline {
   _targetScript(lang = 'en', voiceId = '') {
     // hi-Latn and English variants always want Roman (Latin) output
     if (lang === 'hi-Latn' || lang === 'en' || lang === 'en-IN') return 'latin';
-    // For pure Hindi (lang='hi'), multi, and regional languages:
-    // return the TTS voice's native script so no unnecessary transliteration happens.
-    // e.g. hi-IN-SwaraNeural → 'deva', en-IN-NeerjaNeural → 'latin'
+    
+    // If the language is pure Hindi (lang='hi') or multi:
+    // Modern multilingual TTS (ElevenLabs, Cartesia) don't use 'Neural' in their IDs.
+    // They support native Devnagari flawlessly, so return 'deva' to prevent transliteration.
+    if (voiceId && !voiceId.includes('Neural')) {
+      return 'deva';
+    }
+
+    // For Edge TTS, fall back to deriving script from locale prefix (hi-IN -> deva, en-IN -> latin)
     return this._voiceNativeScript(voiceId);
   }
 
@@ -520,8 +526,8 @@ class VoicePipeline {
     ];
 
     // Determine which LLM to use
-    const llmProvider = agent.llm?.provider || 'groq';
-    const llmModel = agent.llm?.model || 'llama-3.1-8b-instant';
+    const llmProvider = agent.llm?.provider || 'gemini';
+    const llmModel = agent.llm?.model || 'gemini-2.0-flash';
     const voiceProvider = agent.voice?.provider || 'edge-tts';
     const apiKey = userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY;
 
@@ -727,7 +733,7 @@ class VoicePipeline {
     ];
 
     const llmProvider   = agent.llm?.provider   || 'gemini';
-    const llmModel      = agent.llm?.model       || 'llama-3.1-8b-instant';
+    const llmModel      = agent.llm?.model       || 'gemini-2.0-flash';
     // Default to edge-tts (free, no API key needed).
     // Cartesia is only used when the agent explicitly sets voice.provider = 'cartesia'.
     // Never auto-select Cartesia from env alone — an invalid/expired key causes every
@@ -842,80 +848,96 @@ class VoicePipeline {
           yield 'Sorry, my external intelligence server is offline.';
         }
       })();
-    } else if (llmProvider === 'gemini' && geminiService.isAvailable(userSettings.geminiKey)) {
-      // ─── Direct Gemini streaming ─────────────────────────────────────
-      tokenStream = geminiService.generateStreamResponse({
-        messages,
-        model: llmModel || 'gemini-2.0-flash',
-        temperature: agent.temperature || 0.7,
-        apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
-      });
     } else {
-      // ─── Groq streaming with REAL model rotation ──────────────────────
-      // BUG FIX: generateStreamResponse is a lazy async generator — building
-      // it never throws, so the old `try { gen() } catch` loop ALWAYS used
-      // the first model and never rotated. The actual request (and its
-      // timeout/429) only happens when we pull the first chunk. So we prime
-      // each candidate here: pull the first token inside try/catch and, on
-      // failure, rotate to the next model — which has a SEPARATE Groq token
-      // bucket, the whole point of the fallback chain when TPM is exhausted.
-      const candidateModels = this.getGroqFallbackModels(llmModel);
+      // ─── Gemini & Groq Unified Streaming with Fallbacks ───────────────────
       const apiKey = userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY;
-      const temperature = agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4);
+      let temperature = agent.advanced?.temperature ?? agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4);
+      if (agent.advanced?.strictGrounding !== false) {
+        temperature = Math.min(temperature, 0.1);
+      }
       const self = this;
 
       tokenStream = (async function* () {
         let lastErr = null;
-        for (const modelCandidate of candidateModels) {
-          if (pipelineAbort.signal.aborted) return;
-          const inner = groqService.generateStreamResponse({
-            messages,
-            model: modelCandidate,
-            temperature,
-            apiKey,
-            abortSignal: pipelineAbort.signal,
-          });
+
+        // 1. Try Gemini first if it's the provider
+        if (llmProvider === 'gemini' && geminiService.isAvailable(userSettings.geminiKey)) {
           try {
-            // Prime: pull the first chunk. This forces the HTTP request to
-            // actually start and surfaces a throttle/timeout HERE so we can
-            // rotate. If it succeeds, yield it and stream the rest.
-            const first = await inner.next();
-            if (first.done) {
-              // Empty stream — treat as a soft failure, try next model.
-              lastErr = new Error(`${modelCandidate}_empty_stream`);
-              continue;
+            const gemStream = geminiService.generateStreamResponse({
+              messages,
+              model: llmModel || 'gemini-2.0-flash',
+              temperature,
+              apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
+            });
+            // Prime stream to catch 429 quota errors immediately
+            const first = await gemStream.next();
+            if (!first.done) {
+              if (first.value) yield first.value;
+              for await (const tok of gemStream) {
+                if (pipelineAbort.signal.aborted) return;
+                yield tok;
+              }
+              return; // Clean exit
             }
-            if (first.value) yield first.value;
-            for await (const tok of inner) {
-              if (pipelineAbort.signal.aborted) return;
-              yield tok;
-            }
-            return; // stream finished cleanly
-          } catch (err) {
-            lastErr = err;
-            console.warn(`[LLM Stream Fallback] ${modelCandidate} failed -> ${err.message} — rotating model`);
-            // try next candidate (fresh token bucket)
+          } catch (gemErr) {
+            console.warn(`[LLM Stream] Gemini failed (${gemErr.message}). Falling back to Groq...`);
+            lastErr = gemErr;
           }
         }
 
-        // ─── All Groq models exhausted — try Gemini stream if enabled ────
-        if (geminiService.isAvailable()) {
+        // 2. Try Groq (either as primary, or fallback if Gemini failed)
+        if (llmProvider === 'groq' || lastErr) {
+          const candidateModels = self.getGroqFallbackModels(llmProvider === 'groq' ? llmModel : 'llama-3.1-8b-instant');
+          const groqKey = userSettings.groqKey || process.env.GROQ_API_KEY;
+          
+          for (const modelCandidate of candidateModels) {
+            if (pipelineAbort.signal.aborted) return;
+            const inner = groqService.generateStreamResponse({
+              messages,
+              model: modelCandidate,
+              temperature,
+              apiKey: groqKey,
+              abortSignal: pipelineAbort.signal,
+            });
+            try {
+              const first = await inner.next();
+              if (first.done) {
+                lastErr = new Error(`${modelCandidate}_empty_stream`);
+                continue;
+              }
+              if (first.value) yield first.value;
+              for await (const tok of inner) {
+                if (pipelineAbort.signal.aborted) return;
+                yield tok;
+              }
+              return;
+            } catch (err) {
+              lastErr = err;
+              console.warn(`[LLM Stream Fallback] Groq ${modelCandidate} failed -> ${err.message} — rotating`);
+            }
+          }
+        }
+
+        // 3. If primary was Groq and all Groq models failed, try Gemini as last resort
+        if (llmProvider === 'groq' && lastErr && geminiService.isAvailable(userSettings.geminiKey)) {
           console.log('[LLM Stream Fallback] All Groq models failed. Trying Gemini stream...');
           try {
-            const gem = geminiService.generateStreamResponse({ messages, temperature });
-            for await (const tok of gem) {
-              if (pipelineAbort.signal.aborted) return;
-              yield tok;
+            const gem = geminiService.generateStreamResponse({ messages, temperature, apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY });
+            const first = await gem.next();
+            if (!first.done) {
+              if (first.value) yield first.value;
+              for await (const tok of gem) {
+                if (pipelineAbort.signal.aborted) return;
+                yield tok;
+              }
+              return;
             }
-            return;
           } catch (gemErr) {
             console.error('[LLM Stream Fallback] Gemini stream failed:', gemErr.message);
             lastErr = gemErr;
           }
         }
 
-        // Nothing worked — throw so the drainer's catch fires the non-stream
-        // last-resort (cache → template → apology).
         throw lastErr || new Error('all_llm_stream_models_failed');
       })();
     }
@@ -930,12 +952,26 @@ class VoicePipeline {
 
     /** Helper: kick off TTS without blocking; returns a Promise<{text,audio}> */
     const emotionProsody = this.getEmotionProsody(currentEmotion);
-    const fireTTS = (sentenceText) => {
+    
+    // Concurrency limiter to prevent blowing up ElevenLabs/Edge free tier limits
+    let activeTTSCount = 0;
+    const ttsWaitQueue = [];
+    const MAX_CONCURRENT_TTS = 2; // Very safe limit for free tiers
+
+    const runNextTTS = () => {
+      if (ttsWaitQueue.length === 0 || activeTTSCount >= MAX_CONCURRENT_TTS) return;
+      activeTTSCount++;
+      const { text, resolve, reject } = ttsWaitQueue.shift();
+      doFireTTS(text).then(resolve).catch(reject).finally(() => {
+        activeTTSCount--;
+        runNextTTS();
+      });
+    };
+
+    const doFireTTS = (sentenceText) => {
       const lang = agent.language || 'en';
       const targetScript = this._targetScript(lang, voiceId);
       const humanized = this.humanizeText(sentenceText, lang, targetScript);
-      // Apply emotion prosody on top of the agent's configured speed +
-      // per-sentence pitch variation. Clamp to safe Edge TTS bounds.
       const dynamicPitch = this.getDynamicPitch(humanized);
       const adjustedSpeed = Math.max(0.7, Math.min(1.6, speed + emotionProsody.speedDelta));
       const adjustedPitch = Math.max(-3, Math.min(3, dynamicPitch + emotionProsody.pitchDelta));
@@ -945,6 +981,13 @@ class VoicePipeline {
           console.error(`[TTS Concurrent] Failed: "${humanized.substring(0, 40)}"`, err.message);
           return { text: humanized, audio: Buffer.alloc(0) };
         });
+    };
+
+    const fireTTS = (sentenceText) => {
+      return new Promise((resolve, reject) => {
+        ttsWaitQueue.push({ text: sentenceText, resolve, reject });
+        runNextTTS();
+      });
     };
 
     const ttsQueue     = [];   // ordered promise array
@@ -1654,6 +1697,12 @@ ${customFieldDescriptions}
 
 ## YOUR ROLE & PERSONA:
 ${resolvedSystemPrompt}
+
+## CONVERSATIONAL STYLE (CRITICAL):
+- Speak naturally like a human on a phone call. Use simple, everyday language.
+- DO NOT use any Markdown formatting. NO asterisks (*), NO bold text (**), NO hashtags (#), and NO bullet points (-).
+- Keep your responses concise and to the point. Avoid long essays.
+- Do not sound robotic or use overly formal AI-like phrases (e.g. "I am an AI", "As an AI language model").
 `;
 
     if (agent.transferToAgentId) {
@@ -1689,10 +1738,12 @@ ${ragContext}`;
 - You have ZERO general knowledge. You know NOTHING beyond what is written above.
 - If the user asks something NOT covered in your role${hasKb ? ' or knowledge base' : ''}, you MUST say ${refusalLang}. Then offer to take a message or connect to a human.
 - NEVER guess, assume, or use outside/general/world knowledge — even if you "know" the answer. You are a phone agent, not a search engine.
-- NEVER invent: prices, dates, names, policies, availability, phone numbers, addresses, timings, or ANY facts not explicitly given to you.
+- NEVER invent: prices, dates, names, policies, availability, phone numbers, addresses, locations, timings, or ANY facts not explicitly given to you.
+- NEVER assume you have the user's name, phone number, or details unless they explicitly state them. If the user says "Yes, you can take my number", you MUST reply asking them to actually speak the digits out loud.
+- If the user asks for specific locations, branches, offices, or entities that are NOT in your Knowledge Base, you MUST use your standard refusal: ${refusalLang}. Do NOT guess or list random locations.
 - Do NOT volunteer extra information the user didn't ask for.
 - Do NOT ask for information you don't need to fulfill your defined role.
-- Stay strictly on-topic. If asked something off-topic (weather, cricket, politics, jokes), politely say: "Main sirf ${agent.name || 'is service'} ke baare mein baat kar sakti hoon." and redirect.
+- Stay strictly on-topic. If asked something completely off-topic, politely say: "Main sirf ${agent.name || 'is service'} ke baare mein baat kar sakti hoon." and redirect.
 - If user insists on off-topic info, DO NOT give in. Repeat your refusal politely but firmly.`;
     }
 

@@ -39,11 +39,11 @@ const agentSchema = new mongoose.Schema({
     provider: {
       type: String,
       enum: ['groq', 'openai', 'gemini'],
-      default: 'groq',
+      default: 'gemini',
     },
     model: {
       type: String,
-      default: 'llama-3.1-8b-instant', // Groq free model
+      default: 'gemini-2.0-flash', // Gemini fast model
     },
   },
   temperature: { type: Number, default: 0.7, min: 0, max: 1 },

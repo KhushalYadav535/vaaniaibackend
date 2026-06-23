@@ -38,12 +38,12 @@ const agentSchema = new mongoose.Schema({
   llm: {
     provider: {
       type: String,
-      enum: ['groq', 'openai', 'gemini'],
+      enum: ['groq', 'openai', 'gemini', 'cerebras'],
       default: 'gemini',
     },
     model: {
       type: String,
-      default: 'gemini-2.0-flash', // Gemini fast model
+      default: 'gemini-3.1-flash-lite', // Gemini budget fast model
     },
   },
   temperature: { type: Number, default: 0.7, min: 0, max: 1 },
@@ -152,7 +152,7 @@ const agentSchema = new mongoose.Schema({
   // Supported events: 'call.started', 'transcript.segment', 'sentiment.shift',
   //                   'tool.called', 'transferred', 'call.ended'.
   serverEvents: {
-    url:    { type: String, default: '' },
+    url: { type: String, default: '' },
     secret: { type: String, default: '' },
     events: [{ type: String }], // subset of supported events; empty = all
   },
@@ -161,10 +161,10 @@ const agentSchema = new mongoose.Schema({
   // destination agent inherits the conversation summary + last N messages
   // so it can continue without asking the customer to repeat themselves.
   squad: {
-    enabled:  { type: Boolean, default: false },
-    members:  [{
-      agentId:    { type: mongoose.Schema.Types.ObjectId, ref: 'Agent' },
-      role:       { type: String, default: '' }, // e.g. 'billing', 'support'
+    enabled: { type: Boolean, default: false },
+    members: [{
+      agentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Agent' },
+      role: { type: String, default: '' }, // e.g. 'billing', 'support'
       conditions: { type: mongoose.Schema.Types.Mixed }, // free-form routing rules for the LLM
     }],
     handoffPrompt: {
@@ -177,11 +177,11 @@ const agentSchema = new mongoose.Schema({
   // analysis (voicePipeline.analyzeCall) to produce typed JSON instead
   // of the hardcoded {name, email, phone, company, date} shape.
   extractionSchema: [{
-    name:        { type: String, required: true },        // e.g. 'productInterest'
+    name: { type: String, required: true },        // e.g. 'productInterest'
     description: { type: String, default: '' },           // hints to the LLM
-    type:        { type: String, enum: ['string', 'number', 'boolean', 'array', 'enum'], default: 'string' },
-    enumValues:  [{ type: String }],                      // when type==='enum'
-    required:    { type: Boolean, default: false },
+    type: { type: String, enum: ['string', 'number', 'boolean', 'array', 'enum'], default: 'string' },
+    enumValues: [{ type: String }],                      // when type==='enum'
+    required: { type: Boolean, default: false },
   }],
 
   // Function calling tools mapping

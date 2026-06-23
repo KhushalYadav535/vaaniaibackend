@@ -1,7 +1,13 @@
 /**
  * Main Voice Pipeline Orchestrator
- * Flow: Audio Input → STT (Deepgram) → LLM (Groq) → TTS (Edge TTS) → Audio Output
+ * Flow: Audio Input → STT (Deepgram) → LLM (Cerebras/Groq/Gemini) → TTS → Audio Output
+ *
+ * LLM Priority Chain:
+ *   1. Cerebras  — World's fastest (2000+ tok/sec, 1M tokens/day FREE)
+ *   2. Groq      — Ultra-fast LPU inference (fallback)
+ *   3. Gemini    — Google free tier (last resort)
  */
+const cerebrasService = require('./cerebrasService');
 const groqService = require('./groqService');
 const geminiService = require('./geminiService');
 const ttsService = require('./ttsService');
@@ -9,6 +15,44 @@ const deepgramService = require('./deepgramService');
 const toolExecutor = require('./toolExecutor');
 const llmFallback = require('./llmFallback');
 const KnowledgeBase = require('../models/KnowledgeBase');
+
+/**
+ * Edge TTS voices that support <mstts:express-as style="..."> emotion
+ * styling, with their supported style list. Sending a style to a voice
+ * NOT in this map makes Edge reject the SSML, so we gate strictly here.
+ *
+ * Indic voices (hi-IN, ta-IN, ...) do NOT support express-as — they're
+ * intentionally absent so an angry Hindi caller gets prosody-only
+ * adjustment (rate/pitch) while a US/English caller gets genuine
+ * empathetic/cheerful styling. Source: Azure Speech voice gallery.
+ */
+const EDGE_VOICE_STYLES = {
+  // NOTE: 'empathetic' is supported ONLY by Aria among these. Jenny/Guy/Davis
+  // fall back to 'friendly' for empathy-needing emotions (see EMOTION_STYLE_PREF).
+  'en-US-AriaNeural': ['angry', 'chat', 'cheerful', 'customerservice', 'empathetic', 'excited', 'friendly', 'hopeful', 'narration-professional', 'newscast-casual', 'newscast-formal', 'sad', 'shouting', 'terrified', 'unfriendly', 'whispering'],
+  'en-US-JennyNeural': ['assistant', 'chat', 'customerservice', 'newscast', 'angry', 'cheerful', 'sad', 'excited', 'friendly', 'terrified', 'shouting', 'unfriendly', 'whispering', 'hopeful'],
+  'en-US-GuyNeural': ['newscast', 'angry', 'cheerful', 'sad', 'excited', 'friendly', 'terrified', 'shouting', 'unfriendly', 'whispering', 'hopeful'],
+  'en-US-DavisNeural': ['chat', 'angry', 'cheerful', 'excited', 'friendly', 'hopeful', 'sad', 'shouting', 'terrified', 'unfriendly', 'whispering'],
+};
+
+/**
+ * Detected user emotion → ordered list of DESIRED agent voice styles.
+ * We try them in order and pick the first one the chosen voice supports
+ * (with a graceful "no style" fallback). The agent's style is the
+ * RESPONSE to the user's emotion, not a mirror of it:
+ *   - angry/frustrated user → empathetic/friendly agent (de-escalate)
+ *   - sad user             → empathetic/hopeful agent (reassure)
+ *   - happy user           → cheerful/friendly agent (match energy)
+ *   - urgent user          → friendly agent (warm but efficient)
+ */
+const EMOTION_STYLE_PREF = {
+  angry: ['empathetic', 'friendly'],
+  frustrated: ['empathetic', 'friendly'],
+  sad: ['empathetic', 'hopeful', 'sad'],
+  happy: ['cheerful', 'friendly', 'excited'],
+  urgent: ['friendly'],
+  neutral: [],
+};
 
 class VoicePipeline {
   constructor() {
@@ -35,13 +79,13 @@ class VoicePipeline {
 
     // Language-specific filler words for natural turn-taking
     this._fillersByLang = {
-      'en':      ['Hmm...', 'Let me see...', 'Umm...', 'So...', 'Well...', 'Right...', 'Okay so...'],
+      'en': ['Hmm...', 'Let me see...', 'Umm...', 'So...', 'Well...', 'Right...', 'Okay so...'],
       // hi = pure Devnagari Hindi → fillers must be Devnagari so they cache-hit
       // with the same voice+script used for main responses
-      'hi':      ['हम्म...', 'एक सेकंड...', 'अच्छा...', 'देखते हैं...', 'हाँ...', 'जी...', 'ठीक है...'],
+      'hi': ['हम्म...', 'एक सेकंड...', 'अच्छा...', 'देखते हैं...', 'हाँ...', 'जी...', 'ठीक है...'],
       'hi-Latn': ['Hmm...', 'Ek sec...', 'Acchaa...', 'Toh basically...', 'Haan...', 'Dekho...'],
-      'multi':   ['Hmm...', 'Accha...', 'Let me check...', 'Toh...', 'Okay...', 'Haan...'],
-      'en-IN':   ['Hmm...', 'One second...', 'Okay so...', 'Let me check...', 'Right...'],
+      'multi': ['Hmm...', 'Accha...', 'Let me check...', 'Toh...', 'Okay...', 'Haan...'],
+      'en-IN': ['Hmm...', 'One second...', 'Okay so...', 'Let me check...', 'Right...'],
     };
   }
 
@@ -67,82 +111,82 @@ class VoicePipeline {
     // spelling — the way a real person would type them on WhatsApp.
     const wordMap = {
       // Greetings
-      'नमस्ते':'namaste', 'नमस्कार':'namaskar', 'धन्यवाद':'dhanyavaad',
-      'शुक्रिया':'shukriya', 'माफ़':'maaf', 'माफ':'maaf', 'कृपया':'kripya',
-      'स्वागत':'swaagat', 'अलविदा':'alvida',
+      'नमस्ते': 'namaste', 'नमस्कार': 'namaskar', 'धन्यवाद': 'dhanyavaad',
+      'शुक्रिया': 'shukriya', 'माफ़': 'maaf', 'माफ': 'maaf', 'कृपया': 'kripya',
+      'स्वागत': 'swaagat', 'अलविदा': 'alvida',
       // Pronouns
-      'मैं':'main', 'हम':'hum', 'आप':'aap', 'तुम':'tum', 'तू':'tu',
-      'वो':'wo', 'वह':'woh', 'यह':'yeh', 'ये':'ye', 'वे':'ve',
+      'मैं': 'main', 'हम': 'hum', 'आप': 'aap', 'तुम': 'tum', 'तू': 'tu',
+      'वो': 'wo', 'वह': 'woh', 'यह': 'yeh', 'ये': 'ye', 'वे': 've',
       // Possessives
-      'मेरा':'mera', 'मेरी':'meri', 'मेरे':'mere',
-      'आपका':'aapka', 'आपकी':'aapki', 'आपके':'aapke',
-      'आपको':'aapko', 'आपने':'aapne', 'आपसे':'aapse',
-      'हमारा':'hamara', 'हमारी':'hamari', 'हमारे':'hamare',
-      'उसका':'uska', 'उसकी':'uski', 'उसके':'uske',
-      'इसका':'iska', 'इसकी':'iski', 'इसके':'iske',
-      'उनका':'unka', 'उनकी':'unki', 'उनके':'unke',
-      'किसी':'kisi', 'किसका':'kiska', 'किसको':'kisko', 'किसने':'kisne',
+      'मेरा': 'mera', 'मेरी': 'meri', 'मेरे': 'mere',
+      'आपका': 'aapka', 'आपकी': 'aapki', 'आपके': 'aapke',
+      'आपको': 'aapko', 'आपने': 'aapne', 'आपसे': 'aapse',
+      'हमारा': 'hamara', 'हमारी': 'hamari', 'हमारे': 'hamare',
+      'उसका': 'uska', 'उसकी': 'uski', 'उसके': 'uske',
+      'इसका': 'iska', 'इसकी': 'iski', 'इसके': 'iske',
+      'उनका': 'unka', 'उनकी': 'unki', 'उनके': 'unke',
+      'किसी': 'kisi', 'किसका': 'kiska', 'किसको': 'kisko', 'किसने': 'kisne',
       // Postpositions / particles
-      'में':'mein', 'से':'se', 'को':'ko', 'का':'ka', 'की':'ki', 'के':'ke',
-      'पर':'par', 'और':'aur', 'या':'ya', 'तो':'to', 'भी':'bhi', 'ही':'hi',
-      'तक':'tak', 'साथ':'saath', 'बाद':'baad', 'पहले':'pehle',
-      'लिए':'liye', 'बारे':'baare', 'बीच':'beech', 'ऊपर':'upar', 'नीचे':'neeche',
+      'में': 'mein', 'से': 'se', 'को': 'ko', 'का': 'ka', 'की': 'ki', 'के': 'ke',
+      'पर': 'par', 'और': 'aur', 'या': 'ya', 'तो': 'to', 'भी': 'bhi', 'ही': 'hi',
+      'तक': 'tak', 'साथ': 'saath', 'बाद': 'baad', 'पहले': 'pehle',
+      'लिए': 'liye', 'बारे': 'baare', 'बीच': 'beech', 'ऊपर': 'upar', 'नीचे': 'neeche',
       // Verbs
-      'है':'hai', 'हैं':'hain', 'हो':'ho', 'हूँ':'hoon', 'था':'tha', 'थी':'thi', 'थे':'the',
-      'कर':'kar', 'करें':'karein', 'करो':'karo', 'करूँ':'karoon',
-      'करती':'karti', 'करता':'karta', 'करते':'karte', 'करना':'karna', 'करके':'karke',
-      'सकती':'sakti', 'सकता':'sakta', 'सकते':'sakte', 'सकूँ':'sakoon',
-      'रही':'rahi', 'रहा':'raha', 'रहे':'rahe', 'रहेंगे':'rahenge', 'रहेगा':'rahega', 'रहेगी':'rahegi',
-      'बताइए':'bataiye', 'बताइये':'bataiye', 'बताएं':'batayein', 'बताओ':'batao', 'बता':'bata',
-      'बोल':'bol', 'बोलिए':'boliye', 'बोलिये':'boliye', 'बोलो':'bolo',
-      'दीजिए':'dijiye', 'दीजिये':'dijiye', 'दें':'dein', 'दो':'do', 'दूँ':'doon',
-      'कीजिए':'kijiye', 'कीजिये':'kijiye',
-      'लेती':'leti', 'लेता':'leta', 'लेते':'lete',
-      'देती':'deti', 'देता':'deta', 'देते':'dete',
-      'चाहिए':'chahiye', 'चाहिये':'chahiye', 'चाहते':'chahte', 'चाहती':'chahti',
-      'चाहेंगे':'chahenge', 'चाहेंगी':'chahengi',
-      'किया':'kiya', 'दिया':'diya', 'लिया':'liya', 'गया':'gaya', 'गई':'gayi', 'गए':'gaye',
-      'आई':'aayi', 'आया':'aaya', 'आए':'aaye', 'आता':'aata', 'आती':'aati',
-      'मिला':'mila', 'मिली':'mili', 'मिलेगा':'milega', 'मिलेगी':'milegi',
-      'लगता':'lagta', 'लगती':'lagti',
-      'समझ':'samajh', 'समझा':'samjha', 'समझे':'samjhe', 'समझें':'samjhein',
-      'चुनी':'chuni', 'चुना':'chuna', 'चुने':'chune',
+      'है': 'hai', 'हैं': 'hain', 'हो': 'ho', 'हूँ': 'hoon', 'था': 'tha', 'थी': 'thi', 'थे': 'the',
+      'कर': 'kar', 'करें': 'karein', 'करो': 'karo', 'करूँ': 'karoon',
+      'करती': 'karti', 'करता': 'karta', 'करते': 'karte', 'करना': 'karna', 'करके': 'karke',
+      'सकती': 'sakti', 'सकता': 'sakta', 'सकते': 'sakte', 'सकूँ': 'sakoon',
+      'रही': 'rahi', 'रहा': 'raha', 'रहे': 'rahe', 'रहेंगे': 'rahenge', 'रहेगा': 'rahega', 'रहेगी': 'rahegi',
+      'बताइए': 'bataiye', 'बताइये': 'bataiye', 'बताएं': 'batayein', 'बताओ': 'batao', 'बता': 'bata',
+      'बोल': 'bol', 'बोलिए': 'boliye', 'बोलिये': 'boliye', 'बोलो': 'bolo',
+      'दीजिए': 'dijiye', 'दीजिये': 'dijiye', 'दें': 'dein', 'दो': 'do', 'दूँ': 'doon',
+      'कीजिए': 'kijiye', 'कीजिये': 'kijiye',
+      'लेती': 'leti', 'लेता': 'leta', 'लेते': 'lete',
+      'देती': 'deti', 'देता': 'deta', 'देते': 'dete',
+      'चाहिए': 'chahiye', 'चाहिये': 'chahiye', 'चाहते': 'chahte', 'चाहती': 'chahti',
+      'चाहेंगे': 'chahenge', 'चाहेंगी': 'chahengi',
+      'किया': 'kiya', 'दिया': 'diya', 'लिया': 'liya', 'गया': 'gaya', 'गई': 'gayi', 'गए': 'gaye',
+      'आई': 'aayi', 'आया': 'aaya', 'आए': 'aaye', 'आता': 'aata', 'आती': 'aati',
+      'मिला': 'mila', 'मिली': 'mili', 'मिलेगा': 'milega', 'मिलेगी': 'milegi',
+      'लगता': 'lagta', 'लगती': 'lagti',
+      'समझ': 'samajh', 'समझा': 'samjha', 'समझे': 'samjhe', 'समझें': 'samjhein',
+      'चुनी': 'chuni', 'चुना': 'chuna', 'चुने': 'chune',
       // Negation / fillers
-      'नहीं':'nahi', 'नही':'nahi', 'मत':'mat', 'ना':'na', 'जी':'ji', 'हाँ':'haan', 'हां':'haan',
+      'नहीं': 'nahi', 'नही': 'nahi', 'मत': 'mat', 'ना': 'na', 'जी': 'ji', 'हाँ': 'haan', 'हां': 'haan',
       // Adjectives
-      'अच्छा':'achha', 'अच्छी':'achhi', 'अच्छे':'achhe',
-      'ठीक':'theek', 'सही':'sahi', 'गलत':'galat',
-      'बहुत':'bahut', 'ज़्यादा':'zyada', 'ज्यादा':'zyada', 'कम':'kam',
-      'बड़ा':'bada', 'बड़ी':'badi', 'बड़े':'bade',
-      'छोटा':'chhota', 'छोटी':'chhoti', 'छोटे':'chhote',
-      'पूरा':'poora', 'पूरी':'poori', 'पूरे':'poore',
-      'कुछ':'kuchh', 'कोई':'koi', 'दूसरा':'doosra', 'दूसरी':'doosri', 'दूसरे':'doosre',
-      'जल्द':'jald', 'जल्दी':'jaldi', 'अभी':'abhi', 'तुरंत':'turant',
-      'शुभ':'shubh', 'आगे':'aage',
+      'अच्छा': 'achha', 'अच्छी': 'achhi', 'अच्छे': 'achhe',
+      'ठीक': 'theek', 'सही': 'sahi', 'गलत': 'galat',
+      'बहुत': 'bahut', 'ज़्यादा': 'zyada', 'ज्यादा': 'zyada', 'कम': 'kam',
+      'बड़ा': 'bada', 'बड़ी': 'badi', 'बड़े': 'bade',
+      'छोटा': 'chhota', 'छोटी': 'chhoti', 'छोटे': 'chhote',
+      'पूरा': 'poora', 'पूरी': 'poori', 'पूरे': 'poore',
+      'कुछ': 'kuchh', 'कोई': 'koi', 'दूसरा': 'doosra', 'दूसरी': 'doosri', 'दूसरे': 'doosre',
+      'जल्द': 'jald', 'जल्दी': 'jaldi', 'अभी': 'abhi', 'तुरंत': 'turant',
+      'शुभ': 'shubh', 'आगे': 'aage',
       // Question words
-      'क्या':'kya', 'कौन':'kaun', 'कहाँ':'kahan', 'कब':'kab',
-      'कितना':'kitna', 'कितनी':'kitni', 'कैसे':'kaise', 'कैसा':'kaisa', 'कैसी':'kaisi', 'क्यों':'kyon',
+      'क्या': 'kya', 'कौन': 'kaun', 'कहाँ': 'kahan', 'कब': 'kab',
+      'कितना': 'kitna', 'कितनी': 'kitni', 'कैसे': 'kaise', 'कैसा': 'kaisa', 'कैसी': 'kaisi', 'क्यों': 'kyon',
       // Connectors
-      'लेकिन':'lekin', 'इसलिए':'isliye', 'क्योंकि':'kyonki', 'अगर':'agar',
-      'फिर':'phir', 'जिसके':'jiske', 'अपना':'apna', 'अपनी':'apni', 'अपने':'apne',
+      'लेकिन': 'lekin', 'इसलिए': 'isliye', 'क्योंकि': 'kyonki', 'अगर': 'agar',
+      'फिर': 'phir', 'जिसके': 'jiske', 'अपना': 'apna', 'अपनी': 'apni', 'अपने': 'apne',
       // Banking / support
-      'नंबर':'number', 'नम्बर':'number', 'फोन':'phone', 'मोबाइल':'mobile',
-      'खाता':'khaata', 'बैंक':'bank', 'लोन':'loan', 'अकाउंट':'account',
-      'पैसे':'paise', 'पैसा':'paisa', 'रुपये':'rupaye', 'लाख':'laakh', 'हज़ार':'hazaar', 'हजार':'hazaar',
-      'निकालने':'nikalne', 'दर्ज':'darj', 'जमा':'jama',
-      'ब्याज':'byaaj', 'किस्त':'kist', 'अवधि':'avadhi',
-      'अधिकारी':'adhikari', 'सहायता':'sahayata', 'मदद':'madad',
-      'समस्या':'samasya', 'शिकायत':'shikayat', 'सवाल':'sawaal',
-      'जानकारी':'jaankari', 'विवरण':'vivran', 'प्रकार':'prakaar',
-      'प्रक्रिया':'prakriya', 'संपर्क':'sampark',
-      'काट':'kaat', 'बंद':'band', 'चालू':'chaalu', 'शुरू':'shuru',
-      'जुड़ने':'judne', 'जुड़े':'jude', 'पर्सनल':'personal', 'ईमेल':'email',
+      'नंबर': 'number', 'नम्बर': 'number', 'फोन': 'phone', 'मोबाइल': 'mobile',
+      'खाता': 'khaata', 'बैंक': 'bank', 'लोन': 'loan', 'अकाउंट': 'account',
+      'पैसे': 'paise', 'पैसा': 'paisa', 'रुपये': 'rupaye', 'लाख': 'laakh', 'हज़ार': 'hazaar', 'हजार': 'hazaar',
+      'निकालने': 'nikalne', 'दर्ज': 'darj', 'जमा': 'jama',
+      'ब्याज': 'byaaj', 'किस्त': 'kist', 'अवधि': 'avadhi',
+      'अधिकारी': 'adhikari', 'सहायता': 'sahayata', 'मदद': 'madad',
+      'समस्या': 'samasya', 'शिकायत': 'shikayat', 'सवाल': 'sawaal',
+      'जानकारी': 'jaankari', 'विवरण': 'vivran', 'प्रकार': 'prakaar',
+      'प्रक्रिया': 'prakriya', 'संपर्क': 'sampark',
+      'काट': 'kaat', 'बंद': 'band', 'चालू': 'chaalu', 'शुरू': 'shuru',
+      'जुड़ने': 'judne', 'जुड़े': 'jude', 'पर्सनल': 'personal', 'ईमेल': 'email',
       // Time
-      'आज':'aaj', 'कल':'kal', 'साल':'saal', 'महीना':'mahina', 'दिन':'din',
+      'आज': 'aaj', 'कल': 'kal', 'साल': 'saal', 'महीना': 'mahina', 'दिन': 'din',
       // Misc common
-      'यहाँ':'yahan', 'वहाँ':'wahan', 'ज़रूर':'zaroor', 'जरूर':'zaroor',
-      'बात':'baat', 'काम':'kaam', 'नाम':'naam', 'घर':'ghar',
-      'चरणों':'charnon', 'बोल':'bol',
+      'यहाँ': 'yahan', 'वहाँ': 'wahan', 'ज़रूर': 'zaroor', 'जरूर': 'zaroor',
+      'बात': 'baat', 'काम': 'kaam', 'नाम': 'naam', 'घर': 'ghar',
+      'चरणों': 'charnon', 'बोल': 'bol',
     };
 
     // First pass: replace whole Devnagari words using the dictionary.
@@ -170,28 +214,28 @@ class VoicePipeline {
   /** Transliterate a single Devnagari word (no dictionary match). */
   _transliterateWord(word) {
     const consonants = {
-      'क':'k','ख':'kh','ग':'g','घ':'gh','ङ':'ng',
-      'च':'ch','छ':'chh','ज':'j','झ':'jh','ञ':'ny',
-      'ट':'t','ठ':'th','ड':'d','ढ':'dh','ण':'n',
-      'त':'t','थ':'th','द':'d','ध':'dh','न':'n',
-      'प':'p','फ':'ph','ब':'b','भ':'bh','म':'m',
-      'य':'y','र':'r','ल':'l','व':'v','श':'sh','ष':'sh','स':'s','ह':'h',
-      'क़':'q','ख़':'kh','ग़':'gh','ज़':'z','ड़':'r','ढ़':'rh','फ़':'f','य़':'y',
+      'क': 'k', 'ख': 'kh', 'ग': 'g', 'घ': 'gh', 'ङ': 'ng',
+      'च': 'ch', 'छ': 'chh', 'ज': 'j', 'झ': 'jh', 'ञ': 'ny',
+      'ट': 't', 'ठ': 'th', 'ड': 'd', 'ढ': 'dh', 'ण': 'n',
+      'त': 't', 'थ': 'th', 'द': 'd', 'ध': 'dh', 'न': 'n',
+      'प': 'p', 'फ': 'ph', 'ब': 'b', 'भ': 'bh', 'म': 'm',
+      'य': 'y', 'र': 'r', 'ल': 'l', 'व': 'v', 'श': 'sh', 'ष': 'sh', 'स': 's', 'ह': 'h',
+      'क़': 'q', 'ख़': 'kh', 'ग़': 'gh', 'ज़': 'z', 'ड़': 'r', 'ढ़': 'rh', 'फ़': 'f', 'य़': 'y',
     };
     const vowels = {
-      'अ':'a','आ':'aa','इ':'i','ई':'i','उ':'u','ऊ':'u','ऋ':'ri',
-      'ए':'e','ऐ':'ai','ओ':'o','औ':'au','ऍ':'e','ऑ':'o',
+      'अ': 'a', 'आ': 'aa', 'इ': 'i', 'ई': 'i', 'उ': 'u', 'ऊ': 'u', 'ऋ': 'ri',
+      'ए': 'e', 'ऐ': 'ai', 'ओ': 'o', 'औ': 'au', 'ऍ': 'e', 'ऑ': 'o',
     };
     // ALL matras — ा/ी/ू are context-aware (null here, handled below)
     // ं (anusvara) is also null — handled context-aware (m before labials, n otherwise)
     const allMatras = {
-      'ा':null, 'ी':null, 'ू':null,
-      'ि':'i', 'ु':'u', 'ृ':'ri',
-      'े':'e', 'ै':'ai', 'ो':'o', 'ौ':'au',
-      'ँ':'n', 'ं':null, 'ः':'h', 'ॅ':'e', 'ॉ':'o',
+      'ा': null, 'ी': null, 'ू': null,
+      'ि': 'i', 'ु': 'u', 'ृ': 'ri',
+      'े': 'e', 'ै': 'ai', 'ो': 'o', 'ौ': 'au',
+      'ँ': 'n', 'ं': null, 'ः': 'h', 'ॅ': 'e', 'ॉ': 'o',
     };
     // Labial consonants — anusvara (ं) becomes 'm' before these
-    const labials = new Set(['प','फ','ब','भ','म','फ़']);
+    const labials = new Set(['प', 'फ', 'ब', 'भ', 'म', 'फ़']);
     const halant = '्';
 
     const isMatra = (ch) => ch && allMatras.hasOwnProperty(ch);
@@ -294,7 +338,7 @@ class VoicePipeline {
   _targetScript(lang = 'en', voiceId = '') {
     // hi-Latn and English variants always want Roman (Latin) output
     if (lang === 'hi-Latn' || lang === 'en' || lang === 'en-IN') return 'latin';
-    
+
     // If the language is pure Hindi (lang='hi') or multi:
     // Modern multilingual TTS (ElevenLabs, Cartesia) don't use 'Neural' in their IDs.
     // They support native Devnagari flawlessly, so return 'deva' to prevent transliteration.
@@ -417,8 +461,8 @@ class VoicePipeline {
    */
   getDynamicPitch(text) {
     const trimmed = (text || '').trim();
-    if (trimmed.endsWith('?'))  return 2;  // Questions: +2Hz (slightly higher)
-    if (trimmed.endsWith('!'))  return 1;  // Excitement: +1Hz
+    if (trimmed.endsWith('?')) return 2;  // Questions: +2Hz (slightly higher)
+    if (trimmed.endsWith('!')) return 1;  // Excitement: +1Hz
     // Statements: alternate between -1Hz and 0Hz to prevent metronomic monotone
     return Math.random() > 0.5 ? -1 : 0;
   }
@@ -440,11 +484,123 @@ class VoicePipeline {
     switch (userEmotion) {
       case 'angry':
       case 'frustrated': return { speedDelta: -0.05, pitchDelta: -1 }; // slow + lower = calming
-      case 'urgent':     return { speedDelta:  0.10, pitchDelta:  0 }; // faster, neutral pitch
-      case 'sad':        return { speedDelta: -0.07, pitchDelta: -1 }; // slower, softer
-      case 'happy':      return { speedDelta:  0.03, pitchDelta:  1 }; // slightly upbeat
-      default:           return { speedDelta:  0,    pitchDelta:  0 };
+      case 'urgent': return { speedDelta: 0.10, pitchDelta: 0 }; // faster, neutral pitch
+      case 'sad': return { speedDelta: -0.07, pitchDelta: -1 }; // slower, softer
+      case 'happy': return { speedDelta: 0.03, pitchDelta: 1 }; // slightly upbeat
+      default: return { speedDelta: 0, pitchDelta: 0 };
     }
+  }
+
+  /**
+   * Resolve the <mstts:express-as> style to use for a given user emotion
+   * and TTS voice. Returns { style, styleDegree } or { style: null } when
+   * the voice doesn't support styling (Indic voices, Cartesia, ElevenLabs).
+   *
+   * This is the genuinely-empathetic-voice piece: prosody (rate/pitch)
+   * alone can't make a voice sound caring; express-as can. But ONLY a
+   * subset of US English Edge voices support it, so we gate on the map.
+   */
+  getEmotionStyle(userEmotion, voiceId = '', provider = 'edge-tts') {
+    // express-as is an Edge-TTS-only SSML feature.
+    if (provider && provider !== 'edge-tts') return { style: null, styleDegree: null };
+
+    const supported = EDGE_VOICE_STYLES[voiceId];
+    if (!supported || supported.length === 0) return { style: null, styleDegree: null };
+
+    const prefs = EMOTION_STYLE_PREF[userEmotion] || [];
+    const style = prefs.find(s => supported.includes(s)) || null;
+    if (!style) return { style: null, styleDegree: null };
+
+    // styledegree intensifies the style (Azure range 0.01–2, default 1).
+    // 1.4 reads as clearly-but-not-cartoonishly emotional on a phone call.
+    const styleDegree = Number(process.env.TTS_STYLE_DEGREE || 1.4);
+    return { style, styleDegree };
+  }
+
+  /**
+   * ── FAQ response cache ────────────────────────────────────────────────
+   * Repeated FAQ-type questions ("aapka timing kya hai?", "pricing batao")
+   * hit the same answer every call. Re-running the LLM for them burns Groq
+   * TPM and adds 1-2s of latency for a reply we already have verbatim.
+   *
+   * We cache the FINAL response text keyed on (agent, language, voice, KB
+   * context, normalized query) and, on a hit, replay it through the EXACT
+   * same streaming TTS pipeline — so the caller can't tell it wasn't freshly
+   * generated. Distinct from llmFallback's cache, which only fires when the
+   * LLM is DOWN; this one is a proactive fast-path while the LLM is healthy.
+   */
+  _normalizeQuery(text) {
+    return String(text || '')
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  _responseCacheKey({ agentId, lang, voiceId, query, ragContext }) {
+    const crypto = require('crypto');
+    const ragTag = ragContext ? crypto.createHash('md5').update(ragContext).digest('hex').slice(0, 8) : '0';
+    return crypto.createHash('md5')
+      .update(`${agentId}:${lang}:${voiceId}:${ragTag}:${this._normalizeQuery(query)}`)
+      .digest('hex');
+  }
+
+  /**
+   * Decide whether THIS turn may be served from / written to the response
+   * cache. Deliberately conservative — caching a context-dependent reply
+   * and replaying it later would make the agent sound deaf to the
+   * conversation. We only cache self-contained, FAQ-shaped questions.
+   */
+  _isCacheableTurn({ text, hasTools, memory, vars, history }) {
+    if (!this._responseCacheEnabled) return false;
+    if (hasTools) return false;                              // tool results are dynamic
+    if (memory && memory.facts?.length > 0) return false;    // personalized answers
+    if (vars && Object.keys(vars).length > 0) return false;  // template-substituted, per-call
+    // System events / DTMF / handoff sentinels are never FAQs.
+    if (/^\s*\[/.test(text)) return false;
+
+    const norm = this._normalizeQuery(text);
+    const words = norm.split(' ').filter(Boolean);
+    if (norm.length < 10 || norm.length > 200) return false; // too short = ack, too long = bespoke
+    if (words.length < 2) return false;
+
+    // Pure acknowledgements / continuations depend on prior turns — never cache.
+    const acks = new Set(['haan', 'haa', 'nahi', 'nahin', 'ok', 'okay', 'theek', 'theek hai', 'yes', 'no', 'sahi', 'bilkul', 'done', 'accha', 'hmm', 'right']);
+    if (acks.has(norm)) return false;
+
+    // FAQ shape: a question mark, or a known question/FAQ lead word. This is
+    // a soft gate — keeps "haan wahi" style follow-ups out while letting
+    // genuine standalone questions through.
+    const faqLead = /\b(what|how|when|where|why|who|which|do|does|is|are|can|kya|kaise|kab|kahan|kitna|kitne|kaun|konsa|price|pricing|cost|charge|fee|fees|timing|time|hours|location|address|kahaan)\b/i;
+    const looksFaq = /\?/.test(text) || faqLead.test(norm);
+    if (!looksFaq) return false;
+
+    return true;
+  }
+
+  _responseCacheGet(key) {
+    if (!this._responseCacheEnabled) return null;
+    const entry = this._responseCache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.ts > this._responseCacheTtlMs) {
+      this._responseCache.delete(key);
+      return null;
+    }
+    // LRU touch: move to end as most-recently-used.
+    this._responseCache.delete(key);
+    this._responseCache.set(key, entry);
+    return entry.text;
+  }
+
+  _responseCacheSet(key, text) {
+    if (!this._responseCacheEnabled || !key || !text || text.trim().length < 10) return;
+    // Evict oldest until under capacity (Map preserves insertion order).
+    while (this._responseCache.size >= this._responseCacheMaxEntries) {
+      const oldest = this._responseCache.keys().next().value;
+      if (oldest === undefined) break;
+      this._responseCache.delete(oldest);
+    }
+    this._responseCache.set(key, { text: text.trim(), ts: Date.now() });
   }
 
   getGroqFallbackModels(primaryModel = 'llama-3.1-8b-instant') {
@@ -467,29 +623,55 @@ class VoicePipeline {
     return [...new Set(ordered)];
   }
 
-  async generateGroqResponseWithFallback({ messages, model, temperature, apiKey, tools = null }) {
-    const candidates = this.getGroqFallbackModels(model);
+  // ── NEW: Primary LLM chain — Cerebras → Groq → Gemini ───────────────────
+  async generateLLMResponseWithFallback({ messages, model, temperature, apiKey, tools = null }) {
     let lastError = null;
 
-    for (const candidate of candidates) {
+    // ── STEP 1: Try Cerebras (World's fastest — 2000+ tok/sec) ────────────
+    if (cerebrasService.isAvailable(apiKey)) {
       try {
-        return await groqService.generateResponse({
+        const cerebrasModel = process.env.CEREBRAS_DEFAULT_MODEL || 'llama-4-scout-17b-16e-instruct';
+        console.log(`[LLM] Trying Cerebras: ${cerebrasModel}`);
+        const resp = await cerebrasService.generateResponse({
           messages,
-          model: candidate,
+          model: cerebrasModel,
           temperature,
-          apiKey,
+          apiKey: process.env.CEREBRAS_API_KEY,
           tools,
         });
+        return resp;
       } catch (err) {
         lastError = err;
-        console.warn(`[LLM Fallback] Groq model failed: ${candidate} -> ${err.message}`);
+        console.warn(`[LLM Fallback] Cerebras failed → ${err.message}. Trying Groq...`);
       }
     }
 
-    // ─── GEMINI FALLBACK: If ALL Groq models failed, try Gemini (free) ────
+    // ── STEP 2: Try Groq with model fallback chain ────────────────────────
+    if (!groqService.isCircuitOpen()) {
+      const candidates = this.getGroqFallbackModels(model);
+      for (const candidate of candidates) {
+        try {
+          console.log(`[LLM] Trying Groq: ${candidate}`);
+          return await groqService.generateResponse({
+            messages,
+            model: candidate,
+            temperature,
+            apiKey,
+            tools,
+          });
+        } catch (err) {
+          lastError = err;
+          console.warn(`[LLM Fallback] Groq model failed: ${candidate} → ${err.message}`);
+        }
+      }
+    } else {
+      console.warn('[LLM Fallback] Groq circuit open — skipping Groq.');
+    }
+
+    // ── STEP 3: Gemini last resort ─────────────────────────────────────────
     if (geminiService.isAvailable()) {
       try {
-        console.log('[LLM Fallback] All Groq models failed. Trying Gemini...');
+        console.log('[LLM Fallback] All fast LLMs failed. Trying Gemini...');
         const geminiResp = await geminiService.generateResponse({ messages, temperature });
         console.log(`[LLM Fallback] Gemini success (${geminiResp.latencyMs}ms)`);
         return geminiResp;
@@ -499,6 +681,11 @@ class VoicePipeline {
     }
 
     throw lastError || new Error('all_llm_models_failed');
+  }
+
+  // ── Legacy alias — keeps old call sites working ───────────────────────────
+  async generateGroqResponseWithFallback(args) {
+    return this.generateLLMResponseWithFallback(args);
   }
 
   /**
@@ -527,7 +714,7 @@ class VoicePipeline {
 
     // Determine which LLM to use
     const llmProvider = agent.llm?.provider || 'gemini';
-    const llmModel = agent.llm?.model || 'gemini-2.0-flash';
+    const llmModel = agent.llm?.model || 'gemini-3.1-flash-lite';
     const voiceProvider = agent.voice?.provider || 'edge-tts';
     const apiKey = userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY;
 
@@ -562,15 +749,24 @@ class VoicePipeline {
         // ─── Direct Gemini provider selection ─────────────────────────────
         llmResponse = await geminiService.generateResponse({
           messages,
-          model: llmModel || 'gemini-2.0-flash',
+          model: llmModel || 'gemini-3.1-flash-lite',
           // Default temperature 0.4 for business voice agents — high creativity
           // (default 0.7) makes Llama drift into long, decorative essays.
           // Tunable via agent.temperature in DB or LLM_DEFAULT_TEMPERATURE env.
           temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
           apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
         });
+      } else if (llmProvider === 'cerebras') {
+        // ─── Direct Cerebras provider selection (World's Fastest LLM) ─────
+        llmResponse = await cerebrasService.generateResponse({
+          messages,
+          model: llmModel || process.env.CEREBRAS_DEFAULT_MODEL || 'llama-4-scout-17b-16e-instruct',
+          temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
+          apiKey: userSettings.cerebrasKey || process.env.CEREBRAS_API_KEY,
+          tools: groqTools.length > 0 ? groqTools : null,
+        });
       } else {
-        // ─── Default: Groq with Gemini auto-fallback ─────────────────────
+        // ─── Default: Cerebras → Groq → Gemini full fallback chain ───────
         llmResponse = await this.generateGroqResponseWithFallback({
           messages,
           model: llmModel,
@@ -588,13 +784,13 @@ class VoicePipeline {
       // Handle tool calls if present
       if (llmResponse.toolCalls && llmResponse.toolCalls.length > 0) {
         messages.push(llmResponse.message); // Append assistant's tool call message
-        
+
         // Execute each tool (simulated webhook or internal function)
         for (const toolCall of llmResponse.toolCalls) {
           const fnName = toolCall.function.name;
           const fnArgs = toolCall.function.arguments;
           console.log(`[Tool execution] Call: ${fnName}(${fnArgs})`);
-          
+
           let resultStr = '';
           try {
             const args = typeof fnArgs === 'string' ? JSON.parse(fnArgs) : fnArgs;
@@ -603,9 +799,9 @@ class VoicePipeline {
           } catch (e) {
             resultStr = `{"status": "error", "message": "${e.message}"}`;
           }
-          
+
           toolResults.push({ name: fnName, args: fnArgs, result: resultStr });
-          
+
           // Append tool response
           messages.push({
             role: 'tool',
@@ -709,7 +905,7 @@ class VoicePipeline {
     // ── Emotion detection ──────────────────────────────────────────────────
     const currentEmotion = this.detectEmotion(text);
     let emotionPrompt = '';
-    if (currentEmotion === 'angry')  emotionPrompt = '\n[SYSTEM DIRECTIVE]: The user seems frustrated or angry. Adopt a highly empathetic, calming, and apologetic tone immediately.';
+    if (currentEmotion === 'angry') emotionPrompt = '\n[SYSTEM DIRECTIVE]: The user seems frustrated or angry. Adopt a highly empathetic, calming, and apologetic tone immediately.';
     if (currentEmotion === 'urgent') emotionPrompt = '\n[SYSTEM DIRECTIVE]: The user has an urgent issue. Be extremely concise, fast, and helpful. Get straight to the point.';
 
     // ── Rolling conversation summary for long calls ──────────────────────
@@ -732,8 +928,8 @@ class VoicePipeline {
       { role: 'user', content: text },
     ];
 
-    const llmProvider   = agent.llm?.provider   || 'gemini';
-    const llmModel      = agent.llm?.model       || 'gemini-2.0-flash';
+    const llmProvider = agent.llm?.provider || 'gemini';
+    const llmModel = agent.llm?.model || process.env.GEMINI_FAST_MODEL || 'gemini-2.0-flash-lite';
     // Default to edge-tts (free, no API key needed).
     // Cartesia is only used when the agent explicitly sets voice.provider = 'cartesia'.
     // Never auto-select Cartesia from env alone — an invalid/expired key causes every
@@ -745,36 +941,36 @@ class VoicePipeline {
     // with Roman input causes garbled/cut pronunciation.
     const streamLang = agent.language || 'en';
     let streamDefaultVoiceId = 'en-US-JennyNeural';
-    if      (streamLang === 'hi')      streamDefaultVoiceId = 'hi-IN-SwaraNeural';
+    if (streamLang === 'hi') streamDefaultVoiceId = 'hi-IN-SwaraNeural';
     else if (streamLang === 'hi-Latn') streamDefaultVoiceId = 'en-IN-NeerjaNeural';
-    else if (streamLang === 'multi')   streamDefaultVoiceId = 'hi-IN-SwaraNeural';
-    else if (streamLang === 'en-IN')   streamDefaultVoiceId = 'en-IN-NeerjaNeural';
-    else if (streamLang === 'ta')      streamDefaultVoiceId = 'ta-IN-PallaviNeural';
-    else if (streamLang === 'te')      streamDefaultVoiceId = 'te-IN-ShrutiNeural';
-    else if (streamLang === 'kn')      streamDefaultVoiceId = 'kn-IN-SapnaNeural';
-    else if (streamLang === 'ml')      streamDefaultVoiceId = 'ml-IN-SobhanaNeural';
-    else if (streamLang === 'mr')      streamDefaultVoiceId = 'mr-IN-AarohiNeural';
-    else if (streamLang === 'gu')      streamDefaultVoiceId = 'gu-IN-DhwaniNeural';
-    else if (streamLang === 'bn')      streamDefaultVoiceId = 'bn-IN-TanishaaNeural';
-    else if (streamLang === 'ur')      streamDefaultVoiceId = 'ur-IN-GulNeural';
-    else if (streamLang === 'pa')      streamDefaultVoiceId = 'pa-IN-OjasNeural';
-    const voiceId       = agent.voice?.voiceId   || streamDefaultVoiceId;
-    const speed         = agent.voice?.speed     || 1.05; // 1.05 = slightly faster than default, sounds more conversational
+    else if (streamLang === 'multi') streamDefaultVoiceId = 'hi-IN-SwaraNeural';
+    else if (streamLang === 'en-IN') streamDefaultVoiceId = 'en-IN-NeerjaNeural';
+    else if (streamLang === 'ta') streamDefaultVoiceId = 'ta-IN-PallaviNeural';
+    else if (streamLang === 'te') streamDefaultVoiceId = 'te-IN-ShrutiNeural';
+    else if (streamLang === 'kn') streamDefaultVoiceId = 'kn-IN-SapnaNeural';
+    else if (streamLang === 'ml') streamDefaultVoiceId = 'ml-IN-SobhanaNeural';
+    else if (streamLang === 'mr') streamDefaultVoiceId = 'mr-IN-AarohiNeural';
+    else if (streamLang === 'gu') streamDefaultVoiceId = 'gu-IN-DhwaniNeural';
+    else if (streamLang === 'bn') streamDefaultVoiceId = 'bn-IN-TanishaaNeural';
+    else if (streamLang === 'ur') streamDefaultVoiceId = 'ur-IN-GulNeural';
+    else if (streamLang === 'pa') streamDefaultVoiceId = 'pa-IN-OjasNeural';
+    const voiceId = agent.voice?.voiceId || streamDefaultVoiceId;
+    const speed = agent.voice?.speed || 1.05; // 1.05 = slightly faster than default, sounds more conversational
     // Select the correct default API key based on the voice provider
     let defaultTtsKey = '';
     if (voiceProvider === 'cartesia') defaultTtsKey = process.env.CARTESIA_API_KEY;
     else if (voiceProvider === 'eleven-labs') defaultTtsKey = process.env.ELEVENLABS_API_KEY;
-    const ttsApiKey     = userSettings.ttsKey || defaultTtsKey;
+    const ttsApiKey = userSettings.ttsKey || defaultTtsKey;
 
-    const fastFirstChunkMode       = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
+    const fastFirstChunkMode = String(process.env.FAST_FIRST_CHUNK_MODE || 'true').toLowerCase() === 'true';
     // Fast-first-chunk: fire TTS early so the user hears SOMETHING quickly.
     // CRITICAL: firstChunkMaxWords must be large enough that the split point
     // falls at a natural pause — cutting at 8 words produces "Sure, aapka" |
     // "naam aur phone..." which sounds broken. 14 words covers most short
     // sentences fully, so the "fast chunk" IS the complete first sentence.
     // Only very long first sentences get split, and they split cleanly.
-    const firstChunkCharThreshold  = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 30);
-    const firstChunkMaxWords       = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 14);
+    const firstChunkCharThreshold = Number(process.env.FAST_FIRST_CHUNK_CHAR_THRESHOLD || 30);
+    const firstChunkMaxWords = Number(process.env.FAST_FIRST_CHUNK_MAX_WORDS || 14);
 
     // ── Dynamic Knowledge (RAG) ────────────────────────────────────────────
     // (Handled via ragContext passed from voiceSession.js Hybrid Search)
@@ -794,31 +990,53 @@ class VoicePipeline {
       + emotionPrompt;
     messages[0].content = systemPrompt;
 
-    // ── Instant "thinking" filler to cut PERCEIVED latency ────────────────
+    // ── FAQ response cache decision ───────────────────────────────────────
+    // Decide ONCE whether this turn is eligible to be served from / written
+    // to the cache. A turn with tools, caller memory, template vars, or a
+    // non-FAQ shape is excluded (see _isCacheableTurn). When eligible we
+    // build the key now so both the hit-path and the write-back use the same
+    // (agent, lang, voice, KB, query) identity.
+    const hasTools = (agent.webhooks?.length > 0) || (agent.tools?.length > 0) || !!agent.advanced?.customLlmUrl;
+    const cacheableTurn = this._isCacheableTurn({
+      text, hasTools, memory, vars: callContext.vars || {}, history,
+    });
+    const responseCacheKey = cacheableTurn
+      ? this._responseCacheKey({ agentId: String(agent._id || agent.id || 'agent'), lang: streamLang, voiceId, query: text, ragContext })
+      : null;
+    const cachedResponseText = responseCacheKey ? this._responseCacheGet(responseCacheKey) : null;
+    if (cachedResponseText) {
+      console.log(`[FAQ Cache] HIT — replaying cached answer for: "${this._normalizeQuery(text).slice(0, 60)}"`);
+    }
+
+    // ── "Thinking" filler to cut PERCEIVED latency (LATENCY-GATED) ─────────
     // Research (Vapi/Retell): humans tolerate ~600ms; past that a turn feels
-    // laggy. Even when the LLM needs 800-1400ms, an INSTANT acknowledgment
-    // ("Hmm...", "Accha...") makes the turn feel responsive. Key: it must add
-    // ZERO latency itself, so we only use a CACHE HIT (prewarmed at init).
+    // laggy. But a human only says "umm" when they're actually THINKING — not
+    // when the answer is instant. So instead of a blind coin-flip we PREPARE
+    // the filler here (cache-only, zero added latency) and emit it later ONLY
+    // if the first LLM token hasn't arrived within `fillerGateMs` (see the
+    // latency gate just before the drain loop). Fast answers stay crisp;
+    // genuinely slow turns get the "Hmm..." that buys patience.
     // No cache hit → skip silently rather than block on TTS generation.
     const fillerEnabled = agent.advanced?.fillerWords !== false; // default ON
-    const fillerProb = Number(process.env.LLM_FILLER_PROBABILITY || 0.5);
-    if (fillerEnabled && Math.random() < fillerProb) {
+    let pendingFillerAudio = null;
+    let pendingFillerText = '';
+    if (fillerEnabled) {
       const lang = agent.language || 'en';
       const fillers = this._fillersByLang[lang] || this._fillersByLang['en'];
-      const filler  = fillers[Math.floor(Math.random() * fillers.length)];
+      const filler = fillers[Math.floor(Math.random() * fillers.length)];
       const fillerSpeed = Math.max(0.85, speed - 0.15); // slightly slower = natural "thinking"
-      // Cache-only lookup — instant if prewarmed, otherwise we skip the filler
+      // Cache-only lookup — instant if prewarmed, otherwise skip the filler
       // entirely so we never ADD latency waiting for TTS synthesis.
-      let fillerAudio = null;
       try {
-        fillerAudio = ttsService.cache?.get?.(filler, voiceId, fillerSpeed, voiceProvider) || null;
-      } catch (_) { fillerAudio = null; }
-      if (fillerAudio && fillerAudio.length > 0) {
-        yield { type: 'chunk', text: filler + ' ', audio: fillerAudio };
-      } else {
-        // Warm it in the background for next time — but DON'T await/emit now.
-        ttsService.textToSpeech({ text: filler, voiceId, speed: fillerSpeed, apiKey: ttsApiKey, provider: voiceProvider }).catch(() => {});
-      }
+        const cached = ttsService.cache?.get?.(filler, voiceId, fillerSpeed, voiceProvider) || null;
+        if (cached && cached.length > 0) {
+          pendingFillerAudio = cached;
+          pendingFillerText = filler;
+        } else {
+          // Warm it in the background for next time — but DON'T await/emit now.
+          ttsService.textToSpeech({ text: filler, voiceId, speed: fillerSpeed, apiKey: ttsApiKey, provider: voiceProvider }).catch(() => { });
+        }
+      } catch (_) { /* no cache → no filler this turn */ }
     }
 
     // ── Select token stream (Custom URL or Groq with fallback) ────────────
@@ -831,16 +1049,30 @@ class VoicePipeline {
     if (abortSignal) {
       if (abortSignal.aborted) pipelineAbort.abort();
       else abortSignal.addEventListener('abort', () => {
-        try { pipelineAbort.abort(); } catch (_) {}
+        try { pipelineAbort.abort(); } catch (_) { }
       }, { once: true });
     }
 
     let tokenStream;
-    if (agent.advanced?.customLlmUrl) {
+    if (cachedResponseText) {
+      // ── FAQ cache hit: replay the cached answer as a synthetic token
+      // stream. This reuses the ENTIRE downstream pipeline (humanize,
+      // sentence chunking, emotion prosody/style, concurrent TTS) so the
+      // replay is indistinguishable from a fresh generation — no separate
+      // code path to keep in sync. We chunk on whitespace to mimic token
+      // granularity so fast-first-chunk and sentence splitting behave.
+      tokenStream = (async function* () {
+        const parts = cachedResponseText.match(/\S+\s*/g) || [cachedResponseText];
+        for (const p of parts) {
+          if (pipelineAbort.signal.aborted) return;
+          yield p;
+        }
+      })();
+    } else if (agent.advanced?.customLlmUrl) {
       tokenStream = (async function* () {
         const axios = require('axios');
         try {
-          const res  = await axios.post(agent.advanced.customLlmUrl, { messages, agentId: agent._id });
+          const res = await axios.post(agent.advanced.customLlmUrl, { messages, agentId: agent._id });
           const body = typeof res.data === 'string' ? res.data : (res.data?.text || res.data?.response || JSON.stringify(res.data));
           for (const w of body.split(' ')) yield w + ' ';
         } catch (e) {
@@ -849,7 +1081,7 @@ class VoicePipeline {
         }
       })();
     } else {
-      // ─── Gemini & Groq Unified Streaming with Fallbacks ───────────────────
+      // ─── Cerebras → Gemini → Groq Unified Streaming with Fallbacks ─────
       const apiKey = userSettings[`${llmProvider}Key`] || process.env.GROQ_API_KEY;
       let temperature = agent.advanced?.temperature ?? agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4);
       if (agent.advanced?.strictGrounding !== false) {
@@ -860,36 +1092,171 @@ class VoicePipeline {
       tokenStream = (async function* () {
         let lastErr = null;
 
-        // 1. Try Gemini first if it's the provider
-        if (llmProvider === 'gemini' && geminiService.isAvailable(userSettings.geminiKey)) {
+        // 0. Try Cerebras first if it's the selected provider (World's Fastest)
+        if (llmProvider === 'cerebras' && cerebrasService.isAvailable(userSettings.cerebrasKey)) {
           try {
-            const gemStream = geminiService.generateStreamResponse({
+            const cerebrasModel = llmModel || process.env.CEREBRAS_DEFAULT_MODEL || 'llama-4-scout-17b-16e-instruct';
+            console.log(`[LLM Stream] Trying Cerebras: ${cerebrasModel}`);
+            const cerebStream = cerebrasService.generateStreamResponse({
               messages,
-              model: llmModel || 'gemini-2.0-flash',
+              model: cerebrasModel,
               temperature,
-              apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
+              apiKey: userSettings.cerebrasKey || process.env.CEREBRAS_API_KEY,
+              abortSignal: pipelineAbort.signal,
             });
-            // Prime stream to catch 429 quota errors immediately
-            const first = await gemStream.next();
+            const first = await cerebStream.next();
             if (!first.done) {
               if (first.value) yield first.value;
-              for await (const tok of gemStream) {
+              for await (const tok of cerebStream) {
                 if (pipelineAbort.signal.aborted) return;
                 yield tok;
               }
               return; // Clean exit
             }
-          } catch (gemErr) {
-            console.warn(`[LLM Stream] Gemini failed (${gemErr.message}). Falling back to Groq...`);
-            lastErr = gemErr;
+          } catch (cerebErr) {
+            console.warn(`[LLM Stream] Cerebras failed (${cerebErr.message}). Falling back...`);
+            lastErr = cerebErr;
           }
         }
 
-        // 2. Try Groq (either as primary, or fallback if Gemini failed)
-        if (llmProvider === 'groq' || lastErr) {
+        // 0b. If NOT cerebras provider but Cerebras key is available, try it as auto-boost
+        if (llmProvider !== 'cerebras' && llmProvider !== 'gemini' && cerebrasService.isAvailable()) {
+          try {
+            const cerebrasModel = process.env.CEREBRAS_DEFAULT_MODEL || 'llama-4-scout-17b-16e-instruct';
+            console.log(`[LLM Stream] Auto-boost: trying Cerebras before Groq: ${cerebrasModel}`);
+            const cerebStream = cerebrasService.generateStreamResponse({
+              messages,
+              model: cerebrasModel,
+              temperature,
+              apiKey: process.env.CEREBRAS_API_KEY,
+              abortSignal: pipelineAbort.signal,
+            });
+            const first = await cerebStream.next();
+            if (!first.done) {
+              if (first.value) yield first.value;
+              for await (const tok of cerebStream) {
+                if (pipelineAbort.signal.aborted) return;
+                yield tok;
+              }
+              return;
+            }
+          } catch (cerebErr) {
+            console.warn(`[LLM Stream] Cerebras auto-boost failed (${cerebErr.message}). Trying Groq...`);
+            lastErr = cerebErr;
+          }
+        }
+
+        // 1. Gemini primary provider — Race Gemini vs Groq simultaneously.
+        // Gemini alone can take 3-4s TTFT on free tier. By racing it against
+        // Groq llama-3.1-8b-instant (~300ms TTFT), we guarantee first-token in
+        // ~600-900ms whichever wins, then stream the rest from the winner.
+        if (llmProvider === 'gemini' && geminiService.isAvailable(userSettings.geminiKey)) {
+          const geminiRaceEnabled = String(process.env.GEMINI_GROQ_RACE || 'true').toLowerCase() === 'true';
+          const groqAvailableForRace = !groqService.isCircuitOpen() && (process.env.GROQ_API_KEY || userSettings.groqKey);
+
+          if (geminiRaceEnabled && groqAvailableForRace) {
+            // ── PARALLEL RACE: Fire Gemini + Groq simultaneously ─────────────
+            // Both streams are created; we await the first token from each in
+            // parallel. The winner (first non-empty token) takes over the stream;
+            // the loser is silently discarded. This drops P50 TTFT from ~3.2s → ~600ms.
+            console.log('[LLM Race] Gemini vs Groq — racing for first token...');
+
+            let gemWon = false;
+            let groqWon = false;
+
+            // Build both streams upfront (no await yet)
+            const gemStreamRace = geminiService.generateStreamResponse({
+              messages,
+              model: llmModel || process.env.GEMINI_FAST_MODEL || 'gemini-2.0-flash-lite',
+              temperature,
+              apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
+            });
+
+            const groqRaceModel = 'llama-3.1-8b-instant';
+            const groqStreamRace = groqService.generateStreamResponse({
+              messages,
+              model: groqRaceModel,
+              temperature,
+              apiKey: userSettings.groqKey || process.env.GROQ_API_KEY,
+              abortSignal: pipelineAbort.signal,
+            });
+
+            // Race: get first token from each; whoever delivers first wins
+            let winner = null; // 'gemini' | 'groq'
+            let winnerFirstToken = null;
+            let gemFirstProm = null;
+            let groqFirstProm = null;
+
+            try {
+              gemFirstProm = gemStreamRace.next().then(r => ({ src: 'gemini', done: r.done, value: r.value }));
+              groqFirstProm = groqStreamRace.next().then(r => ({ src: 'groq', done: r.done, value: r.value }));
+
+              const result = await Promise.race([gemFirstProm, groqFirstProm]);
+              if (!result.done && result.value) {
+                winner = result.src;
+                winnerFirstToken = result.value;
+              } else {
+                // winner gave empty/done — try the other
+                const other = await (result.src === 'gemini' ? groqFirstProm : gemFirstProm);
+                if (!other.done && other.value) {
+                  winner = other.src;
+                  winnerFirstToken = other.value;
+                }
+              }
+            } catch (raceErr) {
+              // One of the two failed during race — try the other
+              console.warn(`[LLM Race] Race init error: ${raceErr.message}`);
+            }
+
+            if (winner && winnerFirstToken) {
+              console.log(`[LLM Race] ✅ ${winner} won the race — streaming from ${winner}`);
+              if (winnerFirstToken) yield winnerFirstToken;
+
+              const winStream = winner === 'gemini' ? gemStreamRace : groqStreamRace;
+              try {
+                for await (const tok of winStream) {
+                  if (pipelineAbort.signal.aborted) return;
+                  yield tok;
+                }
+              } catch (streamErr) {
+                console.warn(`[LLM Race] Winner stream error: ${streamErr.message}`);
+              }
+              return; // Clean exit
+            }
+            // Both raced and both failed — fall through to sequential Groq below
+            console.warn('[LLM Race] Both Gemini+Groq race failed — falling back to sequential.');
+            lastErr = new Error('gemini_groq_race_failed');
+
+          } else {
+            // ── Sequential: Gemini only (race disabled or no Groq key) ───────
+            try {
+              const gemStream = geminiService.generateStreamResponse({
+                messages,
+                model: llmModel || process.env.GEMINI_FAST_MODEL || 'gemini-2.0-flash-lite',
+                temperature,
+                apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
+              });
+              const first = await gemStream.next();
+              if (!first.done) {
+                if (first.value) yield first.value;
+                for await (const tok of gemStream) {
+                  if (pipelineAbort.signal.aborted) return;
+                  yield tok;
+                }
+                return;
+              }
+            } catch (gemErr) {
+              console.warn(`[LLM Stream] Gemini failed (${gemErr.message}). Falling back to Groq...`);
+              lastErr = gemErr;
+            }
+          }
+        }
+
+        // 2. Try Groq (either as primary, or fallback if Gemini/Cerebras failed)
+        if (!groqService.isCircuitOpen() && (llmProvider === 'groq' || lastErr)) {
           const candidateModels = self.getGroqFallbackModels(llmProvider === 'groq' ? llmModel : 'llama-3.1-8b-instant');
           const groqKey = userSettings.groqKey || process.env.GROQ_API_KEY;
-          
+
           for (const modelCandidate of candidateModels) {
             if (pipelineAbort.signal.aborted) return;
             const inner = groqService.generateStreamResponse({
@@ -916,11 +1283,13 @@ class VoicePipeline {
               console.warn(`[LLM Stream Fallback] Groq ${modelCandidate} failed -> ${err.message} — rotating`);
             }
           }
+        } else if (groqService.isCircuitOpen()) {
+          console.warn('[LLM Stream] Groq circuit open — skipping Groq.');
         }
 
-        // 3. If primary was Groq and all Groq models failed, try Gemini as last resort
-        if (llmProvider === 'groq' && lastErr && geminiService.isAvailable(userSettings.geminiKey)) {
-          console.log('[LLM Stream Fallback] All Groq models failed. Trying Gemini stream...');
+        // 3. If all fast LLMs failed, try Gemini as last resort
+        if (lastErr && geminiService.isAvailable(userSettings.geminiKey)) {
+          console.log('[LLM Stream Fallback] All fast LLMs failed. Trying Gemini stream...');
           try {
             const gem = geminiService.generateStreamResponse({ messages, temperature, apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY });
             const first = await gem.next();
@@ -952,7 +1321,10 @@ class VoicePipeline {
 
     /** Helper: kick off TTS without blocking; returns a Promise<{text,audio}> */
     const emotionProsody = this.getEmotionProsody(currentEmotion);
-    
+    // Emotion-driven express-as style (Edge US-English voices only). For
+    // unsupported voices this is {style:null} and the TTS call is unchanged.
+    const emotionStyle = this.getEmotionStyle(currentEmotion, voiceId, voiceProvider);
+
     // Concurrency limiter to prevent blowing up ElevenLabs/Edge free tier limits
     let activeTTSCount = 0;
     const ttsWaitQueue = [];
@@ -975,9 +1347,9 @@ class VoicePipeline {
       const dynamicPitch = this.getDynamicPitch(humanized);
       const adjustedSpeed = Math.max(0.7, Math.min(1.6, speed + emotionProsody.speedDelta));
       const adjustedPitch = Math.max(-3, Math.min(3, dynamicPitch + emotionProsody.pitchDelta));
-      return ttsService.textToSpeech({ text: humanized, voiceId, speed: adjustedSpeed, pitch: adjustedPitch, apiKey: ttsApiKey, provider: voiceProvider })
+      return ttsService.textToSpeech({ text: humanized, voiceId, speed: adjustedSpeed, pitch: adjustedPitch, apiKey: ttsApiKey, provider: voiceProvider, style: emotionStyle.style, styleDegree: emotionStyle.styleDegree })
         .then(audio => ({ text: humanized, audio }))
-        .catch(err  => {
+        .catch(err => {
           console.error(`[TTS Concurrent] Failed: "${humanized.substring(0, 40)}"`, err.message);
           return { text: humanized, audio: Buffer.alloc(0) };
         });
@@ -990,32 +1362,34 @@ class VoicePipeline {
       });
     };
 
-    const ttsQueue     = [];   // ordered promise array
-    let producerDone   = false;
-    let producerError  = null;
+    const ttsQueue = [];   // ordered promise array
+    let producerDone = false;
+    let producerError = null;
     let fullResponseText = '';
-    let lastTokenTime  = Date.now();
+    let lastTokenTime = Date.now();
+    let firstTokenArrived = false; // flips true on the LLM's first token — gates the filler
 
     // ── LLM Producer (runs concurrently; never awaits TTS) ────────────────
     const runProducer = async () => {
-      let currentSentence     = '';
+      let currentSentence = '';
       let hasSpokenFirstChunk = false;
 
       try {
         for await (const token of tokenStream) {
           if (pipelineAbort.signal.aborted) break;
           lastTokenTime = Date.now();
-          fullResponseText  += token;
-          currentSentence   += token;
+          firstTokenArrived = true; // unblocks (and cancels) the latency-gated filler
+          fullResponseText += token;
+          currentSentence += token;
 
           // ── Tool Execution (Vapi/Retell style) ──────────────────────────
           if (fullResponseText.includes('<TOOL>') && fullResponseText.includes('</TOOL>')) {
             const toolMatch = fullResponseText.match(/<TOOL>(.*?)<\/TOOL>/);
             if (toolMatch) {
               const toolCallStr = toolMatch[1];
-              const name        = toolCallStr.split('(')[0];
-              const argsStr     = toolCallStr.match(/\((.*?)\)/)?.[1] || '{}';
-              
+              const name = toolCallStr.split('(')[0];
+              const argsStr = toolCallStr.match(/\((.*?)\)/)?.[1] || '{}';
+
               // Tell user we are looking it up (instantly)
               const lang = agent.language || 'en';
               const checkPhrases = {
@@ -1029,7 +1403,7 @@ class VoicePipeline {
               ttsQueue.push(fireTTS(checkPhrase));
 
               try {
-                const args       = JSON.parse(argsStr.replace(/'/g, '"'));
+                const args = JSON.parse(argsStr.replace(/'/g, '"'));
 
                 // Prevent circuit breaker from tripping during long tool execution
                 let isToolRunning = true;
@@ -1061,8 +1435,8 @@ class VoicePipeline {
                   // Enqueue a special sentinel so the drainer can yield the transfer event
                   ttsQueue.push(Promise.resolve({
                     __special: 'transfer_agent',
-                    agentId:   toolResult.result.__transferToAgentId,
-                    reason:    toolResult.result.reason,
+                    agentId: toolResult.result.__transferToAgentId,
+                    reason: toolResult.result.reason,
                   }));
                   return; // Stop producing
                 }
@@ -1072,8 +1446,8 @@ class VoicePipeline {
                 ttsQueue.push(Promise.resolve({
                   __special: 'tool_called',
                   toolName: name,
-                  args:     argsStr,
-                  result:   toolResult,
+                  args: argsStr,
+                  result: toolResult,
                 }));
 
                 console.log('[Tool Executed] Result:', toolResult);
@@ -1090,7 +1464,7 @@ class VoicePipeline {
           // split ONLY at a natural boundary (comma, clause end, or word limit).
           // Splitting mid-word or too early sounds clipped/robotic.
           if (fastFirstChunkMode && !hasSpokenFirstChunk && currentSentence.trim().length >= firstChunkCharThreshold) {
-            const words          = currentSentence.trim().split(/\s+/).filter(Boolean);
+            const words = currentSentence.trim().split(/\s+/).filter(Boolean);
 
             // Prefer splitting at a natural clause boundary within the first chunk
             // so "Sure, main check karta hun" → first chunk = "Sure, main check karta hun"
@@ -1105,13 +1479,13 @@ class VoicePipeline {
             } else {
               // Long sentence: split at firstChunkMaxWords boundary
               firstChunkText = words.slice(0, firstChunkMaxWords).join(' ').trim();
-              remainder      = words.slice(firstChunkMaxWords).join(' ').trim();
+              remainder = words.slice(firstChunkMaxWords).join(' ').trim();
             }
 
             if (firstChunkText.length > 0) {
               ttsQueue.push(fireTTS(firstChunkText)); // fire immediately, don't await
               hasSpokenFirstChunk = true;
-              currentSentence     = remainder; // CRITICAL: Do not append ' ' here, it breaks partially streamed words!
+              currentSentence = remainder; // CRITICAL: Do not append ' ' here, it breaks partially streamed words!
               console.log(`[Pipeline] Fast-chunk TTS fired (queue=${ttsQueue.length}): "${firstChunkText.substring(0, 60)}"`);
             }
           }
@@ -1153,6 +1527,25 @@ class VoicePipeline {
     // ── Start producer without awaiting it — it runs concurrently ─────────
     const producerPromise = runProducer();
 
+    // ── Latency gate for the "thinking" filler ────────────────────────────
+    // Give the LLM a short head-start window. If its first token lands inside
+    // the window, the turn already feels responsive → skip the filler so the
+    // answer isn't preceded by a needless "Hmm...". Only if the model is still
+    // silent past `fillerGateMs` do we emit the prewarmed filler to cover the
+    // dead air. The producer runs concurrently throughout, so this never
+    // delays a fast answer — it just decides whether the filler is warranted.
+    if (pendingFillerAudio) {
+      const fillerGateMs = Number(process.env.LLM_FILLER_GATE_MS || 375);
+      const gateStart = Date.now();
+      while (!firstTokenArrived && !producerDone && (Date.now() - gateStart) < fillerGateMs) {
+        await new Promise(resolve => setTimeout(resolve, 15));
+      }
+      if (!firstTokenArrived && !producerError) {
+        yield { type: 'chunk', text: pendingFillerText + ' ', audio: pendingFillerAudio };
+        console.log(`[Pipeline] Latency-gated filler emitted after ${Date.now() - gateStart}ms: "${pendingFillerText}"`);
+      }
+    }
+
     let hasEmittedAnyChunk = false;
 
     try {
@@ -1162,7 +1555,7 @@ class VoicePipeline {
       while (true) {
         if (drainIdx >= ttsQueue.length) {
           if (producerDone) break; // Producer is done and queue is drained
-          
+
           // ── Circuit Breaker: Stop if LLM is stuck for >Ns ──
           // Progressive timeout — fail FAST before first chunk so Gemini
           // fallback kicks in quickly, but be patient mid-stream so slow
@@ -1181,15 +1574,15 @@ class VoicePipeline {
             // `for await` stops pulling and releases its connection-pool slot.
             // Without this the orphaned stream keeps draining and head-of-line
             // blocks the very fallback request we're about to make.
-            try { pipelineAbort.abort(); } catch (_) {}
+            try { pipelineAbort.abort(); } catch (_) { }
 
             if (!hasEmittedAnyChunk) {
-               // If it hung before even speaking, break completely to trigger the Fallback Engine (Gemini)
-               break;
+              // If it hung before even speaking, break completely to trigger the Fallback Engine (Gemini)
+              break;
             } else {
-               // If it hung mid-sentence, apologize
-               yield { type: 'chunk', text: "Sorry, my connection dropped for a second.", audio: Buffer.alloc(0) };
-               break;
+              // If it hung mid-sentence, apologize
+              yield { type: 'chunk', text: "Sorry, my connection dropped for a second.", audio: Buffer.alloc(0) };
+              break;
             }
           }
 
@@ -1225,7 +1618,7 @@ class VoicePipeline {
       yield { type: 'final', fullText: fullResponseText };
 
     } catch (streamErr) {
-      await producerPromise.catch(() => {});
+      await producerPromise.catch(() => { });
 
       // ── Abort path: the caller (interrupt / new turn / session end)
       //    cancelled this generation. This is NOT a failure — do NOT spin up
@@ -1258,7 +1651,7 @@ class VoicePipeline {
         try {
           fallbackResponse = await geminiService.generateResponse({
             messages,
-            model: 'gemini-2.0-flash',
+            model: 'gemini-3.1-flash-lite',
             temperature: agent.temperature ?? Number(process.env.LLM_DEFAULT_TEMPERATURE || 0.4),
             apiKey: userSettings.geminiKey || process.env.GEMINI_API_KEY,
           });
@@ -1282,14 +1675,27 @@ class VoicePipeline {
         text: fallbackText, voiceId, speed, apiKey: ttsApiKey, provider: voiceProvider,
       });
 
-      yield { type: 'chunk', text: fallbackText,  audio: fallbackAudio };
+      yield { type: 'chunk', text: fallbackText, audio: fallbackAudio };
       yield { type: 'final', fullText: fallbackText };
     } finally {
       // Remember successful responses for future fallback cache hits.
       // Only remember non-trivial replies so we don't poison the cache
       // with apologies or empty strings.
       if (fullResponseText && fullResponseText.trim().length > 10) {
-        try { llmFallback.remember(text, fullResponseText.trim()); } catch (_) {}
+        try { llmFallback.remember(text, fullResponseText.trim()); } catch (_) { }
+      }
+
+      // FAQ response cache write-back. Store ONLY a clean, freshly-generated
+      // answer for an eligible turn: skip cache hits (already stored), skip
+      // aborted/errored turns (partial or fallback text), and skip when the
+      // model invoked a tool mid-stream (the answer was data-dependent).
+      const producedToolCall = fullResponseText.includes('<TOOL>') || fullResponseText.includes('[Result:');
+      if (responseCacheKey && !cachedResponseText && !producerError && !abortSignal?.aborted
+        && !producedToolCall && fullResponseText && fullResponseText.trim().length >= 10) {
+        try {
+          this._responseCacheSet(responseCacheKey, fullResponseText.trim());
+          console.log(`[FAQ Cache] stored answer for: "${this._normalizeQuery(text).slice(0, 60)}"`);
+        } catch (_) { /* cache best-effort */ }
       }
     }
   }
@@ -1416,7 +1822,7 @@ ${customFieldDescriptions}
 
     // Phase 1: Fast keyword-based classification (instant, zero cost)
     const keywordResult = this.keywordSentiment(text);
-    
+
     // If keyword analysis is confident (strong signal), skip LLM entirely
     const absScore = Math.abs(keywordResult.score);
     if (absScore >= 0.5) {
@@ -1611,8 +2017,8 @@ ${customFieldDescriptions}
       // Always return immediately with whatever summary we have cached.
       // If we don't have a summary yet, fall back to a larger recent history (up to 20 msgs)
       // so we don't create a "blind spot" for the LLM while the summary generates.
-      return { 
-        summary: cached?.summary || null, 
+      return {
+        summary: cached?.summary || null,
         recentHistory: cached?.summary ? recentHistory : history.slice(-Math.max(this._summaryKeepRecent, 20))
       };
     }
@@ -1640,17 +2046,17 @@ ${customFieldDescriptions}
         },
         { role: 'user', content: olderFormatted },
       ],
-      model: llmProvider === 'gemini' ? 'gemini-2.0-flash' : 'llama-3.1-8b-instant',
+      model: llmProvider === 'gemini' ? 'gemini-3.1-flash-lite' : 'llama-3.1-8b-instant',
       temperature: 0.1,
     };
-    
+
     let response;
     if (llmProvider === 'gemini' && geminiService.isAvailable()) {
       response = await geminiService.generateResponse(params);
     } else {
       response = await groqService.generateResponse(params);
     }
-    
+
     return (response.text || '').trim();
   }
 
@@ -1728,23 +2134,27 @@ ${ragContext}`;
     const strictGrounding = agent.advanced?.strictGrounding !== false;
     if (strictGrounding) {
       const hasKb = !!ragContext;
+      // Refusal sentence MUST match the agent's output script — a Devnagari
+      // voice mispronounces romanized text (and vice-versa). hi → Devnagari,
+      // hi-Latn/multi → Roman Hinglish, en → English.
       const refusalLang = lang === 'en'
-        ? `"I'm sorry, I don't have that information right now."`
-        : `"Maaf kijiye, mere paas is baare mein abhi jaankari nahi hai."`;
+        ? `"I'm sorry, I don't have that specific information. Please visit your nearest branch or contact customer care for accurate details."`
+        : lang === 'hi'
+          ? `"माफ़ कीजिए, मेरे पास इसकी सटीक जानकारी अभी उपलब्ध नहीं है। कृपया अपनी नज़दीकी branch या customer care से संपर्क करें।"`
+          : `"Maaf kijiye, mere paas iski sateek jaankari abhi nahi hai. Kripya apni nazdeeki branch ya customer care se sampark karein."`;
       prompt += `
 
-## STRICT KNOWLEDGE BOUNDARY (CRITICAL — follow EXACTLY):
-- Your ONLY source of truth is: (1) Your Role/Persona above${hasKb ? ', and (2) the Knowledge Base Context provided above' : ''}. 
-- You have ZERO general knowledge. You know NOTHING beyond what is written above.
-- If the user asks something NOT covered in your role${hasKb ? ' or knowledge base' : ''}, you MUST say ${refusalLang}. Then offer to take a message or connect to a human.
-- NEVER guess, assume, or use outside/general/world knowledge — even if you "know" the answer. You are a phone agent, not a search engine.
-- NEVER invent: prices, dates, names, policies, availability, phone numbers, addresses, locations, timings, or ANY facts not explicitly given to you.
-- NEVER assume you have the user's name, phone number, or details unless they explicitly state them. If the user says "Yes, you can take my number", you MUST reply asking them to actually speak the digits out loud.
-- If the user asks for specific locations, branches, offices, or entities that are NOT in your Knowledge Base, you MUST use your standard refusal: ${refusalLang}. Do NOT guess or list random locations.
-- Do NOT volunteer extra information the user didn't ask for.
-- Do NOT ask for information you don't need to fulfill your defined role.
-- Stay strictly on-topic. If asked something completely off-topic, politely say: "Main sirf ${agent.name || 'is service'} ke baare mein baat kar sakti hoon." and redirect.
-- If user insists on off-topic info, DO NOT give in. Repeat your refusal politely but firmly.`;
+## KNOWLEDGE BOUNDARY (STRICTLY ENFORCED — THIS OVERRIDES YOUR ROLE):
+- Answer ONLY from information explicitly written in YOUR ROLE & PERSONA above${hasKb ? ' or the KNOWLEDGE BASE CONTEXT' : ''}.
+- If the user asks about something covered in your Role/Persona${hasKb ? ' or Knowledge Base' : ''}, ANSWER DIRECTLY.
+- ⛔ HALLUCINATION IS STRICTLY FORBIDDEN: Do NOT use your general AI training knowledge to answer banking-specific questions.
+- ⛔ NEVER invent or guess: branch locations, city names, addresses, phone numbers, timings, interest rates, fees, or any specific data that is NOT written verbatim in your instructions above.
+- ⚠️ ROLE-vs-DATA CONFLICT (read carefully): Your role may say you "help with branch information / locations / rates / timings". That names the TOPICS you cover — it is NOT permission to state a value you were never given. If a specific fact is not written above, you simply do NOT have it. Saying "I can help with branches" is fine; naming a branch, city, or address you weren't given is FORBIDDEN.
+- ⛔ If the exact information (branch location/city, address, specific rate, contact number, timing) is NOT stated above, you MUST refuse with: ${refusalLang}
+- WRONG: User asks "bank/branch kahan hai?" → you name any city (e.g. "Prayagraj mein hai"). ← NEVER DO THIS, even if it sounds plausible or helpful.
+- CORRECT: User asks "bank/branch kahan hai?" → if no address is written above, say ${refusalLang}
+- NEVER assume you have the user's name, phone number, or details unless they explicitly state them.
+- Stay on-topic. If asked something off-topic, politely say: "Main sirf ${agent.name || 'is service'} se related banking queries mein madad kar sakti hoon." and redirect.`;
     }
 
     // Anti-repetition guard. Llama 3.1 8B in voice mode repeats its own
@@ -1777,7 +2187,7 @@ ${ragContext}`;
 
     const scriptRules = {
       deva: {
-        rule: `8. SCRIPT (critical): Write Hindi in DEVNAGARI script (देवनागरी). Your voice is a native Hindi voice and pronounces Devnagari clearly. Keep English brand/tech words in Roman (e.g. "website", "booking"). Do NOT romanize Hindi words.`,
+        rule: `9. SCRIPT (critical): Write Hindi in DEVNAGARI script (देवनागरी). Your voice is a native Hindi voice and pronounces Devnagari clearly. Keep English brand/tech words in Roman (e.g. "website", "booking"). Do NOT romanize Hindi words.`,
         example: `Example:
 USER: "मुझे gym ke liye website banwani hai"
 YOU: "ज़रूर, जिम के लिए website बन जाएगी। Basic जानकारी चाहिए या booking भी?"
@@ -1785,7 +2195,7 @@ USER: "Pricing kya hai?"
 YOU: "Pricing project पर depend करती है। आपको कौन से features चाहिए?"`,
       },
       latin: {
-        rule: `8. SCRIPT (critical): NEVER output Devnagari/Indic script even if the user does. Write Hindi in ROMAN script ("विद्यापीठ"→"Vidyapeeth"). Devnagari breaks this voice's TTS.`,
+        rule: `9. SCRIPT (critical): NEVER output Devnagari/Indic script even if the user does. Write Hindi in ROMAN script ("विद्यापीठ"→"Vidyapeeth"). Devnagari breaks this voice's TTS.`,
         example: `Example:
 USER: "मुझे gym ke liye website banwani hai"
 YOU: "Sure, gym ke liye website ban jaayegi. Basic info chahiye ya booking bhi?"
@@ -1794,7 +2204,7 @@ YOU: "Pricing project pe depend karti hai. Aapko kaunse features chahiye?"`,
       },
     };
     // Regional native scripts (Tamil/Telugu/etc.) — keep their own script.
-    const nativeScriptRule = `8. SCRIPT (critical): Write in the NATIVE script of your language (matching your voice). Keep English brand/tech words in Roman. Do NOT romanize native words — this voice pronounces its native script clearly.`;
+    const nativeScriptRule = `9. SCRIPT (critical): Write in the NATIVE script of your language (matching your voice). Keep English brand/tech words in Roman. Do NOT romanize native words — this voice pronounces its native script clearly.`;
 
     const chosen = scriptRules[targetScript] || (targetScript === 'latin'
       ? scriptRules.latin
@@ -1803,19 +2213,29 @@ YOU: "Pricing project pe depend karti hai. Aapko kaunse features chahiye?"`,
     prompt += `
 
 ## VOICE RULES (you are on a live phone call — NOT writing text):
-1. LENGTH: 1-2 short sentences max. Never list features; ask ONE qualifying question.
-2. NO markdown, bullets, dashes, asterisks. Spoken audio only.
-3. NO robotic openers ("Certainly", "I'd be happy to help"). Use "Sure", "Haan", "Theek hai", "Got it".
-4. Contractions always: don't, I'll, you're, that's.
-5. Phone numbers/OTPs: say digits separately. Emails: "name at gmail dot com".
-6. If unsure: never invent details — say you'll confirm.
-7. LANGUAGE: reply in ${langInstruction}. Match the user's code-switching.
+1. RESPOND LIKE A REAL HUMAN ON A PHONE CALL: Warm acknowledgment first ("Zaroor!", "Bilkul!", "Haan ji!"), then give ONE useful piece of info, then ask ONE question to move forward. NEVER dump multiple facts at once — drip-feed information across turns like a real person would.
+2. LENGTH: Maximum 2 short sentences. If you need to share multiple details, share the most important one NOW and save the rest for when the user asks or the conversation progresses.
+3. NO markdown, bullets, dashes, asterisks. Spoken audio only.
+4. NO robotic openers ("Certainly", "I'd be happy to help"). Use natural Hindi openers: "Zaroor!", "Bilkul!", "Haan ji!", "Theek hai!".
+5. Contractions always: don't, I'll, you're, that's.
+6. Phone numbers/OTPs: say digits separately. Emails: "name at gmail dot com".
+7. If unsure: never invent details — say you'll confirm.
+8. LANGUAGE: reply in ${langInstruction}. Match the user's code-switching.
 ${chosen.rule}
 
 ${chosen.example}
 
 Today is ${new Date().toDateString()}. You are NOT an AI; never say "As an AI".
 `;
+
+    // Final recency-anchored grounding reminder. Small/voice models weight the
+    // LAST instruction most. The detailed KNOWLEDGE BOUNDARY block above gets
+    // out-voted by a long persona that repeatedly says "help with branches",
+    // so this one terse line at the very end keeps refuse-on-missing-data
+    // dominant (this is exactly the case where the agent invented "Prayagraj").
+    if (strictGrounding) {
+      prompt += `\nFINAL RULE (highest priority): If a specific fact (branch or branch city, address, phone number, rate, fee, timing) is NOT written in your instructions, you do NOT know it — politely refuse and offer branch/customer care. NEVER invent or guess it, even at temperature 0, even if a guess would sound helpful.\n`;
+    }
 
     return prompt;
   }
@@ -1899,7 +2319,7 @@ Today is ${new Date().toDateString()}. You are NOT an AI; never say "As an AI".
   async getFirstMessageAudio(agent, vars = {}) {
     const rawText = agent.firstMessage || 'Hello! How can I help you today?';
     const text = this.substituteVariables(rawText, vars);
-    
+
     const lang = agent.language || 'en';
     let defaultVoiceId = 'en-US-JennyNeural';
     if (lang === 'hi') defaultVoiceId = 'hi-IN-SwaraNeural';

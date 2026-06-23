@@ -77,7 +77,7 @@ router.post('/', async (req, res, next) => {
       firstMessage,
       language: language || 'en',
       voice: voice || { provider: 'edge-tts', voiceId: 'en-US-JennyNeural' },
-      llm: llm || { provider: 'groq', model: 'llama-3.1-8b-instant' },
+      llm: llm || { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
       temperature: temperature || 0.7,
       maxDuration: maxDuration || 600,
       endCallMessage,
@@ -172,16 +172,16 @@ router.post('/:id/duplicate', async (req, res, next) => {
 // ─── PROMPT PLAYGROUND ──────────────────────────────────────────────────────
 // POST /api/agents/playground
 // Test a system prompt + user message via LLM without a full voice call.
-// Completely free — uses Groq. Great for rapid prompt iteration.
+// Completely free — uses Gemini. Great for rapid prompt iteration.
 router.post('/playground', async (req, res, next) => {
   try {
-    const { systemPrompt, userMessage, model = 'llama-3.1-8b-instant', temperature = 0.7, history = [] } = req.body;
+    const { systemPrompt, userMessage, model = 'gemini-3.1-flash-lite', temperature = 0.7, history = [] } = req.body;
 
     if (!systemPrompt || !userMessage) {
       return res.status(400).json({ success: false, message: 'systemPrompt and userMessage are required' });
     }
 
-    const groqService = require('../services/groqService');
+    const geminiService = require('../services/geminiService');
 
     const messages = [
       { role: 'system', content: systemPrompt },
@@ -190,7 +190,7 @@ router.post('/playground', async (req, res, next) => {
     ];
 
     const startMs = Date.now();
-    const response = await groqService.generateResponse({
+    const response = await geminiService.generateResponse({
       messages,
       model,
       temperature: Math.max(0, Math.min(1, Number(temperature))),
@@ -214,18 +214,18 @@ router.post('/playground', async (req, res, next) => {
 // Compare two system prompts side-by-side with the same user message.
 router.post('/ab-test', async (req, res, next) => {
   try {
-    const { promptA, promptB, userMessage, model = 'llama-3.1-8b-instant', temperature = 0.7 } = req.body;
+    const { promptA, promptB, userMessage, model = 'gemini-3.1-flash-lite', temperature = 0.7 } = req.body;
 
     if (!promptA || !promptB || !userMessage) {
       return res.status(400).json({ success: false, message: 'promptA, promptB, and userMessage are required' });
     }
 
-    const groqService = require('../services/groqService');
+    const geminiService = require('../services/geminiService');
 
     const [resultA, resultB] = await Promise.all([
       (async () => {
         const start = Date.now();
-        const resp = await groqService.generateResponse({
+        const resp = await geminiService.generateResponse({
           messages: [
             { role: 'system', content: promptA },
             { role: 'user', content: userMessage },
@@ -237,7 +237,7 @@ router.post('/ab-test', async (req, res, next) => {
       })(),
       (async () => {
         const start = Date.now();
-        const resp = await groqService.generateResponse({
+        const resp = await geminiService.generateResponse({
           messages: [
             { role: 'system', content: promptB },
             { role: 'user', content: userMessage },

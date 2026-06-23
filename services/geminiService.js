@@ -1,7 +1,7 @@
 /**
  * Google Gemini LLM Service (FREE Tier)
  * - 60 requests/minute free
- * - gemini-2.0-flash (latest, fast & free)
+ * - gemini-3.1-flash-lite (latest, fast & free)
  * - Also provides FREE text embeddings via text-embedding-004
  *
  * Get free API key: https://aistudio.google.com/apikey
@@ -10,6 +10,13 @@
 const fetch = require('node-fetch');
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com/v1beta';
+// Current available Gemini models (June 2026):
+// gemini-3.5-flash    — recommended workhorse, fast + smart
+// gemini-3.1-flash-lite — smallest/cheapest, lowest latency
+// gemini-3.1-flash     — balanced speed+quality
+// gemini-3.1-pro       — highest quality, slower
+// NOTE: gemini-2.0 and earlier were deprecated/shut down June 1 2026
+const GEMINI_FAST_MODEL = process.env.GEMINI_FAST_MODEL || 'gemini-3.5-flash';
 
 class GeminiService {
   constructor() {
@@ -79,7 +86,7 @@ class GeminiService {
   /**
    * Generate LLM response (non-streaming) — drop-in replacement for groqService.generateResponse
    */
-  async generateResponse({ messages, model = 'gemini-2.0-flash', temperature = 0.7, apiKey }) {
+  async generateResponse({ messages, model = GEMINI_FAST_MODEL, temperature = 0.7, apiKey }) {
     if (this.isCircuitOpen()) throw new Error('gemini_circuit_open');
 
     const key = this.getApiKey(apiKey);
@@ -94,7 +101,7 @@ class GeminiService {
       contents,
       generationConfig: {
         temperature,
-        maxOutputTokens: 1024,
+        maxOutputTokens: Number(process.env.LLM_MAX_TOKENS || 80),
       },
     };
 
@@ -109,7 +116,7 @@ class GeminiService {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('gemini_timeout')), 10000)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('gemini_timeout')), Number(process.env.GEMINI_TIMEOUT_MS || 4000))),
       ]);
 
       if (!resp.ok) {
@@ -139,7 +146,7 @@ class GeminiService {
   /**
    * Generate streaming response — async generator yielding text chunks
    */
-  async *generateStreamResponse({ messages, model = 'gemini-2.0-flash', temperature = 0.7, apiKey }) {
+  async *generateStreamResponse({ messages, model = GEMINI_FAST_MODEL, temperature = 0.7, apiKey }) {
     if (this.isCircuitOpen()) throw new Error('gemini_circuit_open');
 
     const key = this.getApiKey(apiKey);
@@ -150,7 +157,7 @@ class GeminiService {
 
     const body = {
       contents,
-      generationConfig: { temperature, maxOutputTokens: 1024 },
+      generationConfig: { temperature, maxOutputTokens: Number(process.env.LLM_MAX_TOKENS || 80) },
     };
     if (systemInstruction) {
       body.systemInstruction = { parts: [{ text: systemInstruction }] };
@@ -164,7 +171,7 @@ class GeminiService {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         }),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('gemini_stream_timeout')), 10000)),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('gemini_stream_timeout')), Number(process.env.GEMINI_TIMEOUT_MS || 4000))),
       ]);
 
       if (!resp.ok) {
@@ -259,9 +266,10 @@ class GeminiService {
 
   static getAvailableModels() {
     return [
-      { id: 'gemini-2.0-flash', name: 'Gemini 2.0 Flash (Recommended — Fast & Free)', provider: 'gemini' },
-      { id: 'gemini-2.5-flash', name: 'Gemini 2.5 Flash (Latest)', provider: 'gemini' },
-      { id: 'gemini-2.0-flash-lite', name: 'Gemini 2.0 Flash Lite (Cheapest)', provider: 'gemini' },
+      { id: 'gemini-3.5-flash', name: 'Gemini 3.5 Flash (Recommended ⚡ Fastest)', provider: 'gemini' },
+      { id: 'gemini-3.1-flash-lite', name: 'Gemini 3.1 Flash Lite (Cheapest & Free)', provider: 'gemini' },
+      { id: 'gemini-3.1-flash', name: 'Gemini 3.1 Flash (Balanced Speed+Quality)', provider: 'gemini' },
+      { id: 'gemini-3.1-pro', name: 'Gemini 3.1 Pro (Deep Reasoning)', provider: 'gemini' },
     ];
   }
 }

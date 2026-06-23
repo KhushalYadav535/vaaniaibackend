@@ -1457,6 +1457,38 @@ async function handleLanguageSwitch(session, message) {
   }
 }
 
+/**
+ * Record a response the agent was cut off mid-way through.
+ *
+ * Why: when the user interrupts, we abort generation and drop the partial
+ * reply. Without recording it, the agent has amnesia about what it was
+ * saying — so it can't do the human "haan, jaise main keh raha tha..."
+ * (continue the thought) and may blindly repeat the whole line. We push
+ * the partial as an assistant turn plus a system note so the next LLM call
+ * knows it was interrupted and can decide whether to resume or move on.
+ *
+ * Safe to call from the interrupt return points: it only appends to history
+ * / call log and never touches the isProcessing / generationId state that
+ * the new turn now owns.
+ */
+function recordInterruptedResponse(session, partialText) {
+  const partial = String(partialText || '').trim();
+  if (partial.length < 2) return;
+
+  session.history.push({ role: 'assistant', content: partial, timestamp: new Date() });
+  session.history.push({
+    role: 'system',
+    content: '[You were INTERRUPTED by the user mid-sentence while saying the line above — you did NOT finish it. Respond to what the user just said. If your unfinished point is still relevant, you may briefly pick up the thread naturally (e.g. "haan, jaise main keh raha tha...") instead of restarting the whole sentence.]',
+    timestamp: new Date(),
+  });
+
+  queueCallLogUpdate(session, {
+    $push: { transcript: { role: 'assistant', content: `${partial} …(interrupted)` } }
+  }, 'assistant_interrupted');
+
+  console.log(`[Interrupt] Recorded partial response for continuity: "${partial.slice(0, 60)}"`);
+}
+
 async function processTranscript(session, transcript) {
   // ── Atomic re-entrancy guard ───────────────────────────────────────────
   // MUST be the first synchronous statements (before any await). Node runs
@@ -1758,6 +1790,7 @@ async function processTranscript(session, transcript) {
       // If a new generation has started, stop this one immediately
       if (session.currentGenerationId !== generationId) {
         console.log(`[Interrupt] Stopping old generation: ${generationId}`);
+        recordInterruptedResponse(session, fullResponseText);
         return;
       }
 
@@ -1765,6 +1798,7 @@ async function processTranscript(session, transcript) {
         // Re-check after async TTS — user may have interrupted during TTS generation
         if (session.currentGenerationId !== generationId) {
           console.log(`[Interrupt] Aborting chunk send for old generation: ${generationId}`);
+          recordInterruptedResponse(session, fullResponseText);
           return;
         }
 
@@ -1806,6 +1840,7 @@ async function processTranscript(session, transcript) {
         // Final interrupt check before sending audio
         if (session.currentGenerationId !== generationId) {
           console.log(`[Interrupt] Aborting audio send for old generation: ${generationId}`);
+          recordInterruptedResponse(session, fullResponseText);
           return;
         }
 
@@ -1894,7 +1929,21 @@ async function processTranscript(session, transcript) {
         setTimeout(() => handleEndSession(session, 'flow_ended'), 2000);
       }
     }
-    
+
+    // ── Clean-abort interrupt guard ─────────────────────────────────────
+    // When the user interrupts, the pipeline aborts and its generator may
+    // exit CLEANLY (no further chunk to trip the in-loop generationId guard).
+    // The loop then falls through here. If a newer generation has taken over,
+    // this turn was superseded: record what we'd spoken so far as an
+    // interrupted partial (for context continuity) and bail BEFORE the
+    // completion side-effects below, which would otherwise push a bogus
+    // "complete" assistant message and stomp the new turn's status.
+    if (session.currentGenerationId !== generationId) {
+      console.log(`[Interrupt] Stream ended for superseded generation: ${generationId}`);
+      recordInterruptedResponse(session, fullResponseText);
+      return;
+    }
+
     // Send a final empty buffer with isFinal=true to trigger the end of stream logic
     // This will send 'audio_end' and correctly start the _agentSpeakingTimer based on accumulated audio duration.
     sendAudioBuffer(session, Buffer.alloc(0), true);

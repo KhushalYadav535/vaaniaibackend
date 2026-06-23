@@ -64,11 +64,19 @@ class EdgeTtsPool {
    * concatenated MP3 audio buffer. Each call is one logical "turn" on
    * the same WS; the next call can immediately reuse it.
    */
-  _synthesizeOnSocket(ws, { text, voiceId, rate, pitchStr }) {
+  _synthesizeOnSocket(ws, { text, voiceId, rate, pitchStr, style = null, styleDegree = null }) {
     return new Promise((resolve, reject) => {
       const chunks = [];
       const requestId = crypto.randomBytes(16).toString('hex');
       const langCode = voiceId.split('-').slice(0, 2).join('-');
+
+      // Optional <mstts:express-as> emotion wrapper. Only ever passed for
+      // voices known to support styles (gated upstream in voicePipeline) —
+      // sending it to an unsupported voice makes Edge reject the SSML.
+      const prosody = `<prosody rate="${rate}" pitch="${pitchStr}" volume="default">${escapeXml(text)}</prosody>`;
+      const inner = style
+        ? `<mstts:express-as style="${escapeXml(style)}"${styleDegree ? ` styledegree="${escapeXml(String(styleDegree))}"` : ''}>${prosody}</mstts:express-as>`
+        : prosody;
 
       const cleanup = () => {
         ws.removeListener('message', onMessage);
@@ -106,7 +114,7 @@ class EdgeTtsPool {
           `X-RequestId:${requestId}\r\nContent-Type:application/ssml+xml\r\nPath:ssml\r\n\r\n` +
           `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="https://www.w3.org/2001/mstts" xml:lang="${langCode}">` +
             `<voice name="${voiceId}">` +
-              `<prosody rate="${rate}" pitch="${pitchStr}" volume="default">${escapeXml(text)}</prosody>` +
+              inner +
             `</voice>` +
           `</speak>`
         );
@@ -202,14 +210,18 @@ class EdgeTtsPool {
    * Public API — feature-equivalent to a one-shot Edge TTS call but
    * routed through the connection pool.
    */
-  async synthesize({ text, voiceId, speed = 1.0, pitch = 0 }) {
+  async synthesize({ text, voiceId, speed = 1.0, pitch = 0, style = null, styleDegree = null }) {
     if (!text || !text.trim()) return Buffer.alloc(0);
     const rate = `${speed >= 1 ? '+' : ''}${Math.round((speed - 1) * 100)}%`;
     const pitchStr = `${pitch >= 0 ? '+' : ''}${pitch}Hz`;
 
     // Two retries: handles the race where a pooled socket gets closed by
     // the server right as we send. The retry will open a fresh socket.
+    // `styleFailed` lets us drop the express-as wrapper if the server
+    // rejected it (some voice/style pairs are unsupported) so the user
+    // still hears the line — just without the emotion styling.
     let lastErr;
+    let styleFailed = false;
     for (let attempt = 0; attempt < 2; attempt++) {
       let slot;
       try {
@@ -219,10 +231,16 @@ class EdgeTtsPool {
         throw acquireErr;
       }
       try {
-        const audio = await this._synthesizeOnSocket(slot.ws, { text, voiceId, rate, pitchStr });
+        const effStyle = styleFailed ? null : style;
+        const audio = await this._synthesizeOnSocket(slot.ws, {
+          text, voiceId, rate, pitchStr, style: effStyle, styleDegree: effStyle ? styleDegree : null,
+        });
         this._release(slot);
         return audio;
       } catch (err) {
+        // If we sent a style and the socket died, the express-as wrapper is
+        // the most likely culprit — retry once WITHOUT it before giving up.
+        if (style && !styleFailed) styleFailed = true;
         // Socket is hosed — drop it so we don't reuse a broken WS
         try { slot.ws.close(); } catch (_) {}
         this._removeSlot(slot);

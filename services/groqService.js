@@ -128,13 +128,14 @@ class GroqService {
       messages,
       model,
       temperature,
-      // Voice replies should be SHORT (1-3 sentences). 1024 tokens lets
-      // the model write essays — which Llama 3.1 8B will, given any
-      // remotely open-ended prompt. Cap tunable via env.
-      max_tokens: Number(process.env.LLM_MAX_TOKENS || 220),
+      // Voice replies: 80 tokens ≈ 2 short sentences — perfect for phone calls.
+      // JSON analysis (post-call summaries): needs 512+ tokens for valid JSON.
+      max_tokens: jsonMode
+        ? Number(process.env.LLM_MAX_TOKENS_JSON || 512)
+        : Number(process.env.LLM_MAX_TOKENS || 80),
       // Stop on markdown patterns. Groq caps stop sequences at 4 — these
       // are the highest-impact ones for preventing bullet-list dumps.
-      stop: ['\n- ', '\n* ', '\n1.', '\n#'],
+      stop: jsonMode ? undefined : ['\n- ', '\n* ', '\n1.', '\n#'],
     };
 
     // Structured JSON output mode
@@ -199,7 +200,7 @@ class GroqService {
           messages,
           model,
           temperature,
-          max_tokens: Number(process.env.LLM_MAX_TOKENS || 220),
+          max_tokens: Number(process.env.LLM_MAX_TOKENS || 80),
           // Same stop sequences as non-streaming path. Groq's hard cap is 4.
           stop: ['\n- ', '\n* ', '\n1.', '\n#'],
           stream: true,

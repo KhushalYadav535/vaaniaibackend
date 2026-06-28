@@ -120,8 +120,85 @@ class TtsService {
    * Convert text to speech audio buffer
    * Returns: Buffer containing MP3 audio
    */
+
+  /**
+   * Normalize text for Hindi TTS — converts digits/numbers to natural speech form
+   * so ElevenLabs (and Edge TTS) don't mispronounce them.
+   * Examples:
+   *   "10.50%"  → "दस पॉइंट पचास प्रतिशत"
+   *   "10 lakh" → "दस लाख"
+   *   "5 साल"   → "पाँच साल"
+   *   "9876543210" → pronounced digit by digit
+   */
+  _normalizeHindiNumbers(text) {
+    if (!text) return text;
+
+    // Hindi number words
+    const ones = ['', 'एक', 'दो', 'तीन', 'चार', 'पाँच', 'छह', 'सात', 'आठ', 'नौ',
+                  'दस', 'ग्यारह', 'बारह', 'तेरह', 'चौदह', 'पंद्रह', 'सोलह', 'सत्रह', 'अठारह', 'उन्नीस',
+                  'बीस', 'इक्कीस', 'बाईस', 'तेईस', 'चौबीस', 'पच्चीस', 'छब्बीस', 'सत्ताईस', 'अट्ठाईस', 'उनतीस',
+                  'तीस', 'इकतीस', 'बत्तीस', 'तैंतीस', 'चौंतीस', 'पैंतीस', 'छत्तीस', 'सैंतीस', 'अड़तीस', 'उनतालीस',
+                  'चालीस', 'इकतालीस', 'बयालीस', 'तैंतालीस', 'चौवालीस', 'पैंतालीस', 'छियालीस', 'सैंतालीस', 'अड़तालीस', 'उनचास',
+                  'पचास', 'इक्यावन', 'बावन', 'तिरपन', 'चौवन', 'पचपन', 'छप्पन', 'सत्तावन', 'अट्ठावन', 'उनसठ',
+                  'साठ', 'इकसठ', 'बासठ', 'तिरसठ', 'चौंसठ', 'पैंसठ', 'छियासठ', 'सड़सठ', 'अड़सठ', 'उनहत्तर',
+                  'सत्तर', 'इकहत्तर', 'बहत्तर', 'तिहत्तर', 'चौहत्तर', 'पचहत्तर', 'छिहत्तर', 'सतहत्तर', 'अठहत्तर', 'उनासी',
+                  'अस्सी', 'इक्यासी', 'बयासी', 'तिरासी', 'चौरासी', 'पचासी', 'छियासी', 'सत्तासी', 'अट्ठासी', 'नवासी',
+                  'नब्बे', 'इक्यानवे', 'बानवे', 'तिरानवे', 'चौरानवे', 'पचानवे', 'छियानवे', 'सत्तानवे', 'अट्ठानवे', 'निन्यानवे'];
+
+    const toHindiWord = (n) => {
+      n = parseInt(n, 10);
+      if (isNaN(n)) return String(n);
+      if (n === 0) return 'शून्य';
+      if (n < 100) return ones[n] || String(n);
+      if (n === 100) return 'सौ';
+      if (n < 1000) return ones[Math.floor(n / 100)] + ' सौ' + (n % 100 ? ' ' + ones[n % 100] : '');
+      return String(n); // fallback for large numbers
+    };
+
+    let result = text;
+
+    // 1. Phone numbers: 10-digit sequences → digit by digit (e.g. 9876543210)
+    result = result.replace(/\b(\d{10})\b/g, (m) => m.split('').join(' '));
+
+    // 2. Percentage with decimal: "10.50%" → "दस पॉइंट पचास प्रतिशत"
+    result = result.replace(/(\d+)\.(\d+)%/g, (m, int, dec) => {
+      return toHindiWord(int) + ' पॉइंट ' + toHindiWord(parseInt(dec, 10)) + ' प्रतिशत';
+    });
+
+    // 3. Plain percentage: "10%" → "दस प्रतिशत"
+    result = result.replace(/(\d+)%/g, (m, n) => toHindiWord(n) + ' प्रतिशत');
+
+    // 4. Indian currency amounts with lakh/crore/hazar
+    result = result.replace(/(\d+)\s*लाख/gi, (m, n) => toHindiWord(n) + ' लाख');
+    result = result.replace(/(\d+)\s*करोड़/gi, (m, n) => toHindiWord(n) + ' करोड़');
+    result = result.replace(/(\d+)\s*हज़ार/gi, (m, n) => toHindiWord(n) + ' हज़ार');
+    result = result.replace(/(\d+)\s*lakh/gi, (m, n) => toHindiWord(n) + ' लाख');
+    result = result.replace(/(\d+)\s*crore/gi, (m, n) => toHindiWord(n) + ' करोड़');
+
+    // 5. Year (4-digit numbers starting with 19xx or 20xx)
+    result = result.replace(/\b(19|20)(\d{2})\b/g, (m, c, y) => toHindiWord(parseInt(c + y, 10)));
+
+    // 6. Small standalone numbers (1-99) in Hindi context
+    result = result.replace(/\b(\d{1,2})\b/g, (m, n) => {
+      const word = toHindiWord(parseInt(n, 10));
+      return word || m;
+    });
+
+    return result;
+  }
+
   async textToSpeech({ text, voiceId = 'en-US-JennyNeural', speed = 1.0, pitch = 0, apiKey = null, provider = 'edge-tts', style = null, styleDegree = null }) {
     if (!text || text.trim().length === 0) return Buffer.alloc(0);
+
+    // Normalize numbers for Hindi TTS providers to avoid mispronunciation
+    // (ElevenLabs reads "10.50%" as "ten point fifty percent" — we want "दस पॉइंट पचास प्रतिशत")
+    const normalizeForHindi = String(process.env.TTS_HINDI_NUMBER_NORMALIZE || 'true').toLowerCase() === 'true';
+    if (normalizeForHindi && (provider === 'eleven-labs' || provider === 'edge-tts')) {
+      text = this._normalizeHindiNumbers(text);
+    }
+
+    const _ttsStart = Date.now(); // instrumentation: measure real synth time per provider
+
 
     // express-as is an Edge-TTS-only feature. For any other provider, ignore
     // the style so it never leaks into the cache key or a non-Edge request.
@@ -134,17 +211,20 @@ class TtsService {
     }
 
     let audioBuffer;
+    let usedProvider = null; // instrumentation: which provider ACTUALLY produced audio
 
     // Respect selected provider. Use ElevenLabs only when explicitly requested.
     if (provider === 'eleven-labs' && (apiKey || process.env.ELEVENLABS_API_KEY)) {
       try {
         audioBuffer = await this.elevenLabsTTS(text, voiceId, apiKey || process.env.ELEVENLABS_API_KEY);
+        if (audioBuffer && audioBuffer.length > 0) usedProvider = 'eleven-labs';
       } catch (e) {
         console.error('ElevenLabs TTS failed, falling back to Edge:', e.message);
       }
     } else if (provider === 'cartesia' && (apiKey || process.env.CARTESIA_API_KEY)) {
       try {
         audioBuffer = await this.cartesiaTTS(text, voiceId, apiKey || process.env.CARTESIA_API_KEY);
+        if (audioBuffer && audioBuffer.length > 0) usedProvider = 'cartesia';
       } catch (e) {
         console.error('Cartesia TTS failed, falling back to Edge:', e.message);
       }
@@ -173,10 +253,17 @@ class TtsService {
       }
     }
 
+    if (!usedProvider && audioBuffer && audioBuffer.length > 0) usedProvider = 'edge-tts';
+
     // ── Store in cache ────────────────────────────────────────────────
     if (this._cacheEnabled && audioBuffer && audioBuffer.length > 0) {
       this.cache.set(text, voiceId, speed, provider, audioBuffer, style);
     }
+
+    // Instrumentation: definitively show which provider synthesized + how long
+    // it took. `requested` is what the agent asked for; `used` is what actually
+    // produced audio (reveals silent fallbacks). Helps split LLM vs TTS latency.
+    console.log(`[TTS] requested=${provider} used=${usedProvider || 'none'} voiceId=${voiceId} synth=${Date.now() - _ttsStart}ms chars=${text.length}`);
 
     return audioBuffer || Buffer.alloc(0);
   }

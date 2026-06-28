@@ -259,7 +259,32 @@ const startServer = async () => {
       } else {
         logger.info('Campaign worker NOT started here (clustered worker handled by dedicated process)');
       }
+
+      // ── OpenRouter provider warmup ─────────────────────────────────────────
+      // The first real user request hits a "cold" provider and takes ~2400ms.
+      // Send a tiny dummy request on startup so the provider is pre-warmed
+      // and subsequent real calls get the fast ~400-700ms path immediately.
+      const openRouterService = require('./services/openRouterService');
+      if (openRouterService.isAvailable()) {
+        setTimeout(async () => {
+          try {
+            const warmModel = process.env.OPENROUTER_MODEL || openRouterService.defaultModel();
+            console.log(`[Warmup] Pre-warming OpenRouter provider for ${warmModel}...`);
+            const stream = openRouterService.generateStreamResponse({
+              messages: [{ role: 'user', content: 'hi' }],
+              model: warmModel,
+              temperature: 0.1,
+            });
+            // Just pull first token then discard — enough to wake the provider
+            const first = await stream.next();
+            console.log(`[Warmup] ✅ OpenRouter provider warm (first token: "${(first.value || '').slice(0, 20)}")`);
+          } catch (e) {
+            console.warn(`[Warmup] OpenRouter warmup failed (non-critical): ${e.message}`);
+          }
+        }, 3000); // 3s delay so DB + routes are fully ready first
+      }
     });
+
   } catch (error) {
     logger.error('Failed to start server', { error: error.message });
     process.exit(1);

@@ -7,6 +7,7 @@
  *   2. Groq      — Ultra-fast LPU inference (fallback)
  *   3. Gemini    — Google free tier (last resort)
  */
+const openRouterService = require('./openRouterService');
 const cerebrasService = require('./cerebrasService');
 const groqService = require('./groqService');
 const geminiService = require('./geminiService');
@@ -627,6 +628,25 @@ class VoicePipeline {
   async generateLLMResponseWithFallback({ messages, model, temperature, apiKey, tools = null }) {
     let lastError = null;
 
+    // ── STEP 0: OpenRouter (paid gateway) — PRIMARY when a key is present.
+    // No free-tier TPM wall + throughput-sorted provider routing. Free
+    // providers below stay as the safety net if OpenRouter errors.
+    if (openRouterService.isAvailable()) {
+      try {
+        console.log(`[LLM] Trying OpenRouter: ${openRouterService.defaultModel()}`);
+        return await openRouterService.generateResponse({
+          messages,
+          model: process.env.OPENROUTER_MODEL || openRouterService.defaultModel(),
+          temperature,
+          apiKey: process.env.OPENROUTER_API_KEY,
+          tools,
+        });
+      } catch (err) {
+        lastError = err;
+        console.warn(`[LLM Fallback] OpenRouter failed → ${err.message}. Trying Cerebras...`);
+      }
+    }
+
     // ── STEP 1: Try Cerebras (World's fastest — 2000+ tok/sec) ────────────
     if (cerebrasService.isAvailable(apiKey)) {
       try {
@@ -1092,6 +1112,37 @@ class VoicePipeline {
       tokenStream = (async function* () {
         let lastErr = null;
 
+        // −1. OpenRouter (paid gateway) — PRIMARY when a key is present.
+        // Pay-as-you-go means no free-tier TPM wall, and provider routing
+        // (sort=throughput) picks the fastest upstream automatically. This is
+        // what removes the Groq-429 storm that was forcing a slow 70B fallback.
+        // Groq / Gemini / Cerebras below remain a free safety net on failure.
+        if (openRouterService.isAvailable(userSettings.openRouterKey)) {
+          try {
+            const orModel = process.env.OPENROUTER_MODEL || openRouterService.defaultModel();
+            console.log(`[LLM Stream] Trying OpenRouter: ${orModel}`);
+            const orStream = openRouterService.generateStreamResponse({
+              messages,
+              model: orModel,
+              temperature,
+              apiKey: userSettings.openRouterKey || process.env.OPENROUTER_API_KEY,
+              abortSignal: pipelineAbort.signal,
+            });
+            const first = await orStream.next();
+            if (!first.done) {
+              if (first.value) yield first.value;
+              for await (const tok of orStream) {
+                if (pipelineAbort.signal.aborted) return;
+                yield tok;
+              }
+              return; // Clean exit
+            }
+          } catch (orErr) {
+            console.warn(`[LLM Stream] OpenRouter failed (${orErr.message}). Falling back to free providers...`);
+            lastErr = orErr;
+          }
+        }
+
         // 0. Try Cerebras first if it's the selected provider (World's Fastest)
         if (llmProvider === 'cerebras' && cerebrasService.isAvailable(userSettings.cerebrasKey)) {
           try {
@@ -1370,6 +1421,7 @@ class VoicePipeline {
     let firstTokenArrived = false; // flips true on the LLM's first token — gates the filler
 
     // ── LLM Producer (runs concurrently; never awaits TTS) ────────────────
+    const _producerStart = Date.now();
     const runProducer = async () => {
       let currentSentence = '';
       let hasSpokenFirstChunk = false;
@@ -1378,6 +1430,11 @@ class VoicePipeline {
         for await (const token of tokenStream) {
           if (pipelineAbort.signal.aborted) break;
           lastTokenTime = Date.now();
+          if (!firstTokenArrived) {
+            // Instrumentation: pure LLM time-to-first-token (no TTS in this number).
+            // Compare against [TTS] synth=… and Pipeline→FirstText to split the budget.
+            console.log(`[⏱️ LATENCY] LLM→FirstToken: ${Date.now() - _producerStart}ms`);
+          }
           firstTokenArrived = true; // unblocks (and cancels) the latency-gated filler
           fullResponseText += token;
           currentSentence += token;
@@ -1498,7 +1555,11 @@ class VoicePipeline {
           // sound like two people talking back-to-back with a micro-gap between.
           // Example: "Sure, main check karta hun." → ONE chunk (natural)
           //          vs "Sure," + "main check karta hun." → TWO chunks (gap audible)
-          const isSentenceBoundary = /[.!?\n]/.test(token);
+          // Include the Devanagari danda (।) and double-danda (॥) — they are
+          // the full-stop in Hindi/Marathi. Without them, Hindi replies never
+          // chunk at sentence ends and the whole tail flushes as one big late
+          // "Remainder" chunk (worse latency + a mid-word cut is more visible).
+          const isSentenceBoundary = /[.!?।॥\n]/.test(token);
 
           // Minimum sentence length before we split — too-short first chunks
           // ("Sure.") sound clipped. 18 chars ≈ 3-4 words minimum.

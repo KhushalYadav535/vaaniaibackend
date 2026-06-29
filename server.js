@@ -123,6 +123,7 @@ app.use(
     contentSecurityPolicy: false,
     crossOriginOpenerPolicy: false,
     crossOriginResourcePolicy: { policy: 'cross-origin' },
+    frameguard: false,
   })
 );
 
@@ -147,7 +148,7 @@ app.use(
         }
         return callback(null, true);
       }
-      if (allowed.includes(origin)) return callback(null, true);
+      if (allowed.includes('*') || allowed.includes(origin)) return callback(null, true);
       logger.warn('Blocked CORS origin', { origin });
       return callback(new Error('Not allowed by CORS'));
     },

@@ -157,8 +157,20 @@ class TtsService {
 
     let result = text;
 
-    // 1. Phone numbers: 10-digit sequences → digit by digit (e.g. 9876543210)
-    result = result.replace(/\b(\d{10})\b/g, (m) => m.split('').join(' '));
+    // Helper: strip commas and parse Indian-formatted numbers like 4,00,000
+    const parseIndian = (s) => parseInt(s.replace(/,/g, ''), 10);
+
+    // Helper: convert a raw digit string to spaced digits for phone reading
+    const spaceDigits = (s) => s.split('').map(d => d === '0' ? ' ज़ीरो ' : d).join(' ').replace(/\s+/g, ' ');
+
+    // 1a. Phone numbers with dash: e.g. 0755-4098000 → "0 7 5 5 - 4 0 9 8 0 0 0"
+    //     Matches XXXX-XXXXXXX (STD code + 7-digit) or similar dash patterns
+    result = result.replace(/\b(\d{3,5})-(\d{6,8})\b/g, (m, part1, part2) =>
+      spaceDigits(part1) + ' ' + spaceDigits(part2)
+    );
+
+    // 1b. Phone numbers: continuous 10-digit sequences → digit by digit
+    result = result.replace(/\b(\d{10})\b/g, (m) => spaceDigits(m));
 
     // 2. Percentage with decimal: "10.50%" → "दस पॉइंट पचास प्रतिशत"
     result = result.replace(/(\d+)\.(\d+)%/g, (m, int, dec) => {
@@ -168,12 +180,34 @@ class TtsService {
     // 3. Plain percentage: "10%" → "दस प्रतिशत"
     result = result.replace(/(\d+)%/g, (m, n) => toHindiWord(n) + ' प्रतिशत');
 
-    // 4. Indian currency amounts with lakh/crore/hazar
-    result = result.replace(/(\d+)\s*लाख/gi, (m, n) => toHindiWord(n) + ' लाख');
-    result = result.replace(/(\d+)\s*करोड़/gi, (m, n) => toHindiWord(n) + ' करोड़');
-    result = result.replace(/(\d+)\s*हज़ार/gi, (m, n) => toHindiWord(n) + ' हज़ार');
-    result = result.replace(/(\d+)\s*lakh/gi, (m, n) => toHindiWord(n) + ' लाख');
-    result = result.replace(/(\d+)\s*crore/gi, (m, n) => toHindiWord(n) + ' करोड़');
+    // 4a. ₹ currency with Indian comma-formatting: ₹4,00,000 / ₹50,000 / ₹1,00,00,000
+    result = result.replace(/₹(\d{1,2}(?:,\d{2})*(?:,\d{3})|\d{1,3}(?:,\d{3})+|\d+)/g, (m, raw) => {
+      const n = parseIndian(raw);
+      if (n >= 10000000) return toHindiWord(Math.round(n / 10000000)) + ' करोड़ रुपये';
+      if (n >= 100000)  return toHindiWord(Math.round(n / 100000))  + ' लाख रुपये';
+      if (n >= 1000)    return toHindiWord(Math.round(n / 1000))    + ' हज़ार रुपये';
+      return toHindiWord(n) + ' रुपये';
+    });
+
+        // Helper for amounts with decimals
+    const processDecimalWord = (n, word) => {
+      if (n.includes('.')) {
+        const [i, d] = n.split('.');
+        return toHindiWord(i) + ' पॉइंट ' + toHindiWord(parseInt(d, 10)) + ' ' + word;
+      }
+      return toHindiWord(n) + ' ' + word;
+    };
+
+    // 4b. Indian currency amounts with lakh/crore/hazar words (supports decimals like 1.5 and optional ₹ prefix)
+    result = result.replace(/(?:₹|Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(लाख|lakh)s?/gi, (m, n) => processDecimalWord(n, 'लाख') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
+    result = result.replace(/(?:₹|Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(करोड़|crore)s?/gi, (m, n) => processDecimalWord(n, 'करोड़') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
+    result = result.replace(/(?:₹|Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(हज़ार|thousand)s?/gi, (m, n) => processDecimalWord(n, 'हज़ार') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
+    
+    // 4c. Simple ₹ with decimals (e.g., ₹1.5 -> एक पॉइंट पाँच रुपये)
+    result = result.replace(/₹(\d+\.\d+)/g, (m, n) => {
+       const [i, d] = n.split('.');
+       return toHindiWord(i) + ' पॉइंट ' + toHindiWord(parseInt(d, 10)) + ' रुपये';
+    });
 
     // 5. Year (4-digit numbers starting with 19xx or 20xx)
     result = result.replace(/\b(19|20)(\d{2})\b/g, (m, c, y) => toHindiWord(parseInt(c + y, 10)));

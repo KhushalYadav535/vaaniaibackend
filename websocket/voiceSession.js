@@ -224,6 +224,37 @@ function mergeUtterance(buffer, text) {
   // Exact trailing duplicate.
   if (an.endsWith(bn)) return a;
 
+  // ── Word-level overlap detection ──────────────────────────────────────
+  // Handles the case where an interrupt-path flush sent a PARTIAL version
+  // of what the user said (e.g. "जल्दी तैयार कर"), then the speech_final
+  // arrives with the complete version ("जल्दी ही तैयार कर लूंगा").
+  // The old code appended both → "जल्दी तैयार कर जल्दी ही तैयार कर लूगा."
+  //
+  // Strategy: split both into word tokens, then find the longest suffix of `a`
+  // that is also a prefix of `b` (ignoring common punctuation). If the overlap
+  // covers ≥ 50% of `a` by word count, treat `b` as the corrected full version
+  // and replace `a` entirely.
+  const wordsOf = (s) => s.toLowerCase().replace(/[।,\.!?]/g, '').split(/\s+/).filter(Boolean);
+  const aWords = wordsOf(a);
+  const bWords = wordsOf(b);
+
+  // Find the longest suffix-of-a that is also a prefix-of-b
+  let maxOverlap = 0;
+  const maxCheck = Math.min(aWords.length, bWords.length);
+  for (let k = maxCheck; k >= 2; k--) {
+    const aSuffix = aWords.slice(aWords.length - k);
+    const bPrefix = bWords.slice(0, k);
+    if (aSuffix.every((w, i) => w === bPrefix[i])) {
+      maxOverlap = k;
+      break;
+    }
+  }
+
+  // If the overlap covers ≥ 50% of buffer words → `b` is the full correction
+  if (maxOverlap > 0 && maxOverlap >= aWords.length * 0.5) {
+    return b;
+  }
+
   // Heuristic for re-dictated content: if both end in a digit run and one
   // run is an extension of the other, replace the tail with the longer run.
   // The separator class includes : . / because STT (smart_format) sometimes
@@ -241,6 +272,7 @@ function mergeUtterance(buffer, text) {
   // Genuinely new content — append.
   return `${a} ${b}`.replace(/\s+/g, ' ').trim();
 }
+
 
 function commitTranscript(session, transcript, { immediate = false } = {}) {
   const text = (transcript || '').trim();
@@ -584,6 +616,13 @@ const UNIVERSAL_HINGLISH_SEED = [
   'online', 'offline', 'submit', 'apply', 'register', 'login', 'link',
   'branch', 'manager', 'officer', 'complaint', 'request', 'cancel',
   'block', 'close', 'open', 'start', 'stop', 'change', 'update', 'add',
+  // Hindi income/loan vocabulary — these are frequently misrecognized by Deepgram
+  // without boosting (e.g. "सालाना" → "सलीना", "मासिक" → garbled)
+  'salary', 'income', 'monthly', 'annual', 'yearly',
+  'सालाना', 'मासिक', 'वेतन', 'आय', 'तनख्वाह',
+  'लाख', 'हज़ार', 'करोड़', 'रुपए', 'रुपये',
+  'होम लोन', 'गोल्ड लोन', 'कार लोन', 'पर्सनल लोन',
+  'सिबिल', 'CIBIL', 'ITR', 'सैलरी स्लिप',
 ];
 
 /**

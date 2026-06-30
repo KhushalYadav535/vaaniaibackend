@@ -217,13 +217,13 @@ class GeminiService {
     const key = this.getApiKey(apiKey);
     if (!key) throw new Error('No Gemini API key for embeddings');
 
-    const url = `${GEMINI_BASE}/models/text-embedding-004:embedContent?key=${key}`;
+    const url = `${GEMINI_BASE}/models/gemini-embedding-001:embedContent?key=${key}`;
 
     const resp = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: 'models/text-embedding-004',
+        model: 'models/gemini-embedding-001',
         content: { parts: [{ text }] },
       }),
     });
@@ -243,10 +243,10 @@ class GeminiService {
     const key = this.getApiKey(apiKey);
     if (!key) throw new Error('No Gemini API key for embeddings');
 
-    const url = `${GEMINI_BASE}/models/text-embedding-004:batchEmbedContents?key=${key}`;
+    const url = `${GEMINI_BASE}/models/gemini-embedding-001:batchEmbedContents?key=${key}`;
 
     const requests = texts.map(text => ({
-      model: 'models/text-embedding-004',
+      model: 'models/gemini-embedding-001',
       content: { parts: [{ text }] },
     }));
 

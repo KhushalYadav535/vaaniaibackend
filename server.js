@@ -36,6 +36,7 @@ const widgetRoutes = require('./routes/widget');
 const knowledgeBaseRoutes = require('./routes/knowledgeBase');
 const callFlowsRoutes = require('./routes/callFlows');
 const testSuiteRoutes = require('./routes/testSuites');
+const voicesRoutes    = require('./routes/voices');
 
 // ─── WebSocket Handlers ─────────────────────────────────────────────────────
 const { setupVoiceSession, canAcceptNewSession, getActiveSessionCount } = require('./websocket/voiceSession');
@@ -224,6 +225,7 @@ app.use('/api/widget', widgetRoutes);
 app.use('/api/knowledge-base', knowledgeBaseRoutes);
 app.use('/api/call-flows', callFlowsRoutes);
 app.use('/api/test-suites', testSuiteRoutes);
+app.use('/api/voices', voicesRoutes);
 
 // ─── 404 Handler ────────────────────────────────────────────────────────────
 app.use('*', (req, res) => {

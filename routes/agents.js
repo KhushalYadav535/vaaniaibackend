@@ -14,11 +14,11 @@ router.use(protect);
  * message string if a reference is invalid, or null when everything is fine.
  */
 async function validateAgentReferences(userId, body) {
-  const { knowledgeBaseId, workflowId, transferToAgentId } = body;
+  const { knowledgeBaseIds, workflowId, transferToAgentId } = body;
 
-  if (knowledgeBaseId) {
-    const kb = await KnowledgeBase.findOne({ _id: knowledgeBaseId, userId }).select('_id');
-    if (!kb) return 'Knowledge base not found';
+  if (knowledgeBaseIds && Array.isArray(knowledgeBaseIds) && knowledgeBaseIds.length > 0) {
+    const kbs = await KnowledgeBase.find({ _id: { $in: knowledgeBaseIds }, userId }).select('_id');
+    if (kbs.length !== knowledgeBaseIds.length) return 'One or more Knowledge bases not found';
   }
   if (workflowId) {
     const flow = await CallFlow.findOne({ _id: workflowId, userId }).select('_id');
@@ -63,7 +63,7 @@ router.get('/:id', async (req, res, next) => {
 // @route   POST /api/agents
 router.post('/', async (req, res, next) => {
   try {
-    const { name, systemPrompt, firstMessage, language, voice, llm, temperature, maxDuration, endCallMessage, endCallPhrases, webhooks, tools, voicemailMessage, transferNumber, transferToAgentId, transferConditions, postCallActions, advanced, knowledgeBaseId, workflowId } = req.body;
+    const { name, systemPrompt, firstMessage, language, voice, llm, temperature, maxDuration, endCallMessage, endCallPhrases, webhooks, tools, voicemailMessage, transferNumber, transferToAgentId, transferConditions, postCallActions, advanced, knowledgeBaseIds, workflowId } = req.body;
 
     const refError = await validateAgentReferences(req.user._id, req.body);
     if (refError) {
@@ -77,7 +77,7 @@ router.post('/', async (req, res, next) => {
       firstMessage,
       language: language || 'en',
       voice: voice || { provider: 'edge-tts', voiceId: 'en-US-JennyNeural' },
-      llm: llm || { provider: 'gemini', model: 'gemini-3.1-flash-lite' },
+      llm: llm || { provider: 'openrouter', model: 'meta-llama/llama-3.3-70b-instruct' },
       temperature: temperature || 0.7,
       maxDuration: maxDuration || 600,
       endCallMessage,
@@ -90,7 +90,7 @@ router.post('/', async (req, res, next) => {
       transferConditions: transferConditions || {},
       postCallActions: postCallActions || {},
       advanced: advanced || {},
-      knowledgeBaseId: knowledgeBaseId || undefined,
+      knowledgeBaseIds: Array.isArray(knowledgeBaseIds) ? knowledgeBaseIds : [],
       workflowId: workflowId || undefined,
     });
 

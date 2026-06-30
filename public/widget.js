@@ -39,7 +39,14 @@
     backendOrigin = 'http://localhost:5000';
   }
 
-  var frontendOrigin = config.frontendUrl || backendOrigin.replace(':5000', ':3000');
+  var frontendOrigin = config.frontendUrl;
+  if (!frontendOrigin) {
+    if (backendOrigin.indexOf('localhost') !== -1 || backendOrigin.indexOf('127.0.0.1') !== -1) {
+      frontendOrigin = backendOrigin.replace(':5000', ':3000');
+    } else {
+      frontendOrigin = 'https://vaani-ai-five.vercel.app';
+    }
+  }
 
   // ─── Create Styles ───
   var style = document.createElement('style');

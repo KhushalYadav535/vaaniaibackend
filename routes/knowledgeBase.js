@@ -42,7 +42,7 @@ router.get('/:id', async (req, res, next) => {
     if (!kb) return res.status(404).json({ success: false, message: 'Knowledge base not found' });
     
     // Check if it's attached to any agents
-    const attachedAgents = await Agent.find({ knowledgeBaseId: kb._id }).select('name');
+    const attachedAgents = await Agent.find({ knowledgeBaseIds: kb._id }).select('name');
     
     // Don't send full chunks to frontend, just metadata
     const kbObj = kb.toObject();
@@ -178,8 +178,8 @@ router.delete('/:id', async (req, res, next) => {
     
     // Detach from agents
     await Agent.updateMany(
-      { knowledgeBaseId: kb._id },
-      { $set: { knowledgeBaseId: null } }
+      { knowledgeBaseIds: kb._id },
+      { $pull: { knowledgeBaseIds: kb._id } }
     );
     
     res.json({ success: true, message: 'Knowledge base deleted' });

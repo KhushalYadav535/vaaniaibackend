@@ -100,9 +100,9 @@ class AgentSimulator {
       for (let turn = 0; turn < maxTurns; turn++) {
         // Optional KB grounding, matching live-call behavior.
         let kbContext = '';
-        if (agent.knowledgeBaseId) {
+        if (agent.knowledgeBaseIds && agent.knowledgeBaseIds.length > 0) {
           kbContext = await ragService
-            .getContextForQuery(callerMsg, agent.knowledgeBaseId)
+            .getContextForQuery(callerMsg, agent.knowledgeBaseIds)
             .catch(() => '');
         }
 

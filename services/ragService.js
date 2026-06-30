@@ -489,14 +489,16 @@ class RAGService {
    * Called during live calls to augment agent's knowledge
    * Enhanced: Uses hybrid search when embeddings are available
    */
-  async getContextForQuery(query, knowledgeBaseId) {
-    if (!knowledgeBaseId) return '';
+  async getContextForQuery(query, knowledgeBaseIds) {
+    if (!knowledgeBaseIds || knowledgeBaseIds.length === 0) return '';
     const minChars = Number(process.env.RAG_MIN_QUERY_CHARS || 12);
     const cacheTtlMs = Number(process.env.RAG_CONTEXT_CACHE_TTL_MS || 15000);
     const normalizedQuery = (query || '').trim().toLowerCase();
     if (!normalizedQuery || normalizedQuery.length < minChars) return '';
 
-    const cacheKey = `${knowledgeBaseId}:${normalizedQuery}`;
+    // Sort IDs so cache key is deterministic
+    const kbIdsStr = [...knowledgeBaseIds].sort().join(',');
+    const cacheKey = `${kbIdsStr}:${normalizedQuery}`;
     const cached = this.contextCache.get(cacheKey);
     if (cached && Date.now() - cached.ts < cacheTtlMs) {
       return cached.value;
@@ -504,19 +506,31 @@ class RAGService {
 
     try {
       const topK = Number(process.env.RAG_TOP_K || 3);
-      let chunks = [];
+      
+      const allChunksPromises = knowledgeBaseIds.map(async (kbId) => {
+        const kb = await KnowledgeBase.findById(kbId);
+        if (kb && kb.hasEmbeddings) {
+          return this.hybridSearch(normalizedQuery, kbId, topK);
+        } else if (kb) {
+          return this.searchRelevantChunks(normalizedQuery, kbId, topK);
+        }
+        return [];
+      });
 
-      // Check if KB has embeddings available
-      const kb = await KnowledgeBase.findById(knowledgeBaseId);
-      if (kb && kb.hasEmbeddings) {
-        // Use hybrid search (semantic + keywords)
-        chunks = await this.hybridSearch(normalizedQuery, knowledgeBaseId, topK);
-        console.log(`[RAG] Hybrid search: ${chunks.length} chunks (semantic+keywords)`);
-      } else {
-        // Fallback to keyword-only search
-        chunks = await this.searchRelevantChunks(normalizedQuery, knowledgeBaseId, topK);
-        console.log(`[RAG] Keyword search: ${chunks.length} chunks`);
+      const chunkArrays = await Promise.all(allChunksPromises);
+      let allChunks = chunkArrays.flat();
+      
+      const uniqueChunks = [];
+      const seenTexts = new Set();
+      for (const c of allChunks) {
+        if (!seenTexts.has(c.text)) {
+          seenTexts.add(c.text);
+          uniqueChunks.push(c);
+        }
       }
+
+      uniqueChunks.sort((a, b) => b.score - a.score);
+      const chunks = uniqueChunks.slice(0, topK);
 
       if (chunks.length === 0) return '';
 

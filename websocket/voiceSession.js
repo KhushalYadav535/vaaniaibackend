@@ -1716,14 +1716,14 @@ async function processTranscript(session, transcript) {
 
     // Kick off RAG in parallel — we'll await it just before invoking the pipeline.
     const _ragStart = Date.now();
-    const ragPromise = (session.agent?.knowledgeBaseId
-      ? ragService.getContextForQuery(transcript, session.agent.knowledgeBaseId)
+    const ragPromise = (session.agent?.knowledgeBaseIds && session.agent.knowledgeBaseIds.length > 0)
+      ? ragService.getContextForQuery(transcript, session.agent.knowledgeBaseIds)
           .then(ctx => {
             if (ctx) console.log(`[RAG] Retrieved context for session ${session.id} (${Date.now() - _ragStart}ms)`);
             return ctx || '';
           })
           .catch(e => { console.error('[RAG] Context retrieval error:', e.message); return ''; })
-      : Promise.resolve(''));
+      : Promise.resolve('');
 
     // 🔄 HUMAN HANDOFF CHECK
     // Check if call should be transferred to a human agent
@@ -1795,7 +1795,7 @@ async function processTranscript(session, transcript) {
     // RAG was kicked off in parallel with sentiment above. Now await it
     // (sentiment continues in the background and is not blocking).
     const ragContext = await ragPromise;
-    if (session.agent?.knowledgeBaseId) {
+    if (session.agent?.knowledgeBaseIds && session.agent.knowledgeBaseIds.length > 0) {
       console.log(`[⏱️ LATENCY] RAG lookup (parallel): ${Date.now() - _ragStart}ms`);
     }
 

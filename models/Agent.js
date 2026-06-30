@@ -38,12 +38,12 @@ const agentSchema = new mongoose.Schema({
   llm: {
     provider: {
       type: String,
-      enum: ['groq', 'openai', 'gemini', 'cerebras'],
-      default: 'gemini',
+      enum: ['groq', 'openai', 'gemini', 'cerebras', 'openrouter'],
+      default: 'openrouter',
     },
     model: {
       type: String,
-      default: 'gemini-3.1-flash-lite', // Gemini budget fast model
+      default: 'meta-llama/llama-3.3-70b-instruct',
     },
   },
   temperature: { type: Number, default: 0.7, min: 0, max: 1 },
@@ -111,11 +111,10 @@ const agentSchema = new mongoose.Schema({
   },
   callsCount: { type: Number, default: 0 },
   totalMinutes: { type: Number, default: 0 },
-  knowledgeBaseId: {
+  knowledgeBaseIds: [{
     type: mongoose.Schema.Types.ObjectId,
     ref: 'KnowledgeBase',
-    default: null,
-  },
+  }],
   workflowId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'CallFlow',

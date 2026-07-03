@@ -842,7 +842,7 @@ function startIdleTimer(session) {
     } catch (e) {
       console.error("Failed to trigger idle engagement:", e);
     }
-  }, 10000);
+  }, idleMs);
 }
 
 async function handleMessage(session, message) {
@@ -918,12 +918,31 @@ async function handleMessage(session, message) {
       if (!session.isProcessing && session._lastSttTranscript && session._lastSttTranscript.trim().length > 0) {
         const pendingTranscript = session._lastSttTranscript;
         const delayMs = Number(process.env.STT_VAD_FINALIZATION_DELAY_MS || 250);
-        console.log(`[VAD] user_speech_end observed pending interim; waiting ${delayMs}ms for Deepgram speech_final: "${pendingTranscript}"`);
 
         if (session._vadFinalizationTimer) clearTimeout(session._vadFinalizationTimer);
+
+        // If a soft-commit timer is already running (Deepgram speech_final already
+        // called commitTranscript), just bump the timer — DON'T call commitTranscript
+        // again or we double-fire the same transcript through the LLM twice.
+        // Also clear _lastSttTranscript and _silenceTimer so the 900ms silence
+        // fallback timer doesn't re-commit the stale text after the turn ends.
+        if (session._softCommitBuffer && session._softCommitTimer) {
+          console.log(`[VAD] user_speech_end → soft-commit already in flight, bumping timer: "${pendingTranscript}"`);
+          session._lastSttTranscript = '';
+          if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
+          bumpSoftCommitTimer(session);
+          break;
+        }
+
+        console.log(`[VAD] user_speech_end observed pending interim; waiting ${delayMs}ms for Deepgram speech_final: "${pendingTranscript}"`);
+
+        // Wait briefly for Deepgram speech_final. If it arrives first,
+        // commitTranscript will be called by the STT handler and this timer
+        // will find a soft-commit in flight and bail out gracefully.
         session._vadFinalizationTimer = setTimeout(() => {
           session._vadFinalizationTimer = null;
           if (session.isProcessing || session.agentSpeaking) return;
+          // If Deepgram speech_final already committed it, soft-commit will be in flight
           if (session._softCommitBuffer && session._softCommitTimer) {
             bumpSoftCommitTimer(session);
             return;
@@ -940,6 +959,7 @@ async function handleMessage(session, message) {
           console.warn(`[VAD] Interim fallback commit enabled; buffering: "${pending}"`);
           commitTranscript(session, pending);
         }, delayMs);
+
         const finalTranscript = session._lastSttTranscript;
         session._lastSttTranscript = '';
         console.log(`[VAD] user_speech_end → soft-commit window: "${finalTranscript}"`);
@@ -1286,7 +1306,11 @@ async function handleInit(session, message) {
     });
 
     session.status = 'listening';
-    startIdleTimer(session);
+    // NOTE: startIdleTimer is NOT called here intentionally.
+    // The greeting uses sendAudioBuffer, which schedules _agentSpeakingTimer
+    // based on actual audio duration. When that timer fires (greeting done playing),
+    // it calls startIdleTimer(session) correctly. Calling it here would start
+    // the 8s idle countdown BEFORE the greeting even finishes playing on the client.
 
     // Mid-call server event — fire AFTER ready so the customer doesn't
     // pay the (small) cost of a slow webhook handshake on TTFA.
@@ -1542,6 +1566,42 @@ async function processTranscript(session, transcript) {
   if (!session.agent || !transcript || typeof transcript !== 'string' || transcript.trim() === '') {
     return;
   }
+
+  // ── Duplicate-transcript dedup guard ──────────────────────────────────
+  // Catches three patterns of duplicate commits for the same utterance:
+  //
+  // 1. EXACT DUPLICATE — late Deepgram speech_final arrives after first turn
+  //    completes, re-committing the identical string.
+  //
+  // 2. CONTINUATION — user said one sentence but a mid-sentence pause caused
+  //    an early VAD soft-commit. E.g.:
+  //      Turn 1 (early): "apply कैसे कर"          ← VAD fired on pause
+  //      Turn 2 (full):  "apply कैसे कर सकता हूं?" ← Deepgram full speech_final
+  //    The full sentence STARTS WITH the partial → same utterance, skip it.
+  //
+  // 3. PARTIAL — first commit was a full sentence, a late/redundant partial
+  //    fires after. The partial is a prefix of what was already processed.
+  //
+  // Window: 5s — enough to catch slow speech_final on interrupted turns
+  // but short enough that genuine re-asks a few seconds later go through.
+  const _DEDUP_WINDOW_MS = 5000;
+  const _cleanedTranscript = transcript.trim().toLowerCase();
+  if (!transcript.startsWith('[SYSTEM_EVENT') && session._lastProcessedTranscript && session._lastProcessedAt) {
+    const _msSinceLast = Date.now() - session._lastProcessedAt;
+    const _prev = session._lastProcessedTranscript;
+    const _isExactDupe = _cleanedTranscript === _prev;
+    // Continuation: new transcript starts with what we already answered
+    const _isContinuation = _cleanedTranscript.startsWith(_prev) && _prev.length >= 6;
+    // Partial: a late partial of something already fully answered
+    const _isLatePart = _prev.startsWith(_cleanedTranscript) && _cleanedTranscript.length >= 6;
+    if (_msSinceLast < _DEDUP_WINDOW_MS && (_isExactDupe || _isContinuation || _isLatePart)) {
+      console.log(`[processTranscript] Dedup (${_isExactDupe ? 'exact' : _isContinuation ? 'continuation' : 'late-partial'}, ${Math.round(_msSinceLast)}ms): skipping: "${transcript.slice(0, 60)}"`);
+      return;
+    }
+  }
+  session._lastProcessedTranscript = _cleanedTranscript;
+  session._lastProcessedAt = Date.now();
+
   session.isProcessing = true;
   session.latency.turnStartedAt = Date.now();
   session.latency.llmStartedAt = null;

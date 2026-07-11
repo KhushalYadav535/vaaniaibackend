@@ -37,6 +37,7 @@ const knowledgeBaseRoutes = require('./routes/knowledgeBase');
 const callFlowsRoutes = require('./routes/callFlows');
 const testSuiteRoutes = require('./routes/testSuites');
 const voicesRoutes    = require('./routes/voices');
+const promptOptimizerRoutes = require('./routes/promptOptimizer');
 
 // ─── WebSocket Handlers ─────────────────────────────────────────────────────
 const { setupVoiceSession, canAcceptNewSession, getActiveSessionCount } = require('./websocket/voiceSession');
@@ -209,6 +210,8 @@ app.get('/health', (req, res) => {
 
 // ─── API Routes ─────────────────────────────────────────────────────────────
 app.use('/api/auth', authLimiter, authRoutes);
+app.use('/api/visitors', require('./routes/visitors'));
+app.use('/api/public', require('./routes/public'));
 app.use('/api/agents', agentRoutes);
 app.use('/api/numbers', numberRoutes);
 app.use('/api/calls', callRoutes);
@@ -226,6 +229,7 @@ app.use('/api/knowledge-base', knowledgeBaseRoutes);
 app.use('/api/call-flows', callFlowsRoutes);
 app.use('/api/test-suites', testSuiteRoutes);
 app.use('/api/voices', voicesRoutes);
+app.use('/api/optimize-prompt', promptOptimizerRoutes);
 
 // ─── 404 Handler ────────────────────────────────────────────────────────────
 app.use('*', (req, res) => {

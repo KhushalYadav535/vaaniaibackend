@@ -11,8 +11,10 @@ const callLogSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: true,
+    required: false,  // null for visitor/widget sessions
+    default: null,
   },
+  visitorEmail: { type: String, default: '' }, // set for visitor (OTP-verified) sessions
   agentId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Agent',
@@ -73,7 +75,7 @@ const callLogSchema = new mongoose.Schema({
   qa: {
     score: { type: Number, min: 0, max: 100 }, // 0-100 QA score
     grade: { type: String, enum: ['A', 'B', 'C', 'D', 'F', ''] },
-    feedback: String,
+    feedback: String, // auto-generated: what the agent did well / could improve
     reviewer: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }
   },
   crm: {

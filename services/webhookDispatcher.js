@@ -31,11 +31,19 @@ class WebhookDispatcher {
    * @param {Object} userSettings - user.settings object
    */
   async dispatch(callLog, agent, userSettings = {}) {
-    const webhookUrl = userSettings?.postCallWebhookUrl;
+    // ── Resolve webhook URL ───────────────────────────────────────────────────
+    // Priority: agent.webhooks.callEnded (per-agent) → userSettings.postCallWebhookUrl (global)
+    const agentWebhookUrl = agent?.webhooks?.callEnded;
+    const globalWebhookUrl = userSettings?.postCallWebhookUrl;
+    const webhookUrl = (agentWebhookUrl && agentWebhookUrl.trim()) || (globalWebhookUrl && globalWebhookUrl.trim()) || '';
 
-    if (!webhookUrl || webhookUrl.trim() === '') {
-      return; // No webhook configured — skip silently
+    if (!webhookUrl) {
+      console.log(`[Webhook] ⚠️ Skipped — no webhook URL configured (set agent.webhooks.callEnded or Settings → Integrations)`);
+      return;
     }
+
+    const source = (agentWebhookUrl && agentWebhookUrl.trim()) ? 'agent' : 'global';
+    console.log(`[Webhook] 🎯 Using ${source}-level webhook URL for agent "${agent?.name || 'unknown'}"`);
 
     // ── Build the payload ────────────────────────────────────────────────────
     const payload = {
@@ -116,7 +124,9 @@ class WebhookDispatcher {
       'X-VaaniAI-Timestamp': payload.timestamp,
     };
 
-    const secret = userSettings?.webhookSecret;
+    // Agent-level secret takes priority over global secret
+    const secret = (agent?.serverEvents?.secret && agent.serverEvents.secret.trim())
+      || userSettings?.webhookSecret;
     if (secret && secret.trim() !== '') {
       const signature = crypto
         .createHmac('sha256', secret)

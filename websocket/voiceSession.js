@@ -455,13 +455,13 @@ function buildSessionOnTranscript(session) {
             return;
           }
 
-          const allowInterimFallback = String(process.env.STT_ALLOW_INTERIM_FALLBACK_COMMIT || 'false').toLowerCase() === 'true';
-          if (!allowInterimFallback) {
-            console.log('[STT] Interrupt silence fallback saw interim text but no speech_final; not committing interim transcript');
-            return;
-          }
-
-          console.warn(`[STT] Interrupt interim fallback commit enabled; buffering: "${pending}"`);
+          // On the interrupt path the transcript is already validated
+          // (interrupt threshold was met). If Deepgram doesn't fire
+          // speech_final within 700ms, commit it unconditionally — there
+          // is no risk of double-fire here because the soft-commit window
+          // deduplicates. Silently dropping the user's speech (the old
+          // behaviour) caused the "agent won't listen" bug.
+          console.log(`[STT] Interrupt silence fallback committing: "${pending}"`);
           commitTranscript(session, pending);
         }, 700);
       }
@@ -569,15 +569,12 @@ function buildSessionOnTranscript(session) {
         return;
       }
 
-      const allowInterimFallback = String(process.env.STT_ALLOW_INTERIM_FALLBACK_COMMIT || 'false').toLowerCase() === 'true';
-      if (!allowInterimFallback) {
-        console.log('[STT] silence fallback saw interim text but no speech_final; not committing interim transcript');
-        return;
-      }
-
+      // Normal silence fallback: if Deepgram produced an interim transcript
+      // but never sent speech_final within the silence window, commit it.
+      // The soft-commit window deduplicates so there's no double-fire risk.
       const pending = session._lastSttTranscript;
       if (!pending || pending.trim().length < 2) return;
-      console.warn(`[STT] Interim fallback commit enabled; buffering: "${pending}"`);
+      console.log(`[STT] Silence fallback committing interim: "${pending}"`);
       commitTranscript(session, pending);
     }, silenceFallbackMs);
   };
@@ -801,6 +798,11 @@ function setupVoiceSession(wss) {
       } catch (error) {
         console.error(`❌ Session ${sessionId} error:`, error.message);
         safeSend(ws, { type: 'error', message: error.message });
+        // If init failed the session is unusable — close it cleanly so the
+        // client doesn't wait for the 5-minute idle reaper to reclaim the slot.
+        if (session.status !== 'ready') {
+          try { ws.close(4500, error.message?.slice(0, 120) || 'init_error'); } catch (_) {}
+        }
       }
     });
 
@@ -1065,23 +1067,27 @@ async function handleInit(session, message) {
     throw new Error('Invalid or expired token. Please log in again.');
   }
 
-  // Load user
-  const user = await User.findById(decoded.id);
-  if (!user) throw new Error('User not found');
+  // Load user (skip for visitors)
+  let user = null;
+  if (decoded.type !== 'visitor') {
+    user = await User.findById(decoded.id);
+    if (!user) throw new Error('User not found');
+  }
 
-  // Load agent - widget tokens include agentId and bypass ownership check
+  // Load agent - widget and visitor tokens include agentId and bypass ownership check
   let agent;
-  if (decoded.type === 'widget') {
-    agent = await Agent.findOne({ _id: decoded.agentId, status: 'active' });
+  if (decoded.type === 'widget' || decoded.type === 'visitor') {
+    agent = await Agent.findOne({ _id: agentId, status: 'active' });
     if (!agent) throw new Error('Agent not found or inactive');
   } else {
     agent = await Agent.findOne({ _id: agentId, userId: user._id });
     if (!agent) throw new Error('Agent not found or not authorized');
   }
 
-  session.userId = user._id;
+  session.userId = user ? user._id : null;
+  session.visitorEmail = decoded.type === 'visitor' ? decoded.email : null;
   session.agent = agent;
-  session.userSettings = user.settings || {};
+  session.userSettings = user ? user.settings : {};
   session.prefersBinaryAudio = !!preferBinaryAudio;
   session.enableStt = enableStt !== false;
   session.streamProtocol = !!streamProtocol;
@@ -1096,9 +1102,10 @@ async function handleInit(session, message) {
   }
   
   // Fetch User Memory (Retell/Vapi style)
+  // Skip for visitor sessions where user is null
   const UserMemory = require('../models/UserMemory');
   const userPhone = session.callParams?.from || 'test_user'; // Default for test agent
-  const memory = await UserMemory.findOne({ userId: user._id, phone: userPhone });
+  const memory = user ? await UserMemory.findOne({ userId: user._id, phone: userPhone }) : null;
   session.memory = memory;
 
   if (session.enableStt) {
@@ -1198,7 +1205,8 @@ async function handleInit(session, message) {
 
   // Create initial call log
   const callLog = await CallLog.create({
-    userId: user._id,
+    userId: user?._id ?? null,
+    visitorEmail: session.visitorEmail || '',
     agentId: agent._id,
     agentName: agent.name,
     direction: 'web',
@@ -1584,7 +1592,9 @@ async function processTranscript(session, transcript) {
   //
   // Window: 5s — enough to catch slow speech_final on interrupted turns
   // but short enough that genuine re-asks a few seconds later go through.
-  const _DEDUP_WINDOW_MS = 5000;
+  const _DEDUP_WINDOW_MS = 8000; // Extended from 5s: VAD fires ~0ms, Deepgram speech_final may arrive
+  // up to 6-7s later (after LLM responds). 8s safely catches the double-fire
+  // pattern without blocking genuine re-asks (user typically waits 10s+).
   const _cleanedTranscript = transcript.trim().toLowerCase();
   if (!transcript.startsWith('[SYSTEM_EVENT') && session._lastProcessedTranscript && session._lastProcessedAt) {
     const _msSinceLast = Date.now() - session._lastProcessedAt;
@@ -1623,13 +1633,16 @@ async function processTranscript(session, transcript) {
     session.currentGenerationId = generationId;
     session.mainPipelineResponded = false;
 
-    // Send transcript to client
-    safeSend(session.ws, {
-      type: 'transcript',
-      text: transcript,
-      isFinal: true,
-      role: 'user',
-    });
+    // Send transcript to client — but hide SYSTEM_EVENT messages which are
+    // internal LLM prompts, not real user speech. Showing them confuses users.
+    if (!transcript.startsWith('[SYSTEM_EVENT')) {
+      safeSend(session.ws, {
+        type: 'transcript',
+        text: transcript,
+        isFinal: true,
+        role: 'user',
+      });
+    }
 
     // Handle Backchanneling (Vapi/Retell style) — NON-BLOCKING to avoid delaying LLM
     if (session.agent.advanced?.backchanneling) {
@@ -2478,16 +2491,25 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
   const timestamp = Date.now();
 
   // Accumulate estimated audio duration for EVERY chunk (not just the final one).
-  // MP3 at ~32kbps: bytes / 4000 ≈ seconds. This must happen synchronously here
-  // (before the async task) so the timer gets the full total when isFinal fires.
-  // Previously this was inside the isFinal block only — so streaming chunks
-  // (isFinal=false) never accumulated, the timer was set to ~500ms regardless
-  // of how many chunks were queued, and agentSpeaking cleared mid-sentence.
+  // This must happen synchronously before the async task so the timer gets the
+  // full total when isFinal fires.
+  //
+  // Bytes-per-second by provider/format:
+  //   ElevenLabs: mp3_44100_128 → 128kbps → 16000 bytes/sec
+  //   Edge TTS:   mp3 at ~64kbps → 8000 bytes/sec
+  //   Fallback:   32kbps → 4000 bytes/sec
+  // Using wrong rate (32kbps for ElevenLabs) caused agentSpeaking to stay true
+  // 4× too long, blocking all user speech in listening mode.
   if (buffer && buffer.length > 0) {
     if (!session._audioQueueDurationMs) session._audioQueueDurationMs = 0;
-    const chunkDurationMs = Math.round((buffer.length / 4000) * 1000);
-    session._audioQueueDurationMs += Math.max(200, chunkDurationMs);
+    const provider = session.agent?.voice?.provider || 'edge-tts';
+    const bytesPerSec = provider === 'eleven-labs' ? 16000
+                      : provider === 'edge-tts'    ? 8000
+                      : 4000;
+    const chunkDurationMs = Math.round((buffer.length / bytesPerSec) * 1000);
+    session._audioQueueDurationMs += Math.max(150, chunkDurationMs);
   }
+
 
   const task = async () => {
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
@@ -2527,15 +2549,17 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
       });
 
       // Use the fully-accumulated duration (all chunks summed above) +
-      // a 600ms tail buffer so the last word finishes before we start listening.
-      const totalDuration = session._audioQueueDurationMs || 1000;
+      // a 300ms tail buffer so the last word finishes before we start listening.
+      // Cap at 6s max so agentSpeaking never blocks the mic indefinitely if
+      // the buffer size estimate is wrong for an unusual audio format.
+      const totalDuration = Math.min(session._audioQueueDurationMs || 1000, 6000);
       if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
       session._agentSpeakingTimer = setTimeout(() => {
         session.agentSpeaking = false;
         session._lastSttTranscript = '';
         startIdleTimer(session);
         session._audioQueueDurationMs = 0;
-      }, totalDuration + 600);
+      }, totalDuration + 300);
     }
   };
 

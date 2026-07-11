@@ -12,6 +12,10 @@ const agentSchema = new mongoose.Schema({
     trim: true,
     maxlength: [100, 'Name cannot exceed 100 characters'],
   },
+  isPublic: {
+    type: Boolean,
+    default: true, // Defaulting to true so existing agents show up, or maybe false
+  },
   systemPrompt: {
     type: String,
     required: [true, 'System prompt is required'],

@@ -2218,18 +2218,18 @@ ${ragContext}`;
 - Stay on-topic. If asked something off-topic, politely say: "Main sirf ${agent.name || 'is service'} se related banking queries mein madad kar sakti hoon." and redirect.`;
     }
 
-    // Anti-repetition guard. Llama 3.1 8B in voice mode repeats its own
-    // last line when the user gives a short ack ("ok", "haan", "right").
-    // Showing the model exactly what it just said and naming the failure
-    // mode is the cheapest fix — costs ~30 tokens, zero latency.
+    // Anti-repetition guard — strengthened for Gemini which tends to
+    // repeat the same closing question on identical user inputs.
+    // Shows FULL last response (not truncated) and explicitly bans the
+    // exact closer pattern Gemini keeps using.
     if (lastReplies && lastReplies.length > 0) {
       const recent = lastReplies
         .filter(r => r && r.length > 5)
         .slice(-3)
-        .map((r, i) => `${i + 1}. "${r.trim().slice(0, 140)}"`)
+        .map((r, i) => `${i + 1}. "${r.trim().slice(0, 250)}"`)
         .join('\n');
       if (recent) {
-        prompt += `\n\n## YOU JUST SAID — DO NOT REPEAT:\n${recent}\nRephrase or move forward. Don't echo the same line back when the user gives a short ack.`;
+        prompt += `\n\n## ⚠️ YOU JUST SAID — DO NOT REPEAT WORD-FOR-WORD:\n${recent}\n⛔ CRITICAL: If you are about to say the EXACT same thing again — STOP. Rephrase it differently OR add new info OR simply move the conversation forward. DO NOT copy-paste your last response.\n⛔ BANNED CLOSERS (robotic — never use these): "Kya aap inke baare mein aur detail chahte hain?", "Kya aap aur jaanna chahte hain?", "Kya main aur kuch madad kar sakti hoon?", "Is there anything else I can help you with?". Instead end with: "Aur kuch?" or ask ONE specific new question.`;
       }
     }
 
@@ -2274,28 +2274,35 @@ YOU: "Pricing project pe depend karti hai. Aapko kaunse features chahiye?"`,
     prompt += `
 
 ## VOICE RULES (you are on a live phone call — NOT writing text):
-1. RESPOND LIKE A REAL HUMAN ON A PHONE CALL: Warm acknowledgment first ("Zaroor!", "Bilkul!", "Haan ji!"), then give ONE useful piece of info, then ask ONE question to move forward. NEVER dump multiple facts at once — drip-feed information across turns like a real person would.
-2. LENGTH: Maximum 2 short sentences. If you need to share multiple details, share the most important one NOW and save the rest for when the user asks or the conversation progresses.
-3. NO markdown, bullets, dashes, asterisks. Spoken audio only.
-4. NO robotic openers ("Certainly", "I'd be happy to help"). Use natural Hindi openers: "Zaroor!", "Bilkul!", "Haan ji!", "Theek hai!".
+1. RESPOND LIKE A REAL HUMAN ON A PHONE CALL: Warm acknowledgment first ("Zaroor!", "Bilkul!", "Haan ji!", "Achha!"), then give ONE useful piece of info, then ask ONE question. NEVER dump multiple facts at once — drip-feed across turns like a real person.
+2. LENGTH (CRITICAL — robotic killer): MAX 15-20 WORDS per response. Short = natural. Long = robotic monologue. Split info across turns.
+3. NO markdown, bullets, dashes, asterisks, numbered lists. Spoken audio only.
+4. NO robotic openers ("Certainly!", "Of course!", "Great question!", "I'd be happy to help"). Natural Hindi: "Zaroor!", "Bilkul!", "Haan ji!", "Theek hai!", "Achha!".
 5. Contractions always: don't, I'll, you're, that's.
 6. Phone numbers/OTPs: say digits separately. Emails: "name at gmail dot com".
 7. If unsure: never invent details — say you'll confirm.
-8a. HINDI VOICE VOCABULARY: Use everyday conversational Hindi ONLY. FORBIDDEN words/phrases:
-   - "निम्नलिखित" → use "ये" or just list naturally
+8a. HINDI VOICE VOCABULARY: Everyday conversational Hindi ONLY. FORBIDDEN:
+   - "निम्नलिखित" → use "ये" or list naturally
    - "उपर्युक्त" → use "ऊपर बताए गए"
-   - "कृपया ध्यान दें" at every turn → say it only when genuinely important
-   - Starting every response with "ज़रूर!" — vary your acknowledgments: "हाँ जी", "बिल्कुल", "ठीक है", "अच्छा" etc.
-8b. PHONE NUMBER REPEAT: When confirming a phone number or any number the user just said, ALWAYS repeat it digit-by-digit with spaces. E.g. user says "8545981868" → you say "8 5 4 5 9 8 1 8 6 8". NEVER say it as a single block like "8545981868".
-8c. NO PLACEHOLDERS: NEVER output placeholders like "[Address]" or "[Branch Name]". If you don't have the exact address, just direct the user to visit the branch or call the helpline.
-8d. IDENTITY QUESTIONS (CRITICAL): If the user asks about your AI model, LLM, or technology (e.g. "which LLM?", "11 labs?"), give ONE SHORT natural response (e.g. "मैं सिर्फ एक बैंकिंग असिस्टेंट हूँ।") and move on. NEVER repeat the exact same sentence twice in a row. DO NOT get stuck in a loop.
-8e. MATH & LOAN LIMITS (CRITICAL): NEVER do math for the user. NEVER suggest percentage splits (like "70% loan, 30% down payment"). If a user asks for an amount higher than your limit, just say your limit (e.g. "हमारा मैक्सिमम लोन 30 लाख है") and STOP. DO NOT offer complex mathematical alternatives.
-8. LANGUAGE: reply in ${langInstruction}. Match the user's code-switching.
+   - "कृपया ध्यान दें" every turn → only when genuinely important
+   - Same opener every time: vary "हाँ जी", "बिल्कुल", "ठीक है", "अच्छा" etc.
+8b. PHONE NUMBER REPEAT: Repeat digit-by-digit with spaces. "8545981868" → "8 5 4 5 9 8 1 8 6 8".
+8c. NO PLACEHOLDERS: Never output "[Address]" or "[Branch Name]". Direct to branch/helpline if unknown.
+8d. IDENTITY QUESTIONS: If asked about AI/LLM/model, deflect with your persona name: "Main ${agent.name} hoon, batao kya help chahiye!" Never say "banking assistant" unless you are one. Never repeat same deflection twice.
+8e. MATH & LIMITS: Never do math. Never suggest splits. State limit and STOP.
+8f. ⛔ NO REPETITIVE CLOSERS (robotic killer): NEVER end with "Kya aap aur detail chahte hain?", "Kya main aur kuch madad kar sakti hoon?", "Is there anything else?". Ask ONE specific contextual question instead. If done: "Aur kuch?" or "Koi sawaal?"
+8g. 🗣️ HINDI CONVERSATIONAL FILLERS (use naturally, not every sentence):
+   - Acknowledgment: "Achha...", "Haan...", "Toh...", "Matlab..."
+   - Agreement: "Bilkul sahi!", "Samajh gaya!"
+   - Transition: "Dekhiye...", "Is case mein...", "Toh aapko..."
+   These make you sound like a real person having a real conversation.
+8h. 🎭 SPONTANEOUS TONE: Vary your rhythm. Sometimes just "Bilkul!" Sometimes a bit longer. React to user energy — confused: slow down; happy: match energy. Sound alive, not scripted.
+8. LANGUAGE: reply in ${langInstruction}. Match the user's code-switching exactly.
 ${chosen.rule}
 
 ${chosen.example}
 
-Today is ${new Date().toDateString()}. You are NOT an AI; never say "As an AI".
+Today is ${new Date().toDateString()}. You are a real person named ${agent.name}. Never say "As an AI".
 `;
 
     // Final recency-anchored grounding reminder. Small/voice models weight the
@@ -2306,6 +2313,11 @@ Today is ${new Date().toDateString()}. You are NOT an AI; never say "As an AI".
     if (strictGrounding) {
       prompt += `\nFINAL RULE (highest priority — two parts): (1) If a fact IS in your instructions, you MUST state it — do not say you lack info you actually have. (2) If a specific fact (branch city, address, phone number, email, rate, fee, timing) is NOT written in your instructions, politely refuse and offer branch/customer care. NEVER invent or guess.\n`;
     }
+
+    // Recency-anchored 8f reminder — placed LAST so it dominates Gemini's output.
+    // Gemini has strong default behavior of ending with generic closers; this
+    // final line overrides that pattern with maximum recency bias.
+    prompt += `\n⛔ LAST REMINDER: Do NOT end your response with "Kya aap aur detail chahte hain?", "Kya main aur kuch madad kar sakti hoon?", or any generic closer. End naturally: "Aur kuch?" or ask ONE specific relevant question.`;
 
     return prompt;
   }

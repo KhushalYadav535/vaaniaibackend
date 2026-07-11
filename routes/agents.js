@@ -146,6 +146,22 @@ router.patch('/:id/status', async (req, res, next) => {
   }
 });
 
+// @route   PATCH /api/agents/:id/public
+router.patch('/:id/public', async (req, res, next) => {
+  try {
+    const { isPublic } = req.body;
+    const agent = await Agent.findOneAndUpdate(
+      { _id: req.params.id, userId: req.user._id },
+      { isPublic },
+      { new: true }
+    );
+    if (!agent) return res.status(404).json({ success: false, message: 'Agent not found' });
+    res.json({ success: true, agent });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // @route   POST /api/agents/:id/duplicate
 router.post('/:id/duplicate', async (req, res, next) => {
   try {

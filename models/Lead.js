@@ -4,7 +4,8 @@ const leadSchema = new mongoose.Schema({
   userId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User',
-    required: true,
+    required: false,  // null for visitor/widget sessions
+    default: null,
   },
   agentId: {
     type: mongoose.Schema.Types.ObjectId,

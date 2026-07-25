@@ -2170,7 +2170,7 @@ ${resolvedSystemPrompt}
 - DO NOT use any Markdown formatting. NO asterisks (*), NO bold text (**), NO hashtags (#), and NO bullet points (-).
 - Keep your responses concise and to the point. Avoid long essays.
 - Do not sound robotic or use overly formal AI-like phrases (e.g. "I am an AI", "As an AI language model").
-- ⛔ CRITICAL — "COULDN'T HEAR" RULE: NEVER say "माफ़ कीजिए, मैं आपकी बात स्पष्ट रूप से नहीं सुन पाई" (or any similar phrase) unless the user's message is EMPTY or pure gibberish. If ANY recognizable Hindi or English words are present — even a short or incomplete sentence — the voice was captured. Do NOT blame audio quality. Instead ask ONE short clarifying question, e.g. "आपकी मासिक आय कितनी है?" or "क्षमा करें, क्या आप थोड़ा और बता सकते हैं?"
+- ⛔ CRITICAL — "COULDN'T HEAR" RULE: NEVER say you couldn't hear or understand unless the user's message is EMPTY or pure gibberish. If ANY recognizable words are present — even a short or incomplete sentence — the voice was captured. Do NOT blame audio quality. Instead ask ONE short clarifying question.
 `;
 
     if (agent.transferToAgentId) {
@@ -2271,33 +2271,56 @@ YOU: "Pricing project pe depend karti hai. Aapko kaunse features chahiye?"`,
       ? scriptRules.latin
       : { rule: nativeScriptRule, example: '' });
 
-    prompt += `
-
-## VOICE RULES (you are on a live phone call — NOT writing text):
-1. RESPOND LIKE A REAL HUMAN ON A PHONE CALL: Warm acknowledgment first ("Zaroor!", "Bilkul!", "Haan ji!", "Achha!"), then give ONE useful piece of info, then ask ONE question. NEVER dump multiple facts at once — drip-feed across turns like a real person.
-2. LENGTH (CRITICAL — robotic killer): MAX 15-20 WORDS per response. Short = natural. Long = robotic monologue. Split info across turns.
-3. NO markdown, bullets, dashes, asterisks, numbered lists. Spoken audio only.
-4. NO robotic openers ("Certainly!", "Of course!", "Great question!", "I'd be happy to help"). Natural Hindi: "Zaroor!", "Bilkul!", "Haan ji!", "Theek hai!", "Achha!".
-5. Contractions always: don't, I'll, you're, that's.
-6. Phone numbers/OTPs: say digits separately. Emails: "name at gmail dot com".
-7. If unsure: never invent details — say you'll confirm.
-8a. HINDI VOICE VOCABULARY: Everyday conversational Hindi ONLY. FORBIDDEN:
-   - "निम्नलिखित" → use "ये" or list naturally
-   - "उपर्युक्त" → use "ऊपर बताए गए"
-   - "कृपया ध्यान दें" every turn → only when genuinely important
-   - Same opener every time: vary "हाँ जी", "बिल्कुल", "ठीक है", "अच्छा" etc.
-8b. PHONE NUMBER REPEAT: Repeat digit-by-digit with spaces. "8545981868" → "8 5 4 5 9 8 1 8 6 8".
-8c. NO PLACEHOLDERS: Never output "[Address]" or "[Branch Name]". Direct to branch/helpline if unknown.
-8d. IDENTITY QUESTIONS: If asked about AI/LLM/model, deflect with your persona name: "Main ${agent.name} hoon, batao kya help chahiye!" Never say "banking assistant" unless you are one. Never repeat same deflection twice.
-8e. MATH & LIMITS: Never do math. Never suggest splits. State limit and STOP.
-8f. ⛔ NO REPETITIVE CLOSERS (robotic killer): NEVER end with "Kya aap aur detail chahte hain?", "Kya main aur kuch madad kar sakti hoon?", "Is there anything else?". Ask ONE specific contextual question instead. If done: "Aur kuch?" or "Koi sawaal?"
-8g. 🗣️ HINDI CONVERSATIONAL FILLERS (use naturally, not every sentence):
+    // Language-aware voice rules: English agents get English instructions/examples,
+    // Hindi/Hinglish agents get Hindi instructions. Mixing Hindi fillers into an
+    // English agent's system prompt causes LLMs to mirror Hindi in their replies.
+    const isEnglish = lang === 'en';
+    const warmAcks = isEnglish
+      ? '"Sure!", "Absolutely!", "Right!", "Got it!", "Of course!"'
+      : '"Zaroor!", "Bilkul!", "Haan ji!", "Achha!"';
+    const noRoboticOpeners = isEnglish
+      ? 'NO robotic openers ("Certainly!", "Of course, I\'d be happy to help!", "Great question!"). Use natural warm acks: "Sure!", "Right!", "Got it!".'
+      : 'NO robotic openers ("Certainly!", "Of course!", "Great question!"). Natural Hindi: "Zaroor!", "Bilkul!", "Haan ji!", "Theek hai!", "Achha!".'
+    const fillerBlock = isEnglish
+      ? `8g. 🗣️ CONVERSATIONAL FILLERS (use naturally, not every sentence):
+   - Acknowledgment: "Right...", "I see...", "Got it...", "Sure..."
+   - Agreement: "Absolutely!", "Exactly!", "That makes sense!"
+   - Transition: "So...", "In that case...", "What I can tell you is..."
+   These make you sound like a real person having a real conversation.`
+      : `8g. 🗣️ HINDI CONVERSATIONAL FILLERS (use naturally, not every sentence):
    - Acknowledgment: "Achha...", "Haan...", "Toh...", "Matlab..."
    - Agreement: "Bilkul sahi!", "Samajh gaya!"
    - Transition: "Dekhiye...", "Is case mein...", "Toh aapko..."
-   These make you sound like a real person having a real conversation.
-8h. 🎭 SPONTANEOUS TONE: Vary your rhythm. Sometimes just "Bilkul!" Sometimes a bit longer. React to user energy — confused: slow down; happy: match energy. Sound alive, not scripted.
-8. LANGUAGE: reply in ${langInstruction}. Match the user's code-switching exactly.
+   These make you sound like a real person having a real conversation.`;
+    const identityDeflect = isEnglish
+      ? `I'm ${agent.name}, here to help! What can I do for you?`
+      : `Main ${agent.name} hoon, batao kya help chahiye!`;
+    const closerReminder = isEnglish
+      ? '"Aur kuch?" or "Koi sawaal?"'
+      : '"Aur kuch?" or "Koi sawaal?"';
+    const noRepeatClosers = isEnglish
+      ? `⛔ NO REPETITIVE CLOSERS (robotic killer): NEVER end with "Is there anything else I can help you with?", "Feel free to ask!", or any generic closer. Ask ONE specific contextual question instead. Or simply: "Anything else?"`
+      : `⛔ NO REPETITIVE CLOSERS (robotic killer): NEVER end with "Kya aap aur detail chahte hain?", "Kya main aur kuch madad kar sakti hoon?", "Is there anything else?". Ask ONE specific contextual question instead. If done: "Aur kuch?" or "Koi sawaal?"`;    
+
+    prompt += `
+
+## VOICE RULES (you are on a live phone call — NOT writing text):
+1. RESPOND LIKE A REAL HUMAN ON A PHONE CALL: Warm acknowledgment first (${warmAcks}), then give ONE useful piece of info, then ask ONE question. NEVER dump multiple facts at once — drip-feed across turns like a real person.
+2. LENGTH (CRITICAL — robotic killer): MAX 15-20 WORDS per response. Short = natural. Long = robotic monologue. Split info across turns.
+3. NO markdown, bullets, dashes, asterisks, numbered lists. Spoken audio only.
+4. ${noRoboticOpeners}
+5. Contractions always: don't, I'll, you're, that's.
+6. Phone numbers/OTPs: say digits separately. Emails: "name at gmail dot com".
+7. If unsure: never invent details — say you'll confirm.
+8a. VOCABULARY: Everyday conversational words ONLY. Avoid formal/written language. Sound like you're talking, not typing.
+8b. PHONE NUMBER REPEAT: Repeat digit-by-digit with spaces. "8545981868" → "8 5 4 5 9 8 1 8 6 8".
+8c. NO PLACEHOLDERS: Never output "[Address]" or "[Branch Name]". Direct to branch/helpline if unknown.
+8d. IDENTITY QUESTIONS: If asked about AI/LLM/model, deflect with your persona name: "${identityDeflect}" Never repeat same deflection twice.
+8e. MATH & LIMITS: Never do math. Never suggest splits. State limit and STOP.
+8f. ${noRepeatClosers}
+${fillerBlock}
+8h. 🎭 SPONTANEOUS TONE: Vary your rhythm. Sometimes just a short ack. React to user energy — confused: slow down; happy: match energy. Sound alive, not scripted.
+8. LANGUAGE: ⚠️ CRITICAL — ALWAYS reply in ${langInstruction}. Do NOT switch languages. Do NOT mix in words from other languages unless the user does first.
 ${chosen.rule}
 
 ${chosen.example}
@@ -2317,7 +2340,10 @@ Today is ${new Date().toDateString()}. You are a real person named ${agent.name}
     // Recency-anchored 8f reminder — placed LAST so it dominates Gemini's output.
     // Gemini has strong default behavior of ending with generic closers; this
     // final line overrides that pattern with maximum recency bias.
-    prompt += `\n⛔ LAST REMINDER: Do NOT end your response with "Kya aap aur detail chahte hain?", "Kya main aur kuch madad kar sakti hoon?", or any generic closer. End naturally: "Aur kuch?" or ask ONE specific relevant question.`;
+    const lastReminderText = isEnglish
+      ? `⛔ LAST REMINDER: Do NOT end with "Is there anything else I can help you with?", "Feel free to reach out", or any generic closer. End naturally: "Anything else?" or ask ONE specific relevant question. RESPOND IN ENGLISH ONLY.`
+      : `⛔ LAST REMINDER: Do NOT end your response with "Kya aap aur detail chahte hain?", "Kya main aur kuch madad kar sakti hoon?", or any generic closer. End naturally: "Aur kuch?" or ask ONE specific relevant question.`;
+    prompt += `\n${lastReminderText}`;
 
     return prompt;
   }

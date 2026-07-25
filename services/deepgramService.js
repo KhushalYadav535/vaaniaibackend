@@ -54,16 +54,36 @@ class DeepgramService {
   createLiveConnection({ apiKey, language = 'en', backgroundDenoising = 'default', onTranscript, onError, onClose, keywords = [], onVADEvent = null, audioConfig = null }) {
     const key = apiKey || process.env.DEEPGRAM_API_KEY;
     if (!key) throw new Error('No Deepgram API key. Get $200 free credits at https://deepgram.com');
-    // Using nova-2 as nova-3 may return 400 for certain languages like hi/multi
+    // Default to nova-2: nova-3 does NOT support the `keywords` parameter — it
+    // returns HTTP 400 for any request that includes `keywords=...`. Since we
+    // always send keyword boosting terms, nova-2 is the correct model to use.
+    // nova-3 can be opted-in via DEEPGRAM_MODEL=nova-3 ONLY when you also set
+    // DEEPGRAM_DISABLE_KEYWORDS=true (so no `keywords`/`keyterm` are sent).
     const model = process.env.DEEPGRAM_MODEL || 'nova-2';
 
     let sttLanguage = language;
     if (sttLanguage === 'hi-Latn') sttLanguage = 'hi';
 
-    // Force nova-2 for multi/hi as nova-3 is returning 400 errors for these languages
+    // nova-3 requires `keyterm` (repeated params) instead of `keywords` (comma-separated).
+    // If the model is nova-3 and we have keywords, we either:
+    //   a) Switch to nova-2 (safe, recommended), OR
+    //   b) Use keyterm format (if DEEPGRAM_USE_KEYTERM=true is set)
+    // For hi/multi, always fall back to nova-2 regardless.
     let finalModel = model;
-    if (finalModel === 'nova-3' && (sttLanguage === 'hi' || sttLanguage === 'multi' || process.env.DEEPGRAM_FORCE_MULTI === 'true' || process.env.DEEPGRAM_FORCE_MULTI === 'explicit')) {
-      finalModel = 'nova-2';
+    const hasKeywords = keywords && keywords.length > 0;
+    const useKeyterm = String(process.env.DEEPGRAM_USE_KEYTERM || 'false').toLowerCase() === 'true';
+    if (finalModel === 'nova-3') {
+      if (sttLanguage === 'hi' || sttLanguage === 'multi' ||
+          process.env.DEEPGRAM_FORCE_MULTI === 'true' ||
+          process.env.DEEPGRAM_FORCE_MULTI === 'explicit') {
+        // nova-3 doesn't support hi/multi reliably — use nova-2
+        finalModel = 'nova-2';
+      } else if (hasKeywords && !useKeyterm) {
+        // nova-3 + keywords param = 400 error. Fall back to nova-2 unless
+        // operator has explicitly opted in to keyterm format.
+        finalModel = 'nova-2';
+        console.log('[Deepgram] Downgraded nova-3 -> nova-2 because keywords param is not supported by nova-3 (set DEEPGRAM_USE_KEYTERM=true to use keyterm format instead)');
+      }
     }
 
     // Language selection for STT:
@@ -147,11 +167,25 @@ class DeepgramService {
 
     // Keyword boosting: improves recognition of domain-specific terms
     // (company names, product names, agent-specific vocabulary)
+    // IMPORTANT: nova-2 uses `keywords` (comma-separated, supports :weight intensifiers)
+    //            nova-3 uses `keyterm` (repeated URL params, NO weights supported)
     if (keywords && keywords.length > 0) {
       const validKeywords = keywords.filter(k => typeof k === 'string' && k.trim().length > 0).slice(0, 100);
       if (validKeywords.length > 0) {
-        params.set('keywords', validKeywords.join(','));
-        console.log(`[Deepgram] Keyword boosting: ${validKeywords.length} terms`);
+        if (finalModel === 'nova-3') {
+          // nova-3: use `keyterm` repeated params (no comma-joining, no weights)
+          // URLSearchParams.set() overwrites, so we must use .append() for repeated params
+          // Strip any legacy :weight suffixes (e.g. "term:0.5" -> "term")
+          const cleanTerms = validKeywords.map(k => k.replace(/:[0-9.]+$/, '').trim());
+          // Build the URL manually for repeated keyterm params since URLSearchParams
+          // doesn't support duplicate keys well across all Node versions.
+          cleanTerms.forEach(term => params.append('keyterm', term));
+          console.log(`[Deepgram] Keyterm boosting (nova-3): ${cleanTerms.length} terms`);
+        } else {
+          // nova-2 and older: standard comma-separated keywords
+          params.set('keywords', validKeywords.join(','));
+          console.log(`[Deepgram] Keyword boosting: ${validKeywords.length} terms`);
+        }
       }
     }
 

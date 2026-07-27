@@ -96,14 +96,35 @@ class DeepgramService {
     // Endpointing patience (how long Deepgram waits before declaring
     // end-of-utterance). Bumped from 1200/400 → 1600/600 because the
     // smaller window was firing speech_final mid-thought when users
-    // paused to recall a name or word ("मुझे school के लिए... [pause]
-    // ...इसमें... [pause] ...MDS Vidyapeeth"). voiceSession's
-    // commitTranscript adds a soft-commit window on top of this for an
-    // extra safety net.
-    const defaultUtteranceEndMs = fastTurnMode ? 400 : 1600;
+    // paused to recall a name or word.
+    // voiceSession's commitTranscript adds a soft-commit window on top
+    // of this for an extra safety net.
     const defaultEndpointingMs  = fastTurnMode ? 200 : 600;
-    const utteranceEndMs = Number(process.env.DEEPGRAM_UTTERANCE_END_MS || defaultUtteranceEndMs);
     const endpointingMs  = Number(process.env.DEEPGRAM_ENDPOINTING_MS  || defaultEndpointingMs);
+
+    // utterance_end_ms: Deepgram enforces a hard MINIMUM of 1000ms.
+    // Sending any value below 1000 causes an HTTP 400 on the WebSocket
+    // upgrade (the connection is rejected before any audio is sent).
+    // Root cause of the 400 errors seen in production:
+    //   FAST_TURN_MODE=true set utterance_end_ms=400 (below minimum).
+    //
+    // Deepgram docs: "UtteranceEnd relies on word timings from interim
+    // results, which are generated ~once per second. Values < 1000ms
+    // are unsupported."
+    //
+    // For fast turn detection, use `endpointing` (VAD-based, supports
+    // values as low as 10ms) — NOT utterance_end_ms.
+    //
+    // We configure utterance_end_ms as a SAFETY NET that fires AFTER
+    // speech_final already committed. So 1500ms is a reasonable default
+    // that catches stalled speech_final events without being too aggressive.
+    const rawUtteranceEndMs = Number(process.env.DEEPGRAM_UTTERANCE_END_MS || 1500);
+    const DEEPGRAM_UTTERANCE_END_MIN = 1000; // Hard minimum enforced by Deepgram API
+    const utteranceEndMs = Math.max(DEEPGRAM_UTTERANCE_END_MIN, rawUtteranceEndMs);
+    if (rawUtteranceEndMs < DEEPGRAM_UTTERANCE_END_MIN) {
+      console.warn(`[Deepgram] ⚠️ utterance_end_ms=${rawUtteranceEndMs} is below Deepgram's minimum of ${DEEPGRAM_UTTERANCE_END_MIN}ms — clamped to ${utteranceEndMs}ms. For faster turn detection use endpointing (currently ${endpointingMs}ms).`);
+    }
+
     const minFinalChars  = Number(process.env.MIN_TRANSCRIPT_CHARS_FOR_FINAL || 2);
 
     // FIX: Use explicit audioConfig (per-session) if provided, otherwise fall back to env vars.
@@ -143,6 +164,10 @@ class DeepgramService {
       language: sttLanguage,
       interim_results: 'true',
       endpointing: String(endpointingMs),
+      // FIX Bug #4: utterance_end_ms was computed and logged but never added to
+      // the query string — so Deepgram never activated UtteranceEnd events.
+      // Without this, turn-taking relied solely on speech_final with no safety net.
+      utterance_end_ms: String(utteranceEndMs),
     });
     if (smartFormat) {
       params.set('smart_format', 'true');
@@ -219,8 +244,13 @@ class DeepgramService {
       try {
         const msg = JSON.parse(data.toString());
 
-        // Handle UtteranceEnd
+        // Handle UtteranceEnd — fires when Deepgram decides the utterance is done
+        // (after utterance_end_ms of silence post-speech_final). This is the
+        // FIX Bug #4 companion: the param is now sent, so the event will fire.
+        // Forward to onVADEvent so voiceSession can use it as a turn-taking
+        // safety net (e.g. flush soft-commit if still pending after speech_final).
         if (msg.type === 'UtteranceEnd') {
+          if (onVADEvent) onVADEvent({ type: 'utterance_end', lastWordEnd: msg.last_word_end });
           return;
         }
 

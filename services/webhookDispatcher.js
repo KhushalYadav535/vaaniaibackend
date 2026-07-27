@@ -119,9 +119,9 @@ class WebhookDispatcher {
     // ── Sign the payload (optional HMAC for verification) ───────────────────
     const headers = {
       'Content-Type': 'application/json',
-      'User-Agent': 'VaaniAI-Webhook/1.0',
-      'X-VaaniAI-Event': 'call.ended',
-      'X-VaaniAI-Timestamp': payload.timestamp,
+      'User-Agent': 'Vocred-Webhook/1.0',
+      'X-Vocred-Event': 'call.ended',
+      'X-Vocred-Timestamp': payload.timestamp,
     };
 
     // Agent-level secret takes priority over global secret
@@ -132,7 +132,7 @@ class WebhookDispatcher {
         .createHmac('sha256', secret)
         .update(JSON.stringify(payload))
         .digest('hex');
-      headers['X-VaaniAI-Signature'] = `sha256=${signature}`;
+      headers['X-Vocred-Signature'] = `sha256=${signature}`;
     }
 
     // ── Fire and log ─────────────────────────────────────────────────────────

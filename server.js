@@ -1,5 +1,5 @@
 /**
- * VaaniAI Backend Server
+ * Vocred Backend Server
  */
 
 require('dotenv').config();
@@ -183,7 +183,7 @@ app.use('/api', globalLimiter);
 app.get('/', (req, res) => {
   res.json({
     success: true,
-    message: '🎙️ VaaniAI Backend is running!',
+    message: '🎙️ Vocred Backend is running!',
     version: '1.0.0',
     endpoints: {
       auth: '/api/auth',

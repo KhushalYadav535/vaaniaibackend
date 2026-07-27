@@ -1,9 +1,9 @@
 /**
- * VaaniAI Embeddable Widget Script
+ * Vocred Embeddable Widget Script
  * 
  * Usage: Add this to any website:
  * <script>
- *   window.vaaniConfig = {
+ *   window.vocredConfig = {
  *     agentId: "YOUR_AGENT_ID",
  *     color: "#8b5cf6",
  *     text: "Talk to AI",
@@ -15,10 +15,10 @@
 (function () {
   'use strict';
 
-  var config = window.vaaniConfig || {};
+  var config = window.vocredConfig || {};
   var agentId = config.agentId;
   if (!agentId) {
-    console.error('[VaaniAI Widget] Missing agentId in window.vaaniConfig');
+    console.error('[Vocred Widget] Missing agentId in window.vocredConfig');
     return;
   }
 
@@ -44,14 +44,14 @@
     if (backendOrigin.indexOf('localhost') !== -1 || backendOrigin.indexOf('127.0.0.1') !== -1) {
       frontendOrigin = backendOrigin.replace(':5000', ':3000');
     } else {
-      frontendOrigin = 'https://vaani-ai-five.vercel.app';
+      frontendOrigin = 'https://vocred-ai-five.vercel.app';
     }
   }
 
   // ─── Create Styles ───
   var style = document.createElement('style');
   style.textContent = [
-    '.vaani-widget-btn{',
+    '.vocred-widget-btn{',
     '  position:fixed;',
     '  ' + (position === 'bottom-left' ? 'left' : 'right') + ':20px;',
     '  bottom:20px;',
@@ -67,12 +67,12 @@
     '  box-shadow:0 4px 24px rgba(0,0,0,0.18);',
     '  transition:all 0.3s ease;',
     '}',
-    '.vaani-widget-btn:hover{',
+    '.vocred-widget-btn:hover{',
     '  transform:scale(1.05);',
     '  box-shadow:0 6px 32px rgba(0,0,0,0.25);',
     '}',
-    '.vaani-widget-btn svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}',
-    '.vaani-widget-popup{',
+    '.vocred-widget-btn svg{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round;}',
+    '.vocred-widget-popup{',
     '  position:fixed;',
     '  ' + (position === 'bottom-left' ? 'left' : 'right') + ':20px;',
     '  bottom:90px;',
@@ -84,16 +84,16 @@
     '  border:1px solid rgba(0,0,0,0.08);',
     '  background:#fff;',
     '  display:none;',
-    '  animation:vaani-slide-up 0.35s ease;',
+    '  animation:vocred-slide-up 0.35s ease;',
     '}',
-    '.vaani-widget-popup.vaani-open{display:block;}',
-    '.vaani-widget-popup iframe{width:100%;height:100%;border:none;}',
-    '@keyframes vaani-slide-up{',
+    '.vocred-widget-popup.vocred-open{display:block;}',
+    '.vocred-widget-popup iframe{width:100%;height:100%;border:none;}',
+    '@keyframes vocred-slide-up{',
     '  from{opacity:0;transform:translateY(20px);}',
     '  to{opacity:1;transform:translateY(0);}',
     '}',
     '@media(max-width:480px){',
-    '  .vaani-widget-popup{',
+    '  .vocred-widget-popup{',
     '    width:calc(100vw - 20px);',
     '    height:calc(100vh - 120px);',
     '    ' + (position === 'bottom-left' ? 'left' : 'right') + ':10px;',
@@ -105,7 +105,7 @@
 
   // ─── Create Button ───
   var btn = document.createElement('button');
-  btn.className = 'vaani-widget-btn';
+  btn.className = 'vocred-widget-btn';
   btn.innerHTML =
     '<svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>' +
     '<span>' + text + '</span>';
@@ -113,7 +113,7 @@
 
   // ─── Create Popup ───
   var popup = document.createElement('div');
-  popup.className = 'vaani-widget-popup';
+  popup.className = 'vocred-widget-popup';
 
   var widgetUrl =
     frontendOrigin +
@@ -130,12 +130,12 @@
   btn.addEventListener('click', function () {
     isOpen = !isOpen;
     if (isOpen) {
-      popup.classList.add('vaani-open');
+      popup.classList.add('vocred-open');
       btn.innerHTML =
         '<svg viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>' +
         '<span>Close</span>';
     } else {
-      popup.classList.remove('vaani-open');
+      popup.classList.remove('vocred-open');
       btn.innerHTML =
         '<svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>' +
         '<span>' + text + '</span>';
@@ -144,9 +144,9 @@
 
   // Listen for messages from iframe
   window.addEventListener('message', function (e) {
-    if (e.data && e.data.type === 'vaani-close') {
+    if (e.data && e.data.type === 'vocred-close') {
       isOpen = false;
-      popup.classList.remove('vaani-open');
+      popup.classList.remove('vocred-open');
       btn.innerHTML =
         '<svg viewBox="0 0 24 24"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg>' +
         '<span>' + text + '</span>';

@@ -1,7 +1,7 @@
 {
-  "name": "vaaniai-backend",
+  "name": "vocred-backend",
   "version": "1.0.0",
-  "description": "VaaniAI Backend - Voice AI Platform",
+  "description": "Vocred Backend - Voice AI Platform",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

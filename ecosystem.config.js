@@ -8,12 +8,12 @@
  *   pm2 monit           # real-time monitoring
  *   pm2 logs            # view logs
  *   pm2 restart all     # restart all instances
- *   pm2 scale vaaniai +2  # add 2 more instances
+ *   pm2 scale vocred +2  # add 2 more instances
  */
 module.exports = {
   apps: [
     {
-      name: 'vaaniai',
+      name: 'vocred',
       script: 'server.js',
       instances: process.env.PM2_INSTANCES || 'max', // Use all CPU cores
       exec_mode: 'cluster',
@@ -50,7 +50,7 @@ module.exports = {
     },
     {
       // Campaign worker as separate process (doesn't need clustering)
-      name: 'vaaniai-campaigns',
+      name: 'vocred-campaigns',
       script: 'server.js',
       instances: 1,
       exec_mode: 'fork',

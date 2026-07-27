@@ -27,8 +27,12 @@ const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 class OpenRouterService {
   constructor() {
-    this.breaker = { failures: 0, openedAt: 0 };
-    this._clients = new Map(); // cache per API key
+    // FIX Bug #6: Per-tenant circuit breakers.
+    // Previously a single shared `this.breaker` object meant one tenant's
+    // bad API key could trip the breaker for ALL tenants for 20 seconds.
+    // Now each key gets its own failure counter, fully isolated.
+    this._breakers = new Map(); // breakerKey → { failures, openedAt }
+    this._clients = new Map(); // API key → OpenAI client (unchanged)
   }
 
   // ── Master switch ──────────────────────────────────────────────────────────
@@ -69,27 +73,43 @@ class OpenRouterService {
     return routing;
   }
 
-  // ── Circuit breaker ────────────────────────────────────────────────────────
-  isCircuitOpen() {
-    if (!this.breaker.openedAt) return false;
+  // ── Circuit breaker (per-tenant) ───────────────────────────────────────────
+
+  // Use last 8 chars of resolved key as a stable, loggable identifier.
+  // Never log the full key — last 8 chars are enough to correlate tenants
+  // in logs without exposing the secret.
+  _breakerKey(apiKey) {
+    const key = this.getApiKey(apiKey);
+    return key ? key.slice(-8) : '__env__';
+  }
+
+  isCircuitOpen(apiKey) {
+    const bKey = this._breakerKey(apiKey);
+    const breaker = this._breakers.get(bKey);
+    if (!breaker || !breaker.openedAt) return false;
     const resetMs = Number(process.env.OPENROUTER_CIRCUIT_RESET_MS || 20000);
-    if (Date.now() - this.breaker.openedAt > resetMs) {
-      this.breaker = { failures: 0, openedAt: 0 };
+    if (Date.now() - breaker.openedAt > resetMs) {
+      this._breakers.delete(bKey); // auto-reset on expiry
       return false;
     }
     return true;
   }
 
-  onSuccess() {
-    this.breaker = { failures: 0, openedAt: 0 };
+  onSuccess(apiKey) {
+    const bKey = this._breakerKey(apiKey);
+    this._breakers.delete(bKey); // clear on any success
   }
 
-  onFailure() {
-    this.breaker.failures += 1;
+  onFailure(apiKey) {
+    const bKey = this._breakerKey(apiKey);
+    const breaker = this._breakers.get(bKey) || { failures: 0, openedAt: 0 };
+    breaker.failures += 1;
     const threshold = Number(process.env.OPENROUTER_CIRCUIT_FAILURE_THRESHOLD || 5);
-    if (this.breaker.failures >= threshold) {
-      this.breaker.openedAt = Date.now();
+    if (breaker.failures >= threshold && !breaker.openedAt) {
+      breaker.openedAt = Date.now();
+      console.warn(`[OpenRouter] ⚡ Circuit opened for key ...${bKey} after ${breaker.failures} failures (resets in ${Number(process.env.OPENROUTER_CIRCUIT_RESET_MS || 20000)}ms)`);
     }
+    this._breakers.set(bKey, breaker);
   }
 
   // ── Lazy OpenAI-compatible client ─────────────────────────────────────────
@@ -106,8 +126,8 @@ class OpenRouterService {
         timeout: Number(process.env.OPENROUTER_SDK_TIMEOUT_MS || 8000),
         // OpenRouter's optional ranking headers (harmless if unset).
         defaultHeaders: {
-          'HTTP-Referer': process.env.OPENROUTER_SITE_URL || process.env.FRONTEND_URL || 'https://vaani.ai',
-          'X-Title': process.env.OPENROUTER_SITE_NAME || 'VaaniAI',
+          'HTTP-Referer': process.env.OPENROUTER_SITE_URL || process.env.FRONTEND_URL || 'https://vocred.com',
+          'X-Title': process.env.OPENROUTER_SITE_NAME || 'Vocred',
         },
       }));
     }
@@ -137,7 +157,7 @@ class OpenRouterService {
    * Drop-in replacement for groqService.generateResponse.
    */
   async generateResponse({ messages, model, temperature = 0.4, apiKey, tools = null, jsonMode = false }) {
-    if (this.isCircuitOpen()) throw new Error('openrouter_circuit_open');
+    if (this.isCircuitOpen(apiKey)) throw new Error('openrouter_circuit_open');
 
     const resolvedModel = model || this.defaultModel();
     const client = this._getClient(apiKey);
@@ -178,11 +198,11 @@ class OpenRouterService {
       const toolCalls = message?.tool_calls || [];
       const latencyMs = Date.now() - start;
 
-      this.onSuccess();
+      this.onSuccess(apiKey); // FIX: pass apiKey for per-tenant tracking
       console.log(`[OpenRouter] ✅ ${resolvedModel} → ${latencyMs}ms, ${text.length} chars`);
       return { text, toolCalls, latencyMs, model: resolvedModel, message };
     } catch (error) {
-      this.onFailure();
+      this.onFailure(apiKey); // FIX: pass apiKey for per-tenant tracking
       console.warn(`[OpenRouter] ❌ ${resolvedModel} → ${error.message}`);
       throw error;
     }
@@ -193,7 +213,7 @@ class OpenRouterService {
    * Returns async generator of text chunks — drop-in for groqService.generateStreamResponse.
    */
   async *generateStreamResponse({ messages, model, temperature = 0.4, apiKey, abortSignal = null }) {
-    if (this.isCircuitOpen()) throw new Error('openrouter_circuit_open');
+    if (this.isCircuitOpen(apiKey)) throw new Error('openrouter_circuit_open');
 
     const resolvedModel = model || this.defaultModel();
     const client = this._getClient(apiKey);
@@ -223,9 +243,9 @@ class OpenRouterService {
         'openrouter_stream_start',
         controller
       );
-      this.onSuccess();
+      this.onSuccess(apiKey); // FIX: per-tenant
     } catch (error) {
-      this.onFailure();
+      this.onFailure(apiKey); // FIX: per-tenant
       throw error;
     }
 

@@ -81,7 +81,7 @@ class ToolExecutor {
           timeout: 8000,
           headers: {
             'Content-Type': 'application/json',
-            'X-VaaniAI-Agent-Id': agentContext?._id?.toString() || 'unknown',
+            'X-Vocred-Agent-Id': agentContext?._id?.toString() || 'unknown',
           },
         });
         return { success: true, tool: toolName, result: response.data, timestamp: new Date().toISOString() };

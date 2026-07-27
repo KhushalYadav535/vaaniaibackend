@@ -14,7 +14,7 @@ router.post('/', protect, async (req, res, next) => {
   try {
     let { text, voiceId, speed } = req.body;
 
-    if (!text) text = 'Hello! I am your AI assistant powered by VaaniAI. How can I help you today?';
+    if (!text) text = 'Hello! I am your AI assistant powered by Vocred. How can I help you today?';
     if (!voiceId) voiceId = 'en-US-JennyNeural';
     if (!speed) speed = 1.0;
 

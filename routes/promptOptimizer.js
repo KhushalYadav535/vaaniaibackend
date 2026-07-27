@@ -2,7 +2,7 @@
  * Prompt Optimizer Route
  *
  * Takes the current agent prompt + metadata and returns a fully
- * optimized VaaniAI voice-agent system prompt via LLM.
+ * optimized Vocred voice-agent system prompt via LLM.
  *
  * POST /api/optimize-prompt
  * Body: { currentPrompt, agentName, language, role }
@@ -23,9 +23,9 @@ router.post('/', protect, async (req, res) => {
     : language === 'en'      ? 'English'
     : language;
 
-  const metaPrompt = `You are a VaaniAI voice agent prompt expert. VaaniAI is a real-time Hindi/Hinglish voice AI platform used by Indian businesses for sales, support, and lead qualification.
+  const metaPrompt = `You are a Vocred voice agent prompt expert. Vocred is a real-time Hindi/Hinglish voice AI platform used by Indian businesses for sales, support, and lead qualification.
 
-Your job: Take the existing agent prompt below and rewrite it as a PERFECT VaaniAI system prompt.
+Your job: Take the existing agent prompt below and rewrite it as a PERFECT Vocred system prompt.
 
 AGENT DETAILS:
 - Name: ${agentName}
@@ -70,8 +70,8 @@ OUTPUT: Return ONLY the optimized system prompt text. No explanations, no preamb
         headers: {
           Authorization: `Bearer ${openrouterKey}`,
           'Content-Type': 'application/json',
-          'HTTP-Referer': process.env.OPENROUTER_SITE_NAME || 'VaaniAI',
-          'X-Title': 'VaaniAI Prompt Optimizer',
+          'HTTP-Referer': process.env.OPENROUTER_SITE_NAME || 'Vocred',
+          'X-Title': 'Vocred Prompt Optimizer',
         },
         timeout: 40000, // 40s — prompt generation is one-time, not real-time voice
       }

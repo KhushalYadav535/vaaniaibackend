@@ -60,7 +60,7 @@ const logger = createLogger({
     timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
     errors({ stack: true }),
   ),
-  defaultMeta: { service: 'vaaniai-backend' },
+  defaultMeta: { service: 'vocred-backend' },
   transports: [
     // Console (always)
     new transports.Console({

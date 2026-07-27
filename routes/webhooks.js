@@ -73,7 +73,7 @@ router.post('/:id/test', async (req, res, next) => {
     const payload = {
       event: 'test',
       timestamp: new Date().toISOString(),
-      data: { message: 'This is a test webhook from VaaniAI' },
+      data: { message: 'This is a test webhook from Vocred' },
     };
 
     const response = await fetch(webhook.url, {

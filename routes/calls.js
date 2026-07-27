@@ -58,7 +58,7 @@ router.get('/:id/export', async (req, res, next) => {
 
     const agentName = call.agentId?.name || call.agentName || 'Unknown';
     const dateStr = new Date(call.startTime).toISOString().split('T')[0];
-    const filename = `vaaniai_call_${agentName.replace(/\s+/g, '_')}_${dateStr}`;
+    const filename = `vocred_call_${agentName.replace(/\s+/g, '_')}_${dateStr}`;
 
     if (format === 'csv') {
       const lines = ['Timestamp,Role,Content'];
@@ -81,7 +81,7 @@ router.get('/:id/export', async (req, res, next) => {
     }
 
     if (format === 'txt') {
-      let text = `VaaniAI Call Transcript\n`;
+      let text = `Vocred Call Transcript\n`;
       text += `Agent: ${agentName}\n`;
       text += `Date: ${new Date(call.startTime).toLocaleString()}\n`;
       text += `Duration: ${Math.round(call.duration / 60)}m ${call.duration % 60}s\n`;
@@ -157,7 +157,7 @@ router.get('/export/bulk', async (req, res, next) => {
         lines.push(`"${date}","${agent}","${call.direction}","${call.status}",${call.duration},"${call.sentiment || ''}","${summary}","${tags}",${msgCount}`);
       }
       res.setHeader('Content-Type', 'text/csv');
-      res.setHeader('Content-Disposition', `attachment; filename="vaaniai_calls_export_${period}.csv"`);
+      res.setHeader('Content-Disposition', `attachment; filename="vocred_calls_export_${period}.csv"`);
       return res.send(lines.join('\n'));
     }
 

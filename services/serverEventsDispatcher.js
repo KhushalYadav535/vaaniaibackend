@@ -80,14 +80,14 @@ class ServerEventsDispatcher {
 
     const headers = {
       'Content-Type': 'application/json',
-      'User-Agent': 'VaaniAI-ServerEvents/1.0',
-      'X-VaaniAI-Event': payload.event,
-      'X-VaaniAI-Timestamp': ts,
+      'User-Agent': 'Vocred-ServerEvents/1.0',
+      'X-Vocred-Event': payload.event,
+      'X-Vocred-Timestamp': ts,
     };
 
     if (secret) {
       const sig = crypto.createHmac('sha256', secret).update(`${ts}.${body}`).digest('hex');
-      headers['X-VaaniAI-Signature'] = `sha256=${sig}`;
+      headers['X-Vocred-Signature'] = `sha256=${sig}`;
     }
 
     let lastErr;

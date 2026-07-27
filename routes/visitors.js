@@ -45,7 +45,7 @@ router.post('/send-otp', async (req, res, next) => {
 
     // Send email
     if (process.env.SMTP_USER && process.env.SMTP_PASS) {
-      const fromName = process.env.SMTP_FROM_NAME || 'VaaniAI Platform';
+      const fromName = process.env.SMTP_FROM_NAME || 'Vocred Platform';
       const fromEmail = process.env.SMTP_FROM || process.env.SMTP_USER;
       const htmlTemplate = `
       <div style="font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; max-width: 600px; margin: 0 auto; background-color: #ffffff; border-radius: 16px; overflow: hidden; box-shadow: 0 4px 24px rgba(0,0,0,0.06); border: 1px solid #f1f5f9;">

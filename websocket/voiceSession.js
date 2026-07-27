@@ -613,12 +613,13 @@ const UNIVERSAL_HINGLISH_SEED = [
   'online', 'offline', 'submit', 'apply', 'register', 'login', 'link',
   'branch', 'manager', 'officer', 'complaint', 'request', 'cancel',
   'block', 'close', 'open', 'start', 'stop', 'change', 'update', 'add',
+  'car', 'car loan', 'home loan', 'personal loan', 'business loan', 'gold loan',
   // Hindi income/loan vocabulary — these are frequently misrecognized by Deepgram
   // without boosting (e.g. "सालाना" → "सलीना", "मासिक" → garbled)
   'salary', 'income', 'monthly', 'annual', 'yearly',
   'सालाना', 'मासिक', 'वेतन', 'आय', 'तनख्वाह',
   'लाख', 'हज़ार', 'करोड़', 'रुपए', 'रुपये',
-  'होम लोन', 'गोल्ड लोन', 'कार लोन', 'पर्सनल लोन',
+  'होम लोन', 'गोल्ड लोन', 'कार लोन', 'पर्सनल लोन', 'बिजनेस लोन',
   'सिबिल', 'CIBIL', 'ITR', 'सैलरी स्लिप',
 ];
 
@@ -829,9 +830,15 @@ function startIdleTimer(session) {
   const idleMs = Number(process.env.IDLE_REENGAGE_MS || 0);
   if (!idleMs || idleMs <= 0) return;
 
+  // Never start an idle timer if the agent is currently speaking or processing.
+  // This is an extra safety guard: the _agentSpeakingTimer should call us only
+  // after audio finishes, but race conditions (e.g. agentSpeaking not yet true
+  // on first chunk) could let this slip through.
+  if (session.agentSpeaking || session.isProcessing) return;
+
   session._idleTimer = setTimeout(() => {
     // Defense-in-depth: never re-engage on a dead/closing session,
-    // and never if the user is already mid-turn.
+    // and never if the user is already mid-turn or agent is still speaking.
     if (session.status === 'ended' || session.agentSpeaking || session.isProcessing) return;
     if (!session.ws || session.ws.readyState !== 1) return;
     if (!activeSessions.has(session.id)) return;
@@ -919,7 +926,21 @@ async function handleMessage(session, message) {
       // the user resumes, the window extends and we process ONE merged turn.
       if (!session.isProcessing && session._lastSttTranscript && session._lastSttTranscript.trim().length > 0) {
         const pendingTranscript = session._lastSttTranscript;
-        const delayMs = Number(process.env.STT_VAD_FINALIZATION_DELAY_MS || 250);
+        let delayMs = Number(process.env.STT_VAD_FINALIZATION_DELAY_MS || 250);
+
+        // ── 2. Dynamic Silence Detection (VAD Tuning) ───────────────────────
+        // If the user's transcript ends with thinking words, connectors, or numbers,
+        // they are likely reading an ID or thinking. Extend VAD timeout to avoid cutting them off.
+        const normalized = pendingTranscript.trim().toLowerCase();
+        const isThinking = normalized.endsWith('um') || normalized.endsWith('uh') || normalized.endsWith('hmm') || normalized.endsWith('um...');
+        const isConnector = normalized.endsWith('is') || normalized.endsWith('my') || normalized.endsWith('the') || normalized.endsWith('and');
+        const endsWithNumber = /\d$/.test(normalized) || /\d\.$/.test(normalized);
+        const endsWithHindiConnector = normalized.endsWith('hai') || normalized.endsWith('mera') || normalized.endsWith('aur');
+
+        if (isThinking || isConnector || endsWithNumber || endsWithHindiConnector) {
+          delayMs = 1500;
+          console.log(`[VAD Dynamic Tuning] Extended silence timeout to 1500ms because user is thinking/reading: "${pendingTranscript}"`);
+        }
 
         if (session._vadFinalizationTimer) clearTimeout(session._vadFinalizationTimer);
 
@@ -1609,6 +1630,19 @@ async function processTranscript(session, transcript) {
       return;
     }
   }
+
+  // ── 1. Phantom Speech & Backchannel Filter (Edge Case 1) ───────────────
+  // If the agent is currently speaking, and the user just says a 1-2 word utterance
+  // (like "hmm", "yeah", "ok", "haan"), it's likely a backchannel or background noise.
+  // We DROP it instead of interrupting the agent and sending "hmm" to the LLM.
+  if (!transcript.startsWith('[SYSTEM_EVENT') && session.agentSpeaking) {
+    const wordCount = _cleanedTranscript.split(/\s+/).filter(w => w.length > 0).length;
+    if (wordCount <= 2) {
+      console.log(`[Phantom Speech Filter] Dropping short backchannel while agent is speaking: "${transcript}"`);
+      return;
+    }
+  }
+
   session._lastProcessedTranscript = _cleanedTranscript;
   session._lastProcessedAt = Date.now();
 
@@ -1801,11 +1835,18 @@ async function processTranscript(session, transcript) {
     // 🔄 HUMAN HANDOFF CHECK
     // Check if call should be transferred to a human agent
     if (session.agent?.transferNumber) {
-      const transferCheck = voicePipeline.shouldTransfer({
-        transcript: session.history,
-        sentimentHistory: session.sentimentHistory || [],
-        agent: session.agent,
-      });
+      // ── 3. Fast Sentiment & Frustration Escalation (Edge Case 3) ──────────────
+      // Bypass LLM completely if the user uses strong escalation words.
+      const escalationRegex = /(talk to a human|speak to a human|customer care|customer service|agent se baat|insan se|real person|manager|frustrated|useless|stupid|idiot|bakwas)/i;
+      const isFastEscalation = escalationRegex.test(transcript);
+
+      const transferCheck = isFastEscalation
+        ? { shouldTransfer: true, reason: 'Fast Frustration Intercept' }
+        : voicePipeline.shouldTransfer({
+            transcript: session.history,
+            sentimentHistory: session.sentimentHistory || [],
+            agent: session.agent,
+          });
 
       if (transferCheck.shouldTransfer) {
         console.log(`[🔄 Transfer] Session ${session.id} → ${session.agent.transferNumber} (${transferCheck.reason})`);
@@ -1978,15 +2019,35 @@ async function processTranscript(session, transcript) {
 
         const newAgent = await Agent.findById(chunk.agentId);
         if (newAgent) {
-          // Build a handoff summary so the destination agent doesn't have
-          // to ask the customer to repeat themselves. We use a fast Groq
-          // call (best-effort — even if it fails, we still hand off the
-          // last 6 messages verbatim).
+          // FIX: Squad handoff non-blocking.
+          // `compressHistory` is a Groq LLM call. Previously it was awaited
+          // BEFORE sending the "Please hold" message, adding 500-1000ms of
+          // silent dead-air from the user's perspective. Now we:
+          //   1. Send "Please hold" + TTS immediately
+          //   2. Race compressHistory with an 800ms wall clock
+          //   3. Use whatever summary is ready (or empty string) to build context
+          const transferMsg = `I will transfer you to ${newAgent.name}. Please hold.`;
+          safeSend(session.ws, { type: 'response_text', text: transferMsg });
+
+          try {
+            const ttsService = require('../services/ttsService');
+            const audioBuffer = await ttsService.textToSpeech({
+              text: transferMsg,
+              voiceId: session.agent.voice?.voiceId || 'en-US-JennyNeural',
+              provider: session.agent.voice?.provider || 'edge-tts',
+            });
+            if (audioBuffer && audioBuffer.length > 0) sendAudioBuffer(session, audioBuffer);
+          } catch (e) {}
+
+          // Race: get summary within 800ms or proceed without it.
           let handoffSummary = '';
           try {
-            const summary = await voicePipeline.compressHistory(session.history);
-            handoffSummary = summary?.summary || '';
-          } catch (_) { /* ignore */ }
+            const summaryResult = await Promise.race([
+              voicePipeline.compressHistory(session.history),
+              new Promise(resolve => setTimeout(() => resolve(null), 800)),
+            ]);
+            handoffSummary = summaryResult?.summary || '';
+          } catch (_) { /* summary is best-effort */ }
 
           const recentMessages = session.history.slice(-6);
           const handoffContext = [
@@ -2005,19 +2066,6 @@ async function processTranscript(session, transcript) {
             handoffSummary,
             messagesBeforeTransfer: session.history.length,
           });
-
-          const transferMsg = `I will transfer you to ${newAgent.name}. Please hold.`;
-          safeSend(session.ws, { type: 'response_text', text: transferMsg });
-
-          try {
-            const ttsService = require('../services/ttsService');
-            const audioBuffer = await ttsService.textToSpeech({
-              text: transferMsg,
-              voiceId: session.agent.voice?.voiceId || 'en-US-JennyNeural',
-              provider: session.agent.voice?.provider || 'edge-tts',
-            });
-            if (audioBuffer && audioBuffer.length > 0) sendAudioBuffer(session, audioBuffer);
-          } catch (e) {}
 
           // Swap agent. Inject the handoff context as a system message so
           // the next LLM call has the full picture without re-prompting.
@@ -2366,6 +2414,11 @@ async function sendPostCallNotifications(session, analysis) {
 }
 
 async function cleanupSession(session) {
+  // Mark disconnected FIRST — any in-flight TTS synthesis or audio queue
+  // tasks check this flag to bail early and avoid burning API credits for
+  // audio that will never reach a live client.
+  session.isDisconnected = true;
+
   // Cancel any in-flight LLM HTTP request so a dying call doesn't keep
   // burning Groq/Gemini quota (the 429 we saw in production logs came
   // from an idle-timer firing AFTER the WS had disconnected).
@@ -2461,12 +2514,14 @@ function sendAudioChunkOnly(session, buffer) {
   const timestamp = Date.now();
 
   const task = async () => {
+    if (session.isDisconnected) return; // Session already gone — drop silently
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
     await waitForWsDrain(session.ws, maxBufferedBytes);
     if (session.currentGenerationId !== generationId) {
       console.log(`[AudioQueue] Dropping stale audio chunk for generation ${generationId}`);
       return;
     }
+
 
     if (session.prefersBinaryAudio) {
       safeSendBinary(session.ws, buffer);
@@ -2503,15 +2558,29 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
   if (buffer && buffer.length > 0) {
     if (!session._audioQueueDurationMs) session._audioQueueDurationMs = 0;
     const provider = session.agent?.voice?.provider || 'edge-tts';
-    const bytesPerSec = provider === 'eleven-labs' ? 16000
-                      : provider === 'edge-tts'    ? 8000
-                      : 4000;
+    // FIX Bug #3: Previously sarvam and cartesia fell into the 4000 bytes/sec
+    // (32kbps) fallback, which is far below their actual output bitrate.
+    // Wrong estimate → agentSpeaking cleared too early → user barge-in window
+    // opened before audio finished playing.
+    // Use env vars so ops can tune without a code deploy if bitrate changes.
+    const bytesPerSec =
+      provider === 'eleven-labs' ? Number(process.env.ELEVENLABS_BYTES_PER_SEC || 16000)  // 128kbps mp3
+    : provider === 'edge-tts'    ? Number(process.env.EDGE_TTS_BYTES_PER_SEC    ||  8000)  // 64kbps mp3
+    : provider === 'sarvam'      ? Number(process.env.SARVAM_BYTES_PER_SEC      ||  8000)  // ~64kbps mp3
+    : provider === 'cartesia'    ? Number(process.env.CARTESIA_BYTES_PER_SEC    || 16000)  // 128kbps
+    :                              Number(process.env.TTS_DEFAULT_BYTES_PER_SEC  ||  8000); // safe default
     const chunkDurationMs = Math.round((buffer.length / bytesPerSec) * 1000);
     session._audioQueueDurationMs += Math.max(150, chunkDurationMs);
   }
 
 
   const task = async () => {
+    // Skip TTS delivery if session disconnected during synthesis — saves
+    // API credits (ElevenLabs, Cartesia) for audio no client will hear.
+    if (session.isDisconnected) {
+      console.log(`[AudioQueue] Session disconnected — dropping audio chunk (generation ${generationId})`);
+      return;
+    }
     const maxBufferedBytes = Number(process.env.WS_MAX_BUFFERED_BYTES || 2 * 1024 * 1024);
     await waitForWsDrain(session.ws, maxBufferedBytes);
     if (session.currentGenerationId !== generationId) {
@@ -2550,9 +2619,11 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
 
       // Use the fully-accumulated duration (all chunks summed above) +
       // a 300ms tail buffer so the last word finishes before we start listening.
-      // Cap at 6s max so agentSpeaking never blocks the mic indefinitely if
-      // the buffer size estimate is wrong for an unusual audio format.
-      const totalDuration = Math.min(session._audioQueueDurationMs || 1000, 6000);
+      // Cap at 30s max (was 6s — increased because long multi-chunk responses
+      // like 7+ TTS sentences can easily exceed 10-15s of actual playback.
+      // The old 6s cap caused agentSpeaking to clear early, allowing the idle
+      // re-engagement timer to fire mid-speech.)
+      const totalDuration = Math.min(session._audioQueueDurationMs || 1000, 30000);
       if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
       session._agentSpeakingTimer = setTimeout(() => {
         session.agentSpeaking = false;
@@ -2605,6 +2676,11 @@ function emitLatencyMetrics(session, stage = 'update') {
 
 function queueCallLogUpdate(session, update, label = 'call_log_update') {
   if (!session?.callLogId) return;
+  // FIX: Guard against zombie timers on ended sessions.
+  // Without this, queueCallLogUpdate called AFTER session.status === 'ended'
+  // (e.g., from a late async callback) would create a new setInterval that
+  // never gets cleared, leaking memory for the lifetime of the process.
+  if (session.status === 'ended') return;
 
   if (!session._pendingLogUpdates) {
     session._pendingLogUpdates = [];

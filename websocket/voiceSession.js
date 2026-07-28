@@ -485,7 +485,15 @@ function buildSessionOnTranscript(session) {
 
     if (transcript.trim().length > 0) {
       if (session._idleTimer) { clearTimeout(session._idleTimer); session._idleTimer = null; }
-      session._lastSttTranscript = transcript;
+      // CRITICAL: Only store interim transcripts here.
+      // When isFinal+speechFinal fires, _lastSttTranscript must still hold
+      // the last INTERIM value so the hallucination check below can compare
+      // the full interim sentence against the (possibly collapsed) final.
+      // If we overwrote it here with the final "मुझे", prevInterim === transcript
+      // and the check would NEVER detect the drop.
+      if (!(isFinal && speechFinal)) {
+        session._lastSttTranscript = transcript;
+      }
 
       // Active backchanneling — fires only when the user has been talking
       // for a while AND the latest interim transcript looks like a
@@ -544,8 +552,35 @@ function buildSessionOnTranscript(session) {
     if (isFinal && speechFinal && transcript.trim().length > 0) {
       if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
       if (session.isProcessing) return;
-      console.log(`[STT] speech_final buffered: "${transcript}"`);
-      commitTranscript(session, transcript);
+      
+      let finalToCommit = transcript;
+      const prevInterim = (session._lastSttTranscript || '').trim();
+      
+      // Deepgram Hallucination Protection:
+      // Deepgram sometimes collapses a full sentence into a single noise
+      // word ("मन", "mmm", "haan") in the final result even though the
+      // interim was perfectly correct. We detect three patterns of this:
+      //
+      //  1. Char dropoff  — interim ≥10 chars but final ≤6 chars
+      //  2. Word dropoff  — interim had ≥3 words but final has ≤1 word
+      //  3. Ratio dropoff — final is less than 25% of interim length
+      //
+      // In all three cases we prefer the interim over the hallucinated final.
+      const prevInterimWords = prevInterim ? prevInterim.split(/\s+/).filter(Boolean).length : 0;
+      const finalWords       = transcript.split(/\s+/).filter(Boolean).length;
+      const isSuspiciousDropoff =
+        (prevInterim.length >= 10 && transcript.length <= 6) ||
+        (prevInterimWords >= 3 && finalWords <= 1) ||
+        (prevInterim.length >= 20 && transcript.length < prevInterim.length * 0.25);
+
+      if (isSuspiciousDropoff) {
+        console.warn(`[STT] Deepgram hallucination detected! Interim: "${prevInterim}" (${prevInterimWords}w/${prevInterim.length}c) → Final: "${transcript}" (${finalWords}w/${transcript.length}c). Preferring interim.`);
+        finalToCommit = prevInterim;
+      }
+      
+      console.log(`[STT] speech_final buffered: "${finalToCommit}"`);
+      commitTranscript(session, finalToCommit);
+      session._lastSttTranscript = ''; // clear to prevent double-commit by silence fallback
       return;
     }
 

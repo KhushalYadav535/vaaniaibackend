@@ -125,7 +125,10 @@ class DeepgramService {
       console.warn(`[Deepgram] ⚠️ utterance_end_ms=${rawUtteranceEndMs} is below Deepgram's minimum of ${DEEPGRAM_UTTERANCE_END_MIN}ms — clamped to ${utteranceEndMs}ms. For faster turn detection use endpointing (currently ${endpointingMs}ms).`);
     }
 
-    const minFinalChars  = Number(process.env.MIN_TRANSCRIPT_CHARS_FOR_FINAL || 2);
+    // Default raised from 2→3: single 2-char noise words ("मन", "हाँ", "mm")
+    // that Deepgram hallucinates as speech_final are now blocked at source.
+    // Override via MIN_TRANSCRIPT_CHARS_FOR_FINAL env var if needed.
+    const minFinalChars  = Number(process.env.MIN_TRANSCRIPT_CHARS_FOR_FINAL || 3);
 
     // FIX: Use explicit audioConfig (per-session) if provided, otherwise fall back to env vars.
     // This avoids the dangerous pattern of mutating process.env for per-session audio config,

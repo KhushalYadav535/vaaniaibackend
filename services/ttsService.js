@@ -125,7 +125,7 @@ class TtsService {
    * Normalize text for Hindi TTS — converts digits/numbers to natural speech form
    * so ElevenLabs (and Edge TTS) don't mispronounce them.
    * Examples:
-   *   "10.50%"  → "दस पॉइंट पचास प्रतिशत"
+   *   "10.50%"  → "दस दशमलव पचास प्रतिशत"
    *   "10 lakh" → "दस लाख"
    *   "5 साल"   → "पाँच साल"
    *   "9876543210" → pronounced digit by digit
@@ -172,41 +172,41 @@ class TtsService {
     // 1b. Phone numbers: continuous 10-digit sequences → digit by digit
     result = result.replace(/\b(\d{10})\b/g, (m) => spaceDigits(m));
 
-    // 2. Percentage with decimal: "10.50%" → "दस पॉइंट पचास प्रतिशत"
+    // 2. Percentage with decimal: "10.50%" → "दस दशमलव पचास प्रतिशत"
     result = result.replace(/(\d+)\.(\d+)%/g, (m, int, dec) => {
-      return toHindiWord(int) + ' पॉइंट ' + toHindiWord(parseInt(dec, 10)) + ' प्रतिशत';
+      return toHindiWord(int) + ' दशमलव ' + toHindiWord(parseInt(dec, 10)) + ' प्रतिशत';
     });
 
     // 3. Plain percentage: "10%" → "दस प्रतिशत"
     result = result.replace(/(\d+)%/g, (m, n) => toHindiWord(n) + ' प्रतिशत');
 
-    // 4a. ₹ currency with Indian comma-formatting: ₹4,00,000 / ₹50,000 / ₹1,00,00,000
+    // Helper for amounts with decimals
+    const processDecimalWord = (n, word) => {
+      if (n.includes('.')) {
+        const [i, d] = n.split('.');
+        return toHindiWord(i) + ' दशमलव ' + toHindiWord(parseInt(d, 10)) + ' ' + word;
+      }
+      return toHindiWord(n) + ' ' + word;
+    };
+
+    // 4a. Indian currency amounts with lakh/crore/hazar words (supports decimals like 1.5 and optional ₹ prefix)
+    result = result.replace(/(?:₹|Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(लाख|lakh)s?/gi, (m, n) => processDecimalWord(n, 'लाख') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
+    result = result.replace(/(?:₹|Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(करोड़|crore)s?/gi, (m, n) => processDecimalWord(n, 'करोड़') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
+    result = result.replace(/(?:₹|Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(हज़ार|thousand)s?/gi, (m, n) => processDecimalWord(n, 'हज़ार') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
+    
+    // 4b. Simple ₹ with decimals (e.g., ₹1.5 -> एक दशमलव पाँच रुपये)
+    result = result.replace(/₹(\d+\.\d+)/g, (m, n) => {
+       const [i, d] = n.split('.');
+       return toHindiWord(i) + ' दशमलव ' + toHindiWord(parseInt(d, 10)) + ' रुपये';
+    });
+
+    // 4c. ₹ currency with Indian comma-formatting: ₹4,00,000 / ₹50,000 / ₹1,00,00,000
     result = result.replace(/₹(\d{1,2}(?:,\d{2})*(?:,\d{3})|\d{1,3}(?:,\d{3})+|\d+)/g, (m, raw) => {
       const n = parseIndian(raw);
       if (n >= 10000000) return toHindiWord(Math.round(n / 10000000)) + ' करोड़ रुपये';
       if (n >= 100000)  return toHindiWord(Math.round(n / 100000))  + ' लाख रुपये';
       if (n >= 1000)    return toHindiWord(Math.round(n / 1000))    + ' हज़ार रुपये';
       return toHindiWord(n) + ' रुपये';
-    });
-
-        // Helper for amounts with decimals
-    const processDecimalWord = (n, word) => {
-      if (n.includes('.')) {
-        const [i, d] = n.split('.');
-        return toHindiWord(i) + ' पॉइंट ' + toHindiWord(parseInt(d, 10)) + ' ' + word;
-      }
-      return toHindiWord(n) + ' ' + word;
-    };
-
-    // 4b. Indian currency amounts with lakh/crore/hazar words (supports decimals like 1.5 and optional ₹ prefix)
-    result = result.replace(/(?:₹|Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(लाख|lakh)s?/gi, (m, n) => processDecimalWord(n, 'लाख') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
-    result = result.replace(/(?:₹|Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(करोड़|crore)s?/gi, (m, n) => processDecimalWord(n, 'करोड़') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
-    result = result.replace(/(?:₹|Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(हज़ार|thousand)s?/gi, (m, n) => processDecimalWord(n, 'हज़ार') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
-    
-    // 4c. Simple ₹ with decimals (e.g., ₹1.5 -> एक पॉइंट पाँच रुपये)
-    result = result.replace(/₹(\d+\.\d+)/g, (m, n) => {
-       const [i, d] = n.split('.');
-       return toHindiWord(i) + ' पॉइंट ' + toHindiWord(parseInt(d, 10)) + ' रुपये';
     });
 
     // 5. Year (4-digit numbers starting with 19xx or 20xx)
@@ -225,9 +225,10 @@ class TtsService {
     if (!text || text.trim().length === 0) return Buffer.alloc(0);
 
     // Normalize numbers for Hindi TTS providers to avoid mispronunciation
-    // (ElevenLabs reads "10.50%" as "ten point fifty percent" — we want "दस पॉइंट पचास प्रतिशत")
+    // (ElevenLabs reads "10.50%" as "ten point fifty percent" — we want "दस दशमलव पचास प्रतिशत")
     const normalizeForHindi = String(process.env.TTS_HINDI_NUMBER_NORMALIZE || 'true').toLowerCase() === 'true';
-    if (normalizeForHindi && (provider === 'eleven-labs' || provider === 'edge-tts')) {
+    const isHindiContext = voiceId.includes('hi-IN') || /[\u0900-\u097F]/.test(text);
+    if (normalizeForHindi && isHindiContext && (provider === 'eleven-labs' || provider === 'edge-tts')) {
       text = this._normalizeHindiNumbers(text);
     }
 

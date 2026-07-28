@@ -15,7 +15,7 @@ const NEW_CURRENCY_LOGIC = `    // Helper for amounts with decimals
     const processDecimalWord = (n, word) => {
       if (n.includes('.')) {
         const [i, d] = n.split('.');
-        return toHindiWord(i) + ' पॉइंट ' + toHindiWord(parseInt(d, 10)) + ' ' + word;
+        return toHindiWord(i) + ' दशमलव ' + toHindiWord(parseInt(d, 10)) + ' ' + word;
       }
       return toHindiWord(n) + ' ' + word;
     };
@@ -25,10 +25,10 @@ const NEW_CURRENCY_LOGIC = `    // Helper for amounts with decimals
     result = result.replace(/(?:₹|Rs\\.?\\s*)?(\\d+(?:\\.\\d+)?)\\s*(करोड़|crore)s?/gi, (m, n) => processDecimalWord(n, 'करोड़') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
     result = result.replace(/(?:₹|Rs\\.?\\s*)?(\\d+(?:\\.\\d+)?)\\s*(हज़ार|thousand)s?/gi, (m, n) => processDecimalWord(n, 'हज़ार') + (m.includes('₹') || m.toLowerCase().includes('rs') ? ' रुपये' : ''));
     
-    // 4c. Simple ₹ with decimals (e.g., ₹1.5 -> एक पॉइंट पाँच रुपये)
+    // 4c. Simple ₹ with decimals (e.g., ₹1.5 -> एक दशमलव पाँच रुपये)
     result = result.replace(/₹(\\d+\\.\\d+)/g, (m, n) => {
        const [i, d] = n.split('.');
-       return toHindiWord(i) + ' पॉइंट ' + toHindiWord(parseInt(d, 10)) + ' रुपये';
+       return toHindiWord(i) + ' दशमलव ' + toHindiWord(parseInt(d, 10)) + ' रुपये';
     });`;
 
 if (content.includes('4b. Indian currency amounts with lakh/crore/hazar words')) {

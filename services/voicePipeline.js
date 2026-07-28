@@ -2474,8 +2474,8 @@ YOU: "Ji, aapka account? Poori baat bataiye."`,
       ? `⛔ BANNED CLOSERS: NEVER use generic closers like "Is there anything else I can help with?", "Feel free to ask!", or "How can I assist further?". Instead, end with a natural, specific question or simply: "Anything else?"`
       : `⛔ BANNED CLOSERS: NEVER use generic closers like "Kya aap aur detail chahte hain?", "Kya main aur kuch madad kar sakti hoon?", or "Is there anything else?". Instead, ask ONE specific contextual question or simply: "Aur kuch?" or "Koi sawaal?"`;
     const numbersRule = isEnglish
-      ? '8i. NUMBERS (CRITICAL): Spell out ALL large numbers and currencies in English words (e.g., write "eight thousand" instead of "8000", "one lakh" instead of "100000"). If you write digits, the Indian voice will incorrectly read them in Hindi.'
-      : '8i. NUMBERS: Write large numbers as normal digits (e.g., 8000).';
+      ? '8i. NUMBERS (CRITICAL): Spell out ALL numbers, decimals, and currencies in English words (e.g., write "one point five crore" instead of "1.5 crore", "eight thousand" instead of "8000"). If you write digits, the voice engine may mispronounce them.'
+      : '8i. NUMBERS (CRITICAL): Spell out ALL numbers, decimals, and currencies completely in words using the native script of your language. Never use digits (e.g., write "एक दशमलव पाँच करोड़" बजाय "1.5 crore" या "1.5 करोड़" के). If you write digits, the voice engine will mispronounce them.';
 
     prompt += `
 

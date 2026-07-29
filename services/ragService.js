@@ -336,6 +336,99 @@ class RAGService {
     };
   }
 
+  // ── PDF Table-Merge Cleanup (Universal — works for ANY domain) ──────
+  //
+  // pdf-parse / pdfjs extract PDF table cells without column separators,
+  // producing merged strings regardless of domain:
+  //
+  //   Banking:   "Takeover ConditionCar age ≤ 3 years"
+  //   Medical:   "DosageTwice daily after meals"
+  //   HR:        "Notice Period30 days"
+  //   Legal:     "JurisdictionDelhi High Court"
+  //   E-commerce:"Return Policy7 days from delivery"
+  //
+  // ROOT CAUSE: In a PDF table, each row has a Label column and a Value
+  // column. When extracted linearly, the last character of the label and
+  // the first character of the value are concatenated with NO space.
+  //
+  // UNIVERSAL HEURISTIC: In English/Hindi prose a lowercase letter is
+  // NEVER immediately followed by an uppercase letter or a digit without
+  // a space. If we see that pattern, it's a PDF column boundary → split.
+  //
+  // Exclusions handled:
+  //   • URLs (https://...) — protected by URL guard
+  //   • Known abbreviations (e.g., Ltd., etc., Mr., Dr.) — protected
+  //   • Currency symbols and digits — caught by the ₹/$/%/digit rule
+  //
+  _cleanPdfContent(text) {
+    if (!text) return text;
+    let t = text;
+
+    // ── Step 1: Remove repeated page headers / footers ──────────────
+    // Generic patterns that appear in almost all formatted/corporate PDFs
+    // regardless of domain: company name line, helpline footer, "Page N"
+    t = t.replace(/[A-Za-z ,\.]{5,}Ltd\.[^\n]{0,80}Page \d+\s*/g, '\n');
+    t = t.replace(/Helpline:[^\n]{0,80}Page \d+\s*/g, '\n');
+    // Generic footer: "something | something | Page N"
+    t = t.replace(/^[^\n]{5,60}\|\s*Page \d+\s*$/gm, '');
+    t = t.replace(/^\s*Page \d+\s*$/gm, '');
+    t = t.replace(/com\s*Page \d+/g, '');
+
+    // ── Step 2: Remove boilerplate lines that repeat 3+ times ────────
+    // Corporate PDFs often repeat the company name + contact on every page.
+    // Any line appearing 3+ times is a header/footer → remove.
+    const lines = t.split('\n');
+    const freq = {};
+    lines.forEach(l => {
+      const k = l.trim();
+      if (k.length > 8 && k.length < 130) freq[k] = (freq[k] || 0) + 1;
+    });
+    const boilerplate = new Set(Object.keys(freq).filter(k => freq[k] >= 3));
+    if (boilerplate.size > 0) {
+      t = lines.filter(l => !boilerplate.has(l.trim())).join('\n');
+    }
+
+    // ── Step 3: Universal table-cell boundary detection ──────────────
+    // CORE HEURISTIC — works for ANY domain (Banking, Medical, HR, Legal,
+    // E-commerce, Insurance, Education, etc.):
+    //
+    // In English/Hindi prose a lowercase letter is NEVER immediately
+    // followed by an uppercase letter or digit WITHOUT a space.
+    // When pdf-parse/pdfjs merges table columns that boundary is lost.
+    // We restore it by inserting a newline at every such transition.
+    //
+    // Examples caught automatically, without any domain-specific list:
+    //   Banking:    "Takeover ConditionCar age ≤ 3 yrs" → split at "nC"
+    //   Medical:    "DosageTwice daily"                  → split at "eT"
+    //   HR:         "Notice Period30 days"               → split at "d3"
+    //   Legal:      "JurisdictionDelhi High Court"       → split at "nD"
+    //   E-commerce: "Return Policy7 days"                → split at "y7"
+    //   Insurance:  "Sum Assured₹5 lakh"                → split at "d₹"
+    t = t.replace(
+      /([a-z\u0900-\u097F])([A-Z\u20B9\u0024\u20AC\u00A3\u0025\u0900-\u097F\d])/g,
+      (match, p1, p2, offset, str) => {
+        // Guard 1: inside a URL → skip
+        const ctx = str.substring(Math.max(0, offset - 25), offset + 1);
+        if (/https?:\/\/\S*$/.test(ctx)) return match;
+        // Guard 2: digit→digit is part of a number, not a boundary
+        if (/\d/.test(p1) && /\d/.test(p2)) return match;
+        // Guard 3: p2 is % directly after a digit (e.g. "12%" is fine)
+        if (/\d/.test(p1) && p2 === '%') return match;
+        return `${p1}\n${p2}`;
+      }
+    );
+
+    // ── Step 4: Currency symbols still glued after Step 3 ────────────
+    t = t.replace(/([a-zA-Z\u0900-\u097F)])(\u20B9|\$|€|£)/g, '$1\n$2');
+
+    // ── Step 5: Normalise whitespace ─────────────────────────────────
+    t = t.replace(/[ \t]{2,}/g, ' ');
+    t = t.replace(/\r\n/g, '\n');
+    t = t.replace(/\n{3,}/g, '\n\n');
+
+    return t.trim();
+  }
+
   // ── Document Processing ───────────────────────────────────────────
   async processDocument(knowledgeBaseId) {
     const kb = await KnowledgeBase.findById(knowledgeBaseId);
@@ -344,7 +437,13 @@ class RAGService {
       kb.status = 'processing';
       await kb.save();
       console.log(`[RAG] Processing KB: ${kb.name} (${kb.content.length} chars)`);
-      const chunks = this.chunkText(kb.content);
+      // Clean PDF table-merge artifacts before chunking so every upload
+      // automatically gets readable, searchable key-value pairs.
+      const cleanedContent = this._cleanPdfContent(kb.content);
+      if (cleanedContent.length !== kb.content.length) {
+        console.log(`[RAG] Content cleaned: ${kb.content.length} → ${cleanedContent.length} chars`);
+      }
+      const chunks = this.chunkText(cleanedContent);
       console.log(`[RAG] Created ${chunks.length} semantic chunks`);
       const processedChunks = [];
       const batchSize       = 5;

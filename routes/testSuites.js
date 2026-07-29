@@ -3,7 +3,7 @@ const router = express.Router();
 const TestSuite = require('../models/TestSuite');
 const Agent = require('../models/Agent');
 const simulator = require('../services/agentSimulator');
-const { protect } = require('../middleware/auth');
+const { protect, checkPermission } = require('../middleware/auth');
 
 router.use(protect);
 
@@ -16,7 +16,7 @@ async function ownsAgent(userId, agentId) {
 
 // @route   GET /api/test-suites
 // @desc    List all test suites (without heavy run transcripts)
-router.get('/', async (req, res, next) => {
+router.get('/', checkPermission('test_suites_view'), async (req, res, next) => {
   try {
     const suites = await TestSuite.find({ userId: req.user._id })
       .populate('agentId', 'name')
@@ -30,7 +30,7 @@ router.get('/', async (req, res, next) => {
 
 // @route   GET /api/test-suites/:id
 // @desc    Get a single suite with full run history
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', checkPermission('test_suites_view'), async (req, res, next) => {
   try {
     const suite = await TestSuite.findOne({ _id: req.params.id, userId: req.user._id })
       .populate('agentId', 'name');
@@ -43,7 +43,7 @@ router.get('/:id', async (req, res, next) => {
 
 // @route   POST /api/test-suites
 // @desc    Create a test suite
-router.post('/', async (req, res, next) => {
+router.post('/', checkPermission('test_suites_create'), async (req, res, next) => {
   try {
     const { name, description, agentId, scenarios } = req.body;
     if (!name || !agentId) {
@@ -69,7 +69,7 @@ router.post('/', async (req, res, next) => {
 
 // @route   PUT /api/test-suites/:id
 // @desc    Update suite metadata / scenarios
-router.put('/:id', async (req, res, next) => {
+router.put('/:id', checkPermission('test_suites_edit'), async (req, res, next) => {
   try {
     const { name, description, agentId, scenarios } = req.body;
 
@@ -97,7 +97,7 @@ router.put('/:id', async (req, res, next) => {
 });
 
 // @route   DELETE /api/test-suites/:id
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', checkPermission('test_suites_delete'), async (req, res, next) => {
   try {
     const suite = await TestSuite.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
     if (!suite) return res.status(404).json({ success: false, message: 'Test suite not found' });
@@ -110,7 +110,7 @@ router.delete('/:id', async (req, res, next) => {
 // @route   POST /api/test-suites/:id/run
 // @desc    Kick off a simulation run (executes in background). Returns runId
 //          immediately; poll GET /:id/runs/:runId for progress.
-router.post('/:id/run', async (req, res, next) => {
+router.post('/:id/run', checkPermission('test_suites_edit'), async (req, res, next) => {
   try {
     const suite = await TestSuite.findOne({ _id: req.params.id, userId: req.user._id });
     if (!suite) return res.status(404).json({ success: false, message: 'Test suite not found' });

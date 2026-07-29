@@ -6,11 +6,19 @@ const { protect } = require('../middleware/auth');
 
 router.use(protect);
 
+const alacQuery = (user, type = 'agentId') => {
+  if (user.accountType === 'member' && user.restrictAgents) {
+    return { [type]: { $in: user.assignedAgents || [] } };
+  }
+  return {};
+};
+
+
 // @route   GET /api/analytics/overview
 router.get('/overview', async (req, res, next) => {
   try {
     const { period = '30d' } = req.query;
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
 
     const daysMap = { '7d': 7, '30d': 30, '90d': 90 };
     const days = daysMap[period] || 30;
@@ -23,16 +31,16 @@ router.get('/overview', async (req, res, next) => {
       totalAgents,
       activeAgents,
     ] = await Promise.all([
-      CallLog.countDocuments({ userId, startTime: { $gte: startDate } }),
-      CallLog.countDocuments({ userId, status: 'completed', startTime: { $gte: startDate } }),
-      CallLog.countDocuments({ userId, status: 'failed', startTime: { $gte: startDate } }),
-      Agent.countDocuments({ userId }),
-      Agent.countDocuments({ userId, status: 'active' }),
+      CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate } }),
+      CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId, status: 'completed', startTime: { $gte: startDate } }),
+      CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId, status: 'failed', startTime: { $gte: startDate } }),
+      Agent.countDocuments({ ...alacQuery(req.user, '_id'), userId }),
+      Agent.countDocuments({ ...alacQuery(req.user, '_id'), userId, status: 'active' }),
     ]);
 
     // Total duration & QA score
     const durationResult = await CallLog.aggregate([
-      { $match: { userId, status: 'completed', startTime: { $gte: startDate } } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, status: 'completed', startTime: { $gte: startDate } } },
       { $group: { _id: null, totalDuration: { $sum: '$duration' }, totalCost: { $sum: '$costCents' }, avgQaScore: { $avg: '$qa.score' } } },
     ]);
 
@@ -68,14 +76,14 @@ router.get('/overview', async (req, res, next) => {
 router.get('/calls-over-time', async (req, res, next) => {
   try {
     const { period = '30d' } = req.query;
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
 
     const daysMap = { '7d': 7, '30d': 30, '90d': 90 };
     const days = daysMap[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const data = await CallLog.aggregate([
-      { $match: { userId, startTime: { $gte: startDate } } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate } } },
       {
         $group: {
           _id: { $dateToString: { format: '%Y-%m-%d', date: '$startTime' } },
@@ -97,12 +105,12 @@ router.get('/calls-over-time', async (req, res, next) => {
 router.get('/top-agents', async (req, res, next) => {
   try {
     const { period = '30d' } = req.query;
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const data = await CallLog.aggregate([
-      { $match: { userId, startTime: { $gte: startDate } } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate } } },
       {
         $group: {
           _id: '$agentId',
@@ -127,12 +135,12 @@ router.get('/top-agents', async (req, res, next) => {
 router.get('/sentiment-distribution', async (req, res, next) => {
   try {
     const { period = '30d' } = req.query;
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const data = await CallLog.aggregate([
-      { $match: { userId, startTime: { $gte: startDate }, sentiment: { $ne: '' } } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate }, sentiment: { $ne: '' } } },
       {
         $group: {
           _id: '$sentiment',
@@ -154,12 +162,12 @@ router.get('/sentiment-distribution', async (req, res, next) => {
 router.get('/intent-distribution', async (req, res, next) => {
   try {
     const { period = '30d' } = req.query;
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const data = await CallLog.aggregate([
-      { $match: { userId, startTime: { $gte: startDate }, customerIntent: { $ne: '' }, status: 'completed' } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate }, customerIntent: { $ne: '' }, status: 'completed' } },
       {
         $group: {
           _id: '$customerIntent',
@@ -180,10 +188,10 @@ router.get('/intent-distribution', async (req, res, next) => {
 // @desc    Get AMD/voicemail detection stats for campaigns
 router.get('/voicemail-stats', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
 
     const data = await CallLog.aggregate([
-      { $match: { userId, direction: 'outbound' } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, direction: 'outbound' } },
       {
         $group: {
           _id: '$answeredBy',
@@ -214,10 +222,10 @@ router.get('/voicemail-stats', async (req, res, next) => {
 // @desc    Get post-call notification stats
 router.get('/follow-up-stats', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
 
     const data = await CallLog.aggregate([
-      { $match: { userId, 'notificationsSent.0': { $exists: true } } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, 'notificationsSent.0': { $exists: true } } },
       { $unwind: '$notificationsSent' },
       {
         $group: {
@@ -230,8 +238,7 @@ router.get('/follow-up-stats', async (req, res, next) => {
       },
     ]);
 
-    const followUpRequired = await CallLog.countDocuments({
-      userId,
+    const followUpRequired = await CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId,
       followUpRequired: true,
       status: 'completed',
     });
@@ -246,13 +253,13 @@ router.get('/follow-up-stats', async (req, res, next) => {
 // @desc    Heatmap data: calls by hour of day and day of week
 router.get('/peak-hours', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const { period = '30d' } = req.query;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const data = await CallLog.aggregate([
-      { $match: { userId, startTime: { $gte: startDate } } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate } } },
       {
         $group: {
           _id: {
@@ -276,13 +283,13 @@ router.get('/peak-hours', async (req, res, next) => {
 // @desc    Compare agents: calls, avg duration, sentiment breakdown, success rate
 router.get('/agent-comparison', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const { period = '30d' } = req.query;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const data = await CallLog.aggregate([
-      { $match: { userId, startTime: { $gte: startDate } } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate } } },
       {
         $group: {
           _id: { agentId: '$agentId', agentName: '$agentName' },
@@ -331,13 +338,13 @@ router.get('/agent-comparison', async (req, res, next) => {
 // @desc    Histogram: how many calls in each duration bucket
 router.get('/call-duration-distribution', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const { period = '30d' } = req.query;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const data = await CallLog.aggregate([
-      { $match: { userId, startTime: { $gte: startDate }, status: 'completed' } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate }, status: 'completed' } },
       {
         $bucket: {
           groupBy: '$duration',
@@ -369,18 +376,18 @@ router.get('/call-duration-distribution', async (req, res, next) => {
 // @desc    Funnel: total → answered → completed → positive → follow-up sent
 router.get('/conversion-funnel', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const { period = '30d' } = req.query;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const [total, answered, completed, positive, followUpSent, transferred] = await Promise.all([
-      CallLog.countDocuments({ userId, startTime: { $gte: startDate } }),
-      CallLog.countDocuments({ userId, startTime: { $gte: startDate }, answeredBy: { $in: ['human', ''] } }),
-      CallLog.countDocuments({ userId, startTime: { $gte: startDate }, status: 'completed' }),
-      CallLog.countDocuments({ userId, startTime: { $gte: startDate }, sentiment: 'positive' }),
-      CallLog.countDocuments({ userId, startTime: { $gte: startDate }, 'notificationsSent.0': { $exists: true } }),
-      CallLog.countDocuments({ userId, startTime: { $gte: startDate }, transferredTo: { $ne: '' } }),
+      CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate } }),
+      CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate }, answeredBy: { $in: ['human', ''] } }),
+      CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate }, status: 'completed' }),
+      CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate }, sentiment: 'positive' }),
+      CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate }, 'notificationsSent.0': { $exists: true } }),
+      CallLog.countDocuments({ ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate }, transferredTo: { $ne: '' } }),
     ]);
 
     res.json({
@@ -403,13 +410,13 @@ router.get('/conversion-funnel', async (req, res, next) => {
 // @desc    Daily sentiment + call volume trends
 router.get('/trends', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const { period = '30d' } = req.query;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const data = await CallLog.aggregate([
-      { $match: { userId, startTime: { $gte: startDate } } },
+      { $match: { ...alacQuery(req.user, 'agentId'), userId, startTime: { $gte: startDate } } },
       {
         $group: {
           _id: {
@@ -441,15 +448,13 @@ router.get('/trends', async (req, res, next) => {
 // @desc    Average response latency breakdown (STT→LLM→TTS) from transcript timestamps
 router.get('/latency', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const { period = '30d' } = req.query;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const data = await CallLog.aggregate([
-      {
-        $match: {
-          userId,
+      { $match: { ...alacQuery(req.user, 'agentId'), userId,
           status: 'completed',
           startTime: { $gte: startDate },
           'transcript.latencyMs': { $exists: true },
@@ -471,9 +476,7 @@ router.get('/latency', async (req, res, next) => {
 
     // Overall avg
     const overall = await CallLog.aggregate([
-      {
-        $match: {
-          userId,
+      { $match: { ...alacQuery(req.user, 'agentId'), userId,
           status: 'completed',
           startTime: { $gte: startDate },
           'transcript.latencyMs': { $exists: true },
@@ -506,15 +509,13 @@ router.get('/latency', async (req, res, next) => {
 // @desc    QA score distribution across all calls
 router.get('/qa-distribution', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const { period = '30d' } = req.query;
     const days = { '7d': 7, '30d': 30, '90d': 90 }[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const gradeDistribution = await CallLog.aggregate([
-      {
-        $match: {
-          userId,
+      { $match: { ...alacQuery(req.user, 'agentId'), userId,
           startTime: { $gte: startDate },
           'qa.grade': { $exists: true, $ne: '' },
         },
@@ -524,9 +525,7 @@ router.get('/qa-distribution', async (req, res, next) => {
     ]);
 
     const avgScore = await CallLog.aggregate([
-      {
-        $match: {
-          userId,
+      { $match: { ...alacQuery(req.user, 'agentId'), userId,
           startTime: { $gte: startDate },
           'qa.score': { $exists: true, $gt: 0 },
         },
@@ -535,9 +534,7 @@ router.get('/qa-distribution', async (req, res, next) => {
     ]);
 
     const tagDistribution = await CallLog.aggregate([
-      {
-        $match: {
-          userId,
+      { $match: { ...alacQuery(req.user, 'agentId'), userId,
           startTime: { $gte: startDate },
           tags: { $exists: true, $ne: [] },
         },

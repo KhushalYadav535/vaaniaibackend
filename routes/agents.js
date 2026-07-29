@@ -3,7 +3,7 @@ const router = express.Router();
 const Agent = require('../models/Agent');
 const KnowledgeBase = require('../models/KnowledgeBase');
 const CallFlow = require('../models/CallFlow');
-const { protect } = require('../middleware/auth');
+const { protect, checkPermission } = require('../middleware/auth');
 
 // All routes require auth
 router.use(protect);
@@ -32,10 +32,16 @@ async function validateAgentReferences(userId, body) {
 }
 
 // @route   GET /api/agents
-router.get('/', async (req, res, next) => {
+router.get('/', checkPermission('agents_view'), async (req, res, next) => {
   try {
     const { status, search, sortBy = 'createdAt', order = 'desc' } = req.query;
-    const query = { userId: req.user._id };
+    const query = { userId: req.effectiveUserId };
+
+    // Apply Agent-Level Access Control (ALAC) for members
+    if (req.user.accountType === 'member' && req.user.restrictAgents) {
+      // req.user.assignedAgents is an array of ObjectIds
+      query._id = { $in: req.user.assignedAgents || [] };
+    }
 
     if (status && status !== 'all') query.status = status;
     if (search) query.name = { $regex: search, $options: 'i' };
@@ -50,9 +56,9 @@ router.get('/', async (req, res, next) => {
 });
 
 // @route   GET /api/agents/:id
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', checkPermission('agents_view'), async (req, res, next) => {
   try {
-    const agent = await Agent.findOne({ _id: req.params.id, userId: req.user._id });
+    const agent = await Agent.findOne({ _id: req.params.id, userId: req.effectiveUserId });
     if (!agent) return res.status(404).json({ success: false, message: 'Agent not found' });
     res.json({ success: true, agent });
   } catch (error) {
@@ -61,17 +67,17 @@ router.get('/:id', async (req, res, next) => {
 });
 
 // @route   POST /api/agents
-router.post('/', async (req, res, next) => {
+router.post('/', checkPermission('agents_create'), async (req, res, next) => {
   try {
     const { name, systemPrompt, firstMessage, language, voice, llm, temperature, maxDuration, endCallMessage, endCallPhrases, webhooks, tools, voicemailMessage, transferNumber, transferToAgentId, transferConditions, postCallActions, advanced, knowledgeBaseIds, workflowId } = req.body;
 
-    const refError = await validateAgentReferences(req.user._id, req.body);
+    const refError = await validateAgentReferences(req.effectiveUserId, req.body);
     if (refError) {
       return res.status(404).json({ success: false, message: refError });
     }
 
     const agent = await Agent.create({
-      userId: req.user._id,
+      userId: req.effectiveUserId,
       name,
       systemPrompt,
       firstMessage,
@@ -101,14 +107,14 @@ router.post('/', async (req, res, next) => {
 });
 
 // @route   PUT /api/agents/:id
-router.put('/:id', async (req, res, next) => {
+router.put('/:id', checkPermission('agents_edit'), async (req, res, next) => {
   try {
-    const refError = await validateAgentReferences(req.user._id, req.body);
+    const refError = await validateAgentReferences(req.effectiveUserId, req.body);
     if (refError) {
       return res.status(404).json({ success: false, message: refError });
     }
     const agent = await Agent.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      { _id: req.params.id, userId: req.effectiveUserId },
       req.body,
       { new: true, runValidators: true }
     );
@@ -120,9 +126,9 @@ router.put('/:id', async (req, res, next) => {
 });
 
 // @route   DELETE /api/agents/:id
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', checkPermission('agents_delete'), async (req, res, next) => {
   try {
-    const agent = await Agent.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
+    const agent = await Agent.findOneAndDelete({ _id: req.params.id, userId: req.effectiveUserId });
     if (!agent) return res.status(404).json({ success: false, message: 'Agent not found' });
     res.json({ success: true, message: 'Agent deleted' });
   } catch (error) {
@@ -131,11 +137,11 @@ router.delete('/:id', async (req, res, next) => {
 });
 
 // @route   PATCH /api/agents/:id/status
-router.patch('/:id/status', async (req, res, next) => {
+router.patch('/:id/status', checkPermission('agents_edit'), async (req, res, next) => {
   try {
     const { status } = req.body;
     const agent = await Agent.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      { _id: req.params.id, userId: req.effectiveUserId },
       { status },
       { new: true }
     );
@@ -147,11 +153,11 @@ router.patch('/:id/status', async (req, res, next) => {
 });
 
 // @route   PATCH /api/agents/:id/public
-router.patch('/:id/public', async (req, res, next) => {
+router.patch('/:id/public', checkPermission('agents_edit'), async (req, res, next) => {
   try {
     const { isPublic } = req.body;
     const agent = await Agent.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      { _id: req.params.id, userId: req.effectiveUserId },
       { isPublic },
       { new: true }
     );
@@ -163,16 +169,16 @@ router.patch('/:id/public', async (req, res, next) => {
 });
 
 // @route   POST /api/agents/:id/duplicate
-router.post('/:id/duplicate', async (req, res, next) => {
+router.post('/:id/duplicate', checkPermission('agents_create'), async (req, res, next) => {
   try {
-    const original = await Agent.findOne({ _id: req.params.id, userId: req.user._id });
+    const original = await Agent.findOne({ _id: req.params.id, userId: req.effectiveUserId });
     if (!original) return res.status(404).json({ success: false, message: 'Agent not found' });
 
     const { _id, createdAt, updatedAt, callsCount, totalMinutes, ...rest } = original.toObject();
 
     const duplicate = await Agent.create({
       ...rest,
-      userId: req.user._id,
+      userId: req.effectiveUserId,
       name: `Copy of ${original.name}`,
       status: 'inactive',
       callsCount: 0,

@@ -4,7 +4,7 @@ const multer = require('multer');
 const KnowledgeBase = require('../models/KnowledgeBase');
 const Agent = require('../models/Agent');
 const ragService = require('../services/ragService');
-const { protect } = require('../middleware/auth');
+const { protect, checkPermission } = require('../middleware/auth');
 
 router.use(protect);
 
@@ -23,9 +23,9 @@ const upload = multer({
 
 // @route   GET /api/knowledge-base
 // @desc    Get all knowledge bases for user
-router.get('/', async (req, res, next) => {
+router.get('/', checkPermission('kb_view'), async (req, res, next) => {
   try {
-    const kbs = await KnowledgeBase.find({ userId: req.user._id })
+    const kbs = await KnowledgeBase.find({ userId: req.effectiveUserId })
       .select('-content -chunks')
       .sort('-createdAt');
     res.json({ success: true, count: kbs.length, data: kbs });
@@ -36,9 +36,9 @@ router.get('/', async (req, res, next) => {
 
 // @route   GET /api/knowledge-base/:id
 // @desc    Get single knowledge base by ID
-router.get('/:id', async (req, res, next) => {
+router.get('/:id', checkPermission('kb_view'), async (req, res, next) => {
   try {
-    const kb = await KnowledgeBase.findOne({ _id: req.params.id, userId: req.user._id });
+    const kb = await KnowledgeBase.findOne({ _id: req.params.id, userId: req.effectiveUserId });
     if (!kb) return res.status(404).json({ success: false, message: 'Knowledge base not found' });
     
     // Check if it's attached to any agents
@@ -63,7 +63,7 @@ router.get('/:id', async (req, res, next) => {
 
 // @route   POST /api/knowledge-base/text
 // @desc    Create KB from raw text
-router.post('/text', async (req, res, next) => {
+router.post('/text', checkPermission('kb_create'), async (req, res, next) => {
   try {
     const { name, description, content } = req.body;
     
@@ -72,7 +72,7 @@ router.post('/text', async (req, res, next) => {
     }
 
     const kb = await KnowledgeBase.create({
-      userId: req.user._id,
+      userId: req.effectiveUserId,
       name,
       description,
       content,
@@ -91,7 +91,7 @@ router.post('/text', async (req, res, next) => {
 
 // @route   POST /api/knowledge-base/upload
 // @desc    Create KB by uploading a file (PDF or TXT)
-router.post('/upload', upload.single('file'), async (req, res, next) => {
+router.post('/upload', checkPermission('kb_create'), upload.single('file'), async (req, res, next) => {
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'Please upload a file' });
@@ -113,7 +113,7 @@ router.post('/upload', upload.single('file'), async (req, res, next) => {
     }
 
     const kb = await KnowledgeBase.create({
-      userId: req.user._id,
+      userId: req.effectiveUserId,
       name,
       description,
       content,
@@ -134,7 +134,7 @@ router.post('/upload', upload.single('file'), async (req, res, next) => {
 
 // @route   POST /api/knowledge-base/url
 // @desc    Create KB by scraping a URL
-router.post('/url', async (req, res, next) => {
+router.post('/url', checkPermission('kb_create'), async (req, res, next) => {
   try {
     const { name, description, url } = req.body;
     
@@ -149,7 +149,7 @@ router.post('/url', async (req, res, next) => {
     }
 
     const kb = await KnowledgeBase.create({
-      userId: req.user._id,
+      userId: req.effectiveUserId,
       name,
       description,
       content,
@@ -169,9 +169,9 @@ router.post('/url', async (req, res, next) => {
 
 // @route   DELETE /api/knowledge-base/:id
 // @desc    Delete knowledge base and detach from agents
-router.delete('/:id', async (req, res, next) => {
+router.delete('/:id', checkPermission('kb_delete'), async (req, res, next) => {
   try {
-    const kb = await KnowledgeBase.findOne({ _id: req.params.id, userId: req.user._id });
+    const kb = await KnowledgeBase.findOne({ _id: req.params.id, userId: req.effectiveUserId });
     if (!kb) return res.status(404).json({ success: false, message: 'Knowledge base not found' });
     
     await kb.deleteOne();
@@ -190,12 +190,12 @@ router.delete('/:id', async (req, res, next) => {
 
 // @route   POST /api/knowledge-base/:id/search
 // @desc    Test RAG search against a knowledge base
-router.post('/:id/search', async (req, res, next) => {
+router.post('/:id/search', checkPermission('kb_view'), async (req, res, next) => {
   try {
     const { query, topK = 3 } = req.body;
     if (!query) return res.status(400).json({ success: false, message: 'Query is required' });
     
-    const kb = await KnowledgeBase.findOne({ _id: req.params.id, userId: req.user._id });
+    const kb = await KnowledgeBase.findOne({ _id: req.params.id, userId: req.effectiveUserId });
     if (!kb) return res.status(404).json({ success: false, message: 'Knowledge base not found' });
     
     const results = await ragService.searchRelevantChunks(query, kb._id, topK);

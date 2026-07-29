@@ -5,6 +5,14 @@ const { protect } = require('../middleware/auth');
 
 router.use(protect);
 
+const alacQuery = (user, type = 'agentId') => {
+  if (user.accountType === 'member' && user.restrictAgents) {
+    return { [type]: { $in: user.assignedAgents || [] } };
+  }
+  return {};
+};
+
+
 // ─── FULL-TEXT SEARCH across all transcripts ────────────────────────────────
 // GET /api/calls/search?q=refund&agentId=xxx&limit=20
 router.get('/search', async (req, res, next) => {
@@ -14,8 +22,7 @@ router.get('/search', async (req, res, next) => {
       return res.status(400).json({ success: false, message: 'Search query must be at least 2 characters' });
     }
 
-    const query = {
-      userId: req.user._id,
+    const query = { ...alacQuery(req.user), userId: req.effectiveUserId,
       'transcript.content': { $regex: q.trim(), $options: 'i' },
     };
     if (agentId) query.agentId = agentId;
@@ -52,7 +59,7 @@ router.get('/search', async (req, res, next) => {
 router.get('/:id/export', async (req, res, next) => {
   try {
     const { format = 'json' } = req.query;
-    const call = await CallLog.findOne({ _id: req.params.id, userId: req.user._id })
+    const call = await CallLog.findOne({ _id: req.params.id, userId: req.effectiveUserId })
       .populate('agentId', 'name');
     if (!call) return res.status(404).json({ success: false, message: 'Call not found' });
 
@@ -138,8 +145,7 @@ router.get('/export/bulk', async (req, res, next) => {
     const days = daysMap[period] || 30;
     const startDate = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
-    const calls = await CallLog.find({
-      userId: req.user._id,
+    const calls = await CallLog.find({ ...alacQuery(req.user), userId: req.effectiveUserId,
       startTime: { $gte: startDate },
     })
       .populate('agentId', 'name')
@@ -190,7 +196,7 @@ router.post('/bulk-delete', async (req, res, next) => {
     }
     const result = await CallLog.deleteMany({
       _id: { $in: callIds.slice(0, 100) }, // max 100 at once
-      userId: req.user._id,
+      userId: req.effectiveUserId,
     });
     res.json({ success: true, deletedCount: result.deletedCount });
   } catch (error) {
@@ -208,7 +214,7 @@ router.patch('/:id/tags', async (req, res, next) => {
     }
     const cleanTags = tags.filter(t => typeof t === 'string' && t.trim()).map(t => t.trim().toLowerCase()).slice(0, 20);
     const call = await CallLog.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      { _id: req.params.id, userId: req.effectiveUserId },
       { tags: cleanTags },
       { new: true }
     );
@@ -223,7 +229,7 @@ router.patch('/:id/tags', async (req, res, next) => {
 // GET /api/calls/stats/summary
 router.get('/stats/summary', async (req, res, next) => {
   try {
-    const userId = req.user._id;
+    const userId = req.effectiveUserId;
     const [total, completed, avgDuration, sentimentBreakdown, tagCloud] = await Promise.all([
       CallLog.countDocuments({ userId }),
       CallLog.countDocuments({ userId, status: 'completed' }),
@@ -272,7 +278,7 @@ router.get('/', async (req, res, next) => {
       endDate,
     } = req.query;
 
-    const query = { userId: req.user._id };
+    const query = { ...alacQuery(req.user), userId: req.effectiveUserId };
     if (agentId) query.agentId = agentId;
     if (status && status !== 'all') query.status = status;
     if (direction && direction !== 'all') query.direction = direction;
@@ -306,7 +312,7 @@ router.get('/', async (req, res, next) => {
 // @route   GET /api/calls/active
 router.get('/active', async (req, res, next) => {
   try {
-    const activeCalls = await CallLog.find({ userId: req.user._id, status: 'ongoing' })
+    const activeCalls = await CallLog.find({ ...alacQuery(req.user), userId: req.effectiveUserId, status: 'ongoing' })
       .populate('agentId', 'name')
       .sort('-startTime');
     res.json({ success: true, activeCalls });
@@ -318,7 +324,7 @@ router.get('/active', async (req, res, next) => {
 // @route   GET /api/calls/:id
 router.get('/:id', async (req, res, next) => {
   try {
-    const call = await CallLog.findOne({ _id: req.params.id, userId: req.user._id })
+    const call = await CallLog.findOne({ _id: req.params.id, userId: req.effectiveUserId })
       .populate('agentId', 'name voice llm');
     if (!call) return res.status(404).json({ success: false, message: 'Call not found' });
     res.json({ success: true, call });
@@ -330,7 +336,7 @@ router.get('/:id', async (req, res, next) => {
 // @route   GET /api/calls/:id/transcript
 router.get('/:id/transcript', async (req, res, next) => {
   try {
-    const call = await CallLog.findOne({ _id: req.params.id, userId: req.user._id })
+    const call = await CallLog.findOne({ _id: req.params.id, userId: req.effectiveUserId })
       .select('transcript agentName fromNumber toNumber startTime endTime duration status');
     if (!call) return res.status(404).json({ success: false, message: 'Call not found' });
     res.json({ success: true, transcript: call.transcript, meta: call });
@@ -342,7 +348,7 @@ router.get('/:id/transcript', async (req, res, next) => {
 // @route   DELETE /api/calls/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const call = await CallLog.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
+    const call = await CallLog.findOneAndDelete({ _id: req.params.id, userId: req.effectiveUserId });
     if (!call) return res.status(404).json({ success: false, message: 'Call not found' });
     res.json({ success: true, message: 'Call log deleted' });
   } catch (error) {
@@ -358,10 +364,10 @@ router.patch('/:id/qa', async (req, res, next) => {
     if (score !== undefined) update['qa.score'] = Math.max(0, Math.min(100, Number(score)));
     if (grade) update['qa.grade'] = grade;
     if (feedback) update['qa.feedback'] = feedback;
-    update['qa.reviewer'] = req.user._id;
+    update['qa.reviewer'] = req.effectiveUserId;
 
     const call = await CallLog.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      { _id: req.params.id, userId: req.effectiveUserId },
       { $set: update },
       { new: true }
     );

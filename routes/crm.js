@@ -2,16 +2,19 @@ const express = require('express');
 const router = express.Router();
 const Lead = require('../models/Lead');
 const Ticket = require('../models/Ticket');
-const { protect } = require('../middleware/auth');
+const { protect, checkPermission } = require('../middleware/auth');
 
 router.use(protect);
 
 // @route   GET /api/crm/leads
 // @desc    Get leads for the user (paginated + filterable)
-router.get('/leads', async (req, res, next) => {
+router.get('/leads', checkPermission('crm_view'), async (req, res, next) => {
   try {
     const { status, search, page = 1, limit = 50, sortBy = 'createdAt', order = 'desc' } = req.query;
-    const query = { userId: req.user._id };
+    const query = { userId: req.effectiveUserId };
+    if (req.user.accountType === 'member' && req.user.restrictAgents) {
+      query.agentId = { $in: req.user.assignedAgents || [] };
+    }
     if (status && status !== 'all') query.status = status;
     if (search) {
       query.$or = [
@@ -46,11 +49,11 @@ router.get('/leads', async (req, res, next) => {
 
 // @route   POST /api/crm/leads
 // @desc    Create a new lead (used internally or via API)
-router.post('/leads', async (req, res, next) => {
+router.post('/leads', checkPermission('crm_create'), async (req, res, next) => {
   try {
     const newLead = await Lead.create({
       ...req.body,
-      userId: req.user._id,
+      userId: req.effectiveUserId,
     });
     res.status(201).json({ success: true, lead: newLead });
   } catch (error) {
@@ -60,10 +63,10 @@ router.post('/leads', async (req, res, next) => {
 
 // @route   PUT /api/crm/leads/:id
 // @desc    Update a lead
-router.put('/leads/:id', async (req, res, next) => {
+router.put('/leads/:id', checkPermission('crm_edit'), async (req, res, next) => {
   try {
     const lead = await Lead.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      { _id: req.params.id, userId: req.effectiveUserId },
       req.body,
       { new: true, runValidators: true }
     );
@@ -80,9 +83,9 @@ router.put('/leads/:id', async (req, res, next) => {
 
 // @route   DELETE /api/crm/leads/:id
 // @desc    Delete a lead
-router.delete('/leads/:id', async (req, res, next) => {
+router.delete('/leads/:id', checkPermission('crm_delete'), async (req, res, next) => {
   try {
-    const lead = await Lead.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
+    const lead = await Lead.findOneAndDelete({ _id: req.params.id, userId: req.effectiveUserId });
     
     if (!lead) {
       return res.status(404).json({ success: false, message: 'Lead not found' });
@@ -96,10 +99,13 @@ router.delete('/leads/:id', async (req, res, next) => {
 
 // @route   GET /api/crm/tickets
 // @desc    Get tickets for the user (paginated + filterable)
-router.get('/tickets', async (req, res, next) => {
+router.get('/tickets', checkPermission('crm_view'), async (req, res, next) => {
   try {
     const { status, priority, search, page = 1, limit = 50, sortBy = 'createdAt', order = 'desc' } = req.query;
-    const query = { userId: req.user._id };
+    const query = { userId: req.effectiveUserId };
+    if (req.user.accountType === 'member' && req.user.restrictAgents) {
+      query.agentId = { $in: req.user.assignedAgents || [] };
+    }
     if (status && status !== 'all') query.status = status;
     if (priority && priority !== 'all') query.priority = priority;
     if (search) {
@@ -136,11 +142,11 @@ router.get('/tickets', async (req, res, next) => {
 
 // @route   POST /api/crm/tickets
 // @desc    Create a new ticket
-router.post('/tickets', async (req, res, next) => {
+router.post('/tickets', checkPermission('crm_create'), async (req, res, next) => {
   try {
     const newTicket = await Ticket.create({
       ...req.body,
-      userId: req.user._id,
+      userId: req.effectiveUserId,
     });
     res.status(201).json({ success: true, ticket: newTicket });
   } catch (error) {
@@ -150,10 +156,10 @@ router.post('/tickets', async (req, res, next) => {
 
 // @route   PUT /api/crm/tickets/:id
 // @desc    Update a ticket
-router.put('/tickets/:id', async (req, res, next) => {
+router.put('/tickets/:id', checkPermission('crm_edit'), async (req, res, next) => {
   try {
     const ticket = await Ticket.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      { _id: req.params.id, userId: req.effectiveUserId },
       req.body,
       { new: true, runValidators: true }
     );
@@ -170,9 +176,9 @@ router.put('/tickets/:id', async (req, res, next) => {
 
 // @route   DELETE /api/crm/tickets/:id
 // @desc    Delete a ticket
-router.delete('/tickets/:id', async (req, res, next) => {
+router.delete('/tickets/:id', checkPermission('crm_delete'), async (req, res, next) => {
   try {
-    const ticket = await Ticket.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
+    const ticket = await Ticket.findOneAndDelete({ _id: req.params.id, userId: req.effectiveUserId });
     
     if (!ticket) {
       return res.status(404).json({ success: false, message: 'Ticket not found' });

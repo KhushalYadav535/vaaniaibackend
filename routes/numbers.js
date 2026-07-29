@@ -9,7 +9,7 @@ router.use(protect);
 // @route   GET /api/numbers
 router.get('/', async (req, res, next) => {
   try {
-    const numbers = await PhoneNumber.find({ userId: req.user._id })
+    const numbers = await PhoneNumber.find({ userId: req.effectiveUserId , ...(req.user.accountType === 'member' && req.user.restrictAgents ? { agentId: { $in: req.user.assignedAgents || [] } } : {}) })
       .populate('assignedAgent', 'name status')
       .sort('-createdAt');
     res.json({ success: true, count: numbers.length, numbers });
@@ -21,7 +21,7 @@ router.get('/', async (req, res, next) => {
 // @route   GET /api/numbers/:id
 router.get('/:id', async (req, res, next) => {
   try {
-    const number = await PhoneNumber.findOne({ _id: req.params.id, userId: req.user._id })
+    const number = await PhoneNumber.findOne({ _id: req.params.id, userId: req.effectiveUserId })
       .populate('assignedAgent', 'name status');
     if (!number) return res.status(404).json({ success: false, message: 'Phone number not found' });
     res.json({ success: true, number });
@@ -39,7 +39,7 @@ router.post('/', async (req, res, next) => {
     if (existing) return res.status(400).json({ success: false, message: 'Phone number already exists' });
 
     const phoneNumber = await PhoneNumber.create({
-      userId: req.user._id,
+      userId: req.effectiveUserId,
       number,
       country: country || 'United States',
       type: type || 'local',
@@ -58,7 +58,7 @@ router.post('/', async (req, res, next) => {
 router.put('/:id', async (req, res, next) => {
   try {
     const number = await PhoneNumber.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      { _id: req.params.id, userId: req.effectiveUserId },
       req.body,
       { new: true, runValidators: true }
     ).populate('assignedAgent', 'name status');
@@ -75,12 +75,12 @@ router.patch('/:id/assign', async (req, res, next) => {
     const { agentId } = req.body;
 
     if (agentId) {
-      const agent = await Agent.findOne({ _id: agentId, userId: req.user._id });
+      const agent = await Agent.findOne({ _id: agentId, userId: req.effectiveUserId });
       if (!agent) return res.status(404).json({ success: false, message: 'Agent not found' });
     }
 
     const number = await PhoneNumber.findOneAndUpdate(
-      { _id: req.params.id, userId: req.user._id },
+      { _id: req.params.id, userId: req.effectiveUserId },
       { assignedAgent: agentId || null },
       { new: true }
     ).populate('assignedAgent', 'name status');
@@ -95,7 +95,7 @@ router.patch('/:id/assign', async (req, res, next) => {
 // @route   DELETE /api/numbers/:id
 router.delete('/:id', async (req, res, next) => {
   try {
-    const number = await PhoneNumber.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
+    const number = await PhoneNumber.findOneAndDelete({ _id: req.params.id, userId: req.effectiveUserId });
     if (!number) return res.status(404).json({ success: false, message: 'Phone number not found' });
     res.json({ success: true, message: 'Phone number deleted' });
   } catch (error) {

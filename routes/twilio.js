@@ -66,7 +66,7 @@ router.post('/inbound', async (req, res) => {
 
     // Find the phone number
     const phoneRecord = await PhoneNumber.findOne({ number: To }).populate('assignedAgent');
-    
+
     if (!phoneRecord || !phoneRecord.assignedAgent) {
       console.warn(`⚠️ No agent assigned to ${To}`);
       twiml.say(
@@ -188,7 +188,7 @@ router.post('/gather-response', async (req, res) => {
         endMsg
       );
       twiml.hangup();
-      
+
       // Update call log
       callLog.status = 'completed';
       callLog.endTime = new Date();
@@ -619,7 +619,7 @@ router.get('/call/:callSid', protect, async (req, res, next) => {
 router.post('/transfer', protect, async (req, res, next) => {
   try {
     const { callSid, transferTo, reason, context } = req.body;
-    
+
     if (!callSid || !transferTo) {
       return res.status(400).json({ success: false, message: 'callSid and transferTo are required' });
     }
@@ -628,7 +628,7 @@ router.post('/transfer', protect, async (req, res, next) => {
     const client = getTwilioClient(user);
 
     // Build TwiML for warm transfer with whisper
-    const whisperMsg = context 
+    const whisperMsg = context
       ? `Incoming transfer from AI agent. ${context.substring(0, 200)}`
       : 'Incoming transfer from AI agent.';
 
@@ -751,7 +751,7 @@ router.post('/whatsapp', async (req, res) => {
       content: result.response,
       timestamp: new Date(),
     });
-    
+
     // Auto-close chat after 10 mins of inactivity, but for now just save
     await chatLog.save();
 
@@ -791,7 +791,7 @@ router.post('/dtmf/:sessionId', async (req, res) => {
 
     // Process the digit(s)
     const result = dtmfService.processDigit(sessionId, Digits);
-    
+
     if (!result) {
       twiml.say('Session expired. Goodbye.');
       twiml.hangup();
@@ -813,7 +813,7 @@ router.post('/dtmf/:sessionId', async (req, res) => {
       case 'input_complete':
         // Input complete, execute action
         twiml.say(result.message);
-        
+
         if (result.action?.type === 'hangup') {
           twiml.hangup();
         } else if (result.action?.type === 'route') {
@@ -867,7 +867,7 @@ router.post('/dtmf-menu', async (req, res) => {
 
   try {
     let menuConfig;
-    
+
     if (customConfig) {
       menuConfig = customConfig;
     } else {
@@ -878,10 +878,10 @@ router.post('/dtmf-menu', async (req, res) => {
 
     // Create menu
     const menu = dtmfService.createMenu(sessionId, menuConfig);
-    
+
     // Generate TwiML
     const menuTwiml = dtmfService.generateMenuTwiml(sessionId, menu);
-    
+
     res.type('text/xml').send(menuTwiml);
   } catch (error) {
     console.error('[DTMF] Error creating menu:', error);
@@ -902,7 +902,7 @@ router.post('/transfer/:target', async (req, res) => {
   try {
     // Look up target number/agent
     const phoneNumber = await PhoneNumber.findOne({ friendlyName: target });
-    
+
     if (phoneNumber && phoneNumber.phoneNumber) {
       twiml.say(`Transferring to ${target}...`);
       twiml.dial({ callerId: phoneNumber.phoneNumber }, phoneNumber.phoneNumber);
@@ -918,7 +918,7 @@ router.post('/transfer/:target', async (req, res) => {
         twiml.hangup();
       }
     }
-    
+
     res.type('text/xml').send(twiml.toString());
   } catch (error) {
     console.error('[Transfer] Error:', error);
@@ -940,7 +940,7 @@ router.post('/voicemail/:sessionId', async (req, res) => {
   try {
     // Log the voicemail
     console.log(`[Voicemail] Session ${sessionId}: ${RecordingUrl}`);
-    
+
     if (TranscriptionText) {
       console.log(`[Voicemail] Transcription: ${TranscriptionText}`);
     }
@@ -949,7 +949,7 @@ router.post('/voicemail/:sessionId', async (req, res) => {
 
     twiml.say('Thank you for your message. We will get back to you soon.');
     twiml.hangup();
-    
+
     res.type('text/xml').send(twiml.toString());
   } catch (error) {
     console.error('[Voicemail] Error:', error);

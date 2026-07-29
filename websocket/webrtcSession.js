@@ -103,12 +103,21 @@ class WebRTCSession {
       this.user = await User.findById(decoded.id).select('-password');
       if (!this.user) throw new Error('User not found');
 
-      this.userId = this.user._id;
+      const effectiveUserId = this.user.accountType === 'member' ? this.user.ownerId : this.user._id;
+      this.userId = effectiveUserId;
       this.userSettings = this.user.settings || {};
 
       // Load agent
       this.agent = await Agent.findById(agentId);
       if (!this.agent) throw new Error('Agent not found');
+
+      // Apply Agent-Level Access Control (ALAC)
+      if (this.user.accountType === 'member' && this.user.restrictAgents) {
+        const assigned = this.user.assignedAgents?.map(id => id.toString()) || [];
+        if (!assigned.includes(agentId.toString())) {
+          throw new Error('You do not have permission to test this agent.');
+        }
+      }
 
       // Initialize Deepgram for STT
       const deepgramKey = this.userSettings.deepgramKey || process.env.DEEPGRAM_API_KEY;

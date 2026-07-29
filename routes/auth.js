@@ -76,6 +76,13 @@ router.post('/login', async (req, res, next) => {
       });
     }
 
+    if (user.isActive === false) {
+      return res.status(403).json({
+        success: false,
+        message: 'Your account is inactive. Please contact the admin.',
+      });
+    }
+
     // Compare password
     const isMatch = await bcrypt.compare(password, user.password);
     console.log("✅ PASSWORD CHECK DONE");
@@ -98,6 +105,10 @@ router.post('/login', async (req, res, next) => {
         name: user.name,
         email: user.email,
         role: user.role,
+        accountType: user.accountType || 'owner',
+        ownerId: user.ownerId || null,
+        permissions: user.permissions ? Object.fromEntries(user.permissions) : {},
+        isActive: user.isActive !== false,
       },
     });
 
@@ -109,9 +120,21 @@ router.post('/login', async (req, res, next) => {
 
 // ✅ GET ME
 router.get('/me', protect, async (req, res) => {
+  const u = req.user;
   res.json({
     success: true,
-    user: req.user,
+    user: {
+      id: u._id,
+      name: u.name,
+      email: u.email,
+      role: u.role,
+      settings: u.settings,
+      accountType: u.accountType || 'owner',
+      ownerId: u.ownerId || null,
+      permissions: u.permissions ? Object.fromEntries(u.permissions) : {},
+      isActive: u.isActive !== false,
+      createdAt: u.createdAt,
+    },
   });
 });
 

@@ -69,24 +69,24 @@ setInterval(() => {
       console.log(`[Reaper] Killing idle session ${id} (idle ${Math.round((now - last) / 1000)}s)`);
       // 1. Abort any in-flight LLM call so it stops burning quota
       if (sess._currentAbortController) {
-        try { sess._currentAbortController.abort(); } catch (_) {}
+        try { sess._currentAbortController.abort(); } catch (_) { }
         sess._currentAbortController = null;
       }
       // 2. Clear pending timers so they can't fire on a dead session
-      if (sess._idleTimer)         { clearTimeout(sess._idleTimer);         sess._idleTimer = null; }
-      if (sess._silenceTimer)      { clearTimeout(sess._silenceTimer);      sess._silenceTimer = null; }
-      if (sess._agentSpeakingTimer){ clearTimeout(sess._agentSpeakingTimer);sess._agentSpeakingTimer = null; }
-      if (sess._dtmfFlushTimer)    { clearTimeout(sess._dtmfFlushTimer);    sess._dtmfFlushTimer = null; }
-      if (sess._softCommitTimer)   { clearTimeout(sess._softCommitTimer);   sess._softCommitTimer = null; }
-      if (sess._logFlushInterval)  { clearInterval(sess._logFlushInterval); sess._logFlushInterval = null; }
+      if (sess._idleTimer) { clearTimeout(sess._idleTimer); sess._idleTimer = null; }
+      if (sess._silenceTimer) { clearTimeout(sess._silenceTimer); sess._silenceTimer = null; }
+      if (sess._agentSpeakingTimer) { clearTimeout(sess._agentSpeakingTimer); sess._agentSpeakingTimer = null; }
+      if (sess._dtmfFlushTimer) { clearTimeout(sess._dtmfFlushTimer); sess._dtmfFlushTimer = null; }
+      if (sess._softCommitTimer) { clearTimeout(sess._softCommitTimer); sess._softCommitTimer = null; }
+      if (sess._logFlushInterval) { clearInterval(sess._logFlushInterval); sess._logFlushInterval = null; }
       sess._softCommitBuffer = '';
       // 3. Flush any pending transcript writes so we don't lose turns
-      flushCallLogWriteQueue(sess).catch(() => {});
+      flushCallLogWriteQueue(sess).catch(() => { });
       // 4. Close Deepgram + WS politely
-      try { sess.deepgramConn?.finish(); } catch (_) {}
+      try { sess.deepgramConn?.finish(); } catch (_) { }
       try {
         if (sess.ws && sess.ws.readyState === 1) sess.ws.close(1000, 'idle_timeout');
-      } catch (_) {}
+      } catch (_) { }
       activeSessions.delete(id);
     }
   }
@@ -131,9 +131,9 @@ function touchSession(session) {
  * Otherwise we use the snappy default so normal turns stay fast.
  */
 function getSoftCommitWindowMs(text) {
-  const base       = Number(process.env.UTTERANCE_SOFT_COMMIT_MS || 800);
-  const numericMs  = Number(process.env.UTTERANCE_SOFT_COMMIT_NUMERIC_MS || 2400);
-  const connectorMs= Number(process.env.UTTERANCE_SOFT_COMMIT_CONNECTOR_MS || 1500);
+  const base = Number(process.env.UTTERANCE_SOFT_COMMIT_MS || 800);
+  const numericMs = Number(process.env.UTTERANCE_SOFT_COMMIT_NUMERIC_MS || 2400);
+  const connectorMs = Number(process.env.UTTERANCE_SOFT_COMMIT_CONNECTOR_MS || 1500);
   const completeMs = Number(process.env.UTTERANCE_SOFT_COMMIT_COMPLETE_MS || 450);
   const t = String(text || '').trim();
   if (!t) return base;
@@ -160,15 +160,15 @@ function getSoftCommitWindowMs(text) {
   // Check the trailing word(s). Hindi postpositions (ke/ki/ka/liye/ko/se/me)
   // and conjunctions almost always have more speech after them.
   const connectorWords = new Set([
-    'aur','और','lekin','लेकिन','ki','कि','ke','का','ka','ko','को','se','से',
-    'me','mein','में','liye','लिए','kyunki','क्योंकि','matlab','मतलब','phir',
-    'फिर','toh','तो','ya','या','and','but','so','because','jaise','जैसे',
-    'that','with','for','to','ek','एक','par','पर','wala','wali','vala',
+    'aur', 'और', 'lekin', 'लेकिन', 'ki', 'कि', 'ke', 'का', 'ka', 'ko', 'को', 'se', 'से',
+    'me', 'mein', 'में', 'liye', 'लिए', 'kyunki', 'क्योंकि', 'matlab', 'मतलब', 'phir',
+    'फिर', 'toh', 'तो', 'ya', 'या', 'and', 'but', 'so', 'because', 'jaise', 'जैसे',
+    'that', 'with', 'for', 'to', 'ek', 'एक', 'par', 'पर', 'wala', 'wali', 'vala',
   ]);
   // last two words joined too (catches "ke liye", "ki taraf")
   const lastTwo = words.slice(-2).join(' ');
   if (connectorWords.has(lastWord) || /[,;:-]$/.test(t)
-      || lastTwo.endsWith('ke liye') || lastTwo.endsWith('के लिए')) {
+    || lastTwo.endsWith('ke liye') || lastTwo.endsWith('के लिए')) {
     return connectorMs;
   }
 
@@ -176,7 +176,7 @@ function getSoftCommitWindowMs(text) {
   // 1-2 words and no '?'/'.' — likely the START of a longer thought
   // ("Mujhe...", "Haan woh..."). Give a beat. But a clear short answer
   // ("haan", "nahi", "theek hai") should still be snappy → handled in 5/6.
-  const shortAcks = ['haan','haa','nahi','nahin','ok','okay','theek','yes','no','sahi','bilkul','done'];
+  const shortAcks = ['haan', 'haa', 'nahi', 'nahin', 'ok', 'okay', 'theek', 'yes', 'no', 'sahi', 'bilkul', 'done'];
   const isShortAck = words.length <= 2 && shortAcks.some(a => lower === a || lower.startsWith(a + ' ') || lower === a + '.');
 
   // ── 5. Semantic completion → respond FAST ───────────────────────────────
@@ -383,7 +383,7 @@ function buildSessionOnTranscript(session) {
         // interrupts queue up behind dead streams and the next real
         // request hits a "groq_completion_timeout".
         if (session._currentAbortController) {
-          try { session._currentAbortController.abort(); } catch (_) {}
+          try { session._currentAbortController.abort(); } catch (_) { }
           session._currentAbortController = null;
         }
         session.agentSpeaking = false;
@@ -524,11 +524,11 @@ function buildSessionOnTranscript(session) {
           console.log('[Backchannel] Mid-thought pause detected — injecting active listening filler...');
           const lang = agent.language || 'en';
           const backchannels = {
-            'en':      ['Mhmm...', 'Right.', 'I see.'],
-            'hi':      ['Mhmm...', 'Accha.', 'Haan...'],
+            'en': ['Mhmm...', 'Right.', 'I see.'],
+            'hi': ['Mhmm...', 'Accha.', 'Haan...'],
             'hi-Latn': ['Mhmm...', 'Accha.', 'Haan...'],
-            'multi':   ['Mhmm...', 'Accha.'],
-            'en-IN':   ['Mhmm...', 'Right.'],
+            'multi': ['Mhmm...', 'Accha.'],
+            'en-IN': ['Mhmm...', 'Right.'],
           };
           const options = backchannels[lang] || backchannels['en'];
           const backchannelText = options[Math.floor(Math.random() * options.length)];
@@ -552,10 +552,10 @@ function buildSessionOnTranscript(session) {
     if (isFinal && speechFinal && transcript.trim().length > 0) {
       if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
       if (session.isProcessing) return;
-      
+
       let finalToCommit = transcript;
       const prevInterim = (session._lastSttTranscript || '').trim();
-      
+
       // Deepgram Hallucination Protection:
       // Deepgram sometimes collapses a full sentence into a single noise
       // word ("मन", "mmm", "haan") in the final result even though the
@@ -567,7 +567,7 @@ function buildSessionOnTranscript(session) {
       //
       // In all three cases we prefer the interim over the hallucinated final.
       const prevInterimWords = prevInterim ? prevInterim.split(/\s+/).filter(Boolean).length : 0;
-      const finalWords       = transcript.split(/\s+/).filter(Boolean).length;
+      const finalWords = transcript.split(/\s+/).filter(Boolean).length;
       const isSuspiciousDropoff =
         (prevInterim.length >= 10 && transcript.length <= 6) ||
         (prevInterimWords >= 3 && finalWords <= 1) ||
@@ -577,7 +577,7 @@ function buildSessionOnTranscript(session) {
         console.warn(`[STT] Deepgram hallucination detected! Interim: "${prevInterim}" (${prevInterimWords}w/${prevInterim.length}c) → Final: "${transcript}" (${finalWords}w/${transcript.length}c). Preferring interim.`);
         finalToCommit = prevInterim;
       }
-      
+
       console.log(`[STT] speech_final buffered: "${finalToCommit}"`);
       commitTranscript(session, finalToCommit);
       session._lastSttTranscript = ''; // clear to prevent double-commit by silence fallback
@@ -837,7 +837,7 @@ function setupVoiceSession(wss) {
         // If init failed the session is unusable — close it cleanly so the
         // client doesn't wait for the 5-minute idle reaper to reclaim the slot.
         if (session.status !== 'ready') {
-          try { ws.close(4500, error.message?.slice(0, 120) || 'init_error'); } catch (_) {}
+          try { ws.close(4500, error.message?.slice(0, 120) || 'init_error'); } catch (_) { }
         }
       }
     });
@@ -1060,7 +1060,7 @@ async function handleMicConfig(session, message) {
   // open and working. Reinitializing would close it and drop audio during reconnect.
   const configAlreadyMatches = normalizedInputMode === configuredInputMode && (
     normalizedInputMode === 'webm'
-      || (normalizedSampleRate === configuredRate && effectiveBrowserEncoding === effectiveConfiguredEncoding)
+    || (normalizedSampleRate === configuredRate && effectiveBrowserEncoding === effectiveConfiguredEncoding)
   );
 
   if (configAlreadyMatches) {
@@ -1073,7 +1073,7 @@ async function handleMicConfig(session, message) {
   console.log(`[MicConfig] Rate mismatch — reinitializing Deepgram connection...`);
 
   if (session.deepgramConn) {
-    try { session.deepgramConn.finish(); } catch (_) {}
+    try { session.deepgramConn.finish(); } catch (_) { }
     session.deepgramConn = null;
   }
 
@@ -1125,9 +1125,11 @@ async function handleInit(session, message) {
 
   // Load user (skip for visitors)
   let user = null;
+  let effectiveUserId = null;
   if (decoded.type !== 'visitor') {
     user = await User.findById(decoded.id);
     if (!user) throw new Error('User not found');
+    effectiveUserId = user.accountType === 'member' ? user.ownerId : user._id;
   }
 
   // Load agent - widget and visitor tokens include agentId and bypass ownership check
@@ -1136,11 +1138,19 @@ async function handleInit(session, message) {
     agent = await Agent.findOne({ _id: agentId, status: 'active' });
     if (!agent) throw new Error('Agent not found or inactive');
   } else {
-    agent = await Agent.findOne({ _id: agentId, userId: user._id });
+    agent = await Agent.findOne({ _id: agentId, userId: effectiveUserId });
     if (!agent) throw new Error('Agent not found or not authorized');
+
+    // Apply Agent-Level Access Control (ALAC)
+    if (user && user.accountType === 'member' && user.restrictAgents) {
+      const assigned = user.assignedAgents?.map(id => id.toString()) || [];
+      if (!assigned.includes(agentId.toString())) {
+        throw new Error('You do not have permission to test this agent.');
+      }
+    }
   }
 
-  session.userId = user ? user._id : null;
+  session.userId = effectiveUserId;
   session.visitorEmail = decoded.type === 'visitor' ? decoded.email : null;
   session.agent = agent;
   session.userSettings = user ? user.settings : {};
@@ -1149,14 +1159,14 @@ async function handleInit(session, message) {
   session.streamProtocol = !!streamProtocol;
   session.skipPostCallAnalysis = !!skipPostCallAnalysis;
   session.status = 'ready';
-  
+
   if (agent.workflowId) {
     session.callFlow = await CallFlow.findById(agent.workflowId);
     if (session.callFlow) {
       console.log(`[Flow] Loaded Call Flow: ${session.callFlow.name}`);
     }
   }
-  
+
   // Fetch User Memory (Retell/Vapi style)
   // Skip for visitor sessions where user is null
   const UserMemory = require('../models/UserMemory');
@@ -1170,7 +1180,7 @@ async function handleInit(session, message) {
     if (!deepgramKey) {
       throw new Error('⚠️ No Deepgram API key configured. Please add DEEPGRAM_API_KEY to your .env file. Get $200 free credits at https://deepgram.com');
     }
-    
+
     // Validate API key format - Deepgram supports two formats:
     // Legacy: 40-char hex (e.g. 7ee245f531db82f59df59ecae82f906f5eac89e1)
     // New: sk-xxx format
@@ -1213,19 +1223,19 @@ async function handleInit(session, message) {
       // otherwise every greeting is a cache miss and sounds garbled.
       let defaultVoiceId = agent.voice?.voiceId || 'en-US-JennyNeural';
       if (!agent.voice?.voiceId) {
-        if      (lang === 'hi')      defaultVoiceId = 'hi-IN-SwaraNeural';
+        if (lang === 'hi') defaultVoiceId = 'hi-IN-SwaraNeural';
         else if (lang === 'hi-Latn') defaultVoiceId = 'en-IN-NeerjaNeural';
-        else if (lang === 'multi')   defaultVoiceId = 'hi-IN-SwaraNeural';
-        else if (lang === 'en-IN')   defaultVoiceId = 'en-IN-NeerjaNeural';
-        else if (lang === 'ta')      defaultVoiceId = 'ta-IN-PallaviNeural';
-        else if (lang === 'te')      defaultVoiceId = 'te-IN-ShrutiNeural';
-        else if (lang === 'kn')      defaultVoiceId = 'kn-IN-SapnaNeural';
-        else if (lang === 'ml')      defaultVoiceId = 'ml-IN-SobhanaNeural';
-        else if (lang === 'mr')      defaultVoiceId = 'mr-IN-AarohiNeural';
-        else if (lang === 'gu')      defaultVoiceId = 'gu-IN-DhwaniNeural';
-        else if (lang === 'bn')      defaultVoiceId = 'bn-IN-TanishaaNeural';
-        else if (lang === 'ur')      defaultVoiceId = 'ur-IN-GulNeural';
-        else if (lang === 'pa')      defaultVoiceId = 'pa-IN-OjasNeural';
+        else if (lang === 'multi') defaultVoiceId = 'hi-IN-SwaraNeural';
+        else if (lang === 'en-IN') defaultVoiceId = 'en-IN-NeerjaNeural';
+        else if (lang === 'ta') defaultVoiceId = 'ta-IN-PallaviNeural';
+        else if (lang === 'te') defaultVoiceId = 'te-IN-ShrutiNeural';
+        else if (lang === 'kn') defaultVoiceId = 'kn-IN-SapnaNeural';
+        else if (lang === 'ml') defaultVoiceId = 'ml-IN-SobhanaNeural';
+        else if (lang === 'mr') defaultVoiceId = 'mr-IN-AarohiNeural';
+        else if (lang === 'gu') defaultVoiceId = 'gu-IN-DhwaniNeural';
+        else if (lang === 'bn') defaultVoiceId = 'bn-IN-TanishaaNeural';
+        else if (lang === 'ur') defaultVoiceId = 'ur-IN-GulNeural';
+        else if (lang === 'pa') defaultVoiceId = 'pa-IN-OjasNeural';
       }
       // Also correct explicit Devnagari voices used in hi-Latn mode (script mismatch).
       const voiceNeedsCorrection = lang === 'hi-Latn' &&
@@ -1248,13 +1258,13 @@ async function handleInit(session, message) {
       if (agent.firstMessage) {
         const greetingTargetScript = voicePipeline._targetScript(lang, voiceId);
         const humanizedGreeting = voicePipeline.humanizeText(agent.firstMessage, lang, greetingTargetScript);
-        await ttsService.textToSpeech({ text: humanizedGreeting, voiceId, speed, provider }).catch(() => {});
+        await ttsService.textToSpeech({ text: humanizedGreeting, voiceId, speed, provider }).catch(() => { });
       }
       // Warm each filler at BOTH the lookup speed (for the instant filler) and
       // normal speed (for backchannels/tool-check phrases).
       for (const phrase of pipelineFillers) {
-        await ttsService.textToSpeech({ text: phrase, voiceId, speed: fillerSpeed, provider }).catch(() => {});
-        await ttsService.textToSpeech({ text: phrase, voiceId, speed, provider }).catch(() => {});
+        await ttsService.textToSpeech({ text: phrase, voiceId, speed: fillerSpeed, provider }).catch(() => { });
+        await ttsService.textToSpeech({ text: phrase, voiceId, speed, provider }).catch(() => { });
       }
     } catch (_) { /* swallow — pre-warm is best-effort */ }
   })();
@@ -1281,42 +1291,42 @@ async function handleInit(session, message) {
   // Get first message audio
   try {
     let firstMessageText = '';
-    
+
     if (session.callFlow) {
       // Execute the first nodes of the CallFlow
       const stream = callFlowEngine.processFlowStep(session, '', session.callFlow);
       for await (const chunk of stream) {
         if (chunk.type === 'chunk') {
-           firstMessageText += chunk.text + ' ';
+          firstMessageText += chunk.text + ' ';
         } else if (chunk.type === 'transfer') {
-           // Handle immediate transfer if any
-           safeSend(session.ws, { type: 'transfer_initiated', transferTo: chunk.transferTo, reason: chunk.reason });
-           return;
+          // Handle immediate transfer if any
+          safeSend(session.ws, { type: 'transfer_initiated', transferTo: chunk.transferTo, reason: chunk.reason });
+          return;
         } else if (chunk.type === 'end_call') {
-           handleEndSession(session, 'flow_ended');
-           return;
+          handleEndSession(session, 'flow_ended');
+          return;
         }
       }
-      
+
       firstMessageText = firstMessageText.trim();
       if (!firstMessageText) firstMessageText = "Hello."; // Fallback if flow had no speak node
-      
+
       const ttsService = require('../services/ttsService');
       const audioBuffer = await ttsService.textToSpeech({
         text: firstMessageText,
         voiceId: agent.voice?.voiceId || 'en-US-JennyNeural',
         provider: agent.voice?.provider || 'edge-tts',
       });
-      
+
       // Add to history
       session.history.push({ role: 'assistant', content: firstMessageText, timestamp: new Date() });
       queueCallLogUpdate(session, {
         $push: { transcript: { role: 'assistant', content: firstMessageText } }
       }, 'first_message_flow');
 
-      safeSend(session.ws, { 
-        type: 'response_text', 
-        text: firstMessageText, 
+      safeSend(session.ws, {
+        type: 'response_text',
+        text: firstMessageText,
         isFirstMessage: true,
         ambientNoise: agent.advanced?.ambientNoise || 'none'
       });
@@ -1343,9 +1353,9 @@ async function handleInit(session, message) {
       }, 'first_message_standard');
 
       // Send text first with ambient noise config
-      safeSend(session.ws, { 
-        type: 'response_text', 
-        text, 
+      safeSend(session.ws, {
+        type: 'response_text',
+        text,
         isFirstMessage: true,
         ambientNoise: agent.advanced?.ambientNoise || 'none'
       });
@@ -1432,7 +1442,7 @@ function handleClientInterrupt(session) {
   session.currentGenerationId = uuidv4();
   // Cancel any in-flight LLM HTTP request so it frees its slot.
   if (session._currentAbortController) {
-    try { session._currentAbortController.abort(); } catch (_) {}
+    try { session._currentAbortController.abort(); } catch (_) { }
     session._currentAbortController = null;
   }
   session.agentSpeaking = false;
@@ -1470,7 +1480,7 @@ function handleClientInterrupt(session) {
 async function handleDtmf(session, message) {
   if (!session.agent) return;
   const single = String(message.digit ?? '').replace(/[^0-9*#]/g, '');
-  const batch  = String(message.digits ?? '').replace(/[^0-9*#]/g, '');
+  const batch = String(message.digits ?? '').replace(/[^0-9*#]/g, '');
   const incoming = batch || single;
   if (!incoming) return;
 
@@ -1550,7 +1560,7 @@ async function handleLanguageSwitch(session, message) {
   console.log(`[LanguageSwitch] ${session.agent.language || 'en'} → ${newLang}`);
 
   // Tear down the old Deepgram connection cleanly.
-  try { session.deepgramConn.finish(); } catch (_) {}
+  try { session.deepgramConn.finish(); } catch (_) { }
   session.deepgramConn = null;
 
   // Mutate in-session agent (don't persist to DB — caller may want this
@@ -1693,7 +1703,7 @@ async function processTranscript(session, transcript) {
     // actually frees the upstream Groq SDK connection slot so a new
     // request doesn't queue behind a half-dead old one).
     if (session._currentAbortController) {
-      try { session._currentAbortController.abort(); } catch (_) {}
+      try { session._currentAbortController.abort(); } catch (_) { }
     }
     const abortController = new AbortController();
     session._currentAbortController = abortController;
@@ -1758,7 +1768,7 @@ async function processTranscript(session, transcript) {
       ];
       const normalizedTranscript = ` ${transcript.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ').trim()} `;
       const isConfirmed = confirmWords.some(w => normalizedTranscript.includes(` ${w} `));
-      
+
       if (isConfirmed) {
         console.log(`[Call End] User confirmed call end: "${transcript}"`);
         // Let agent say goodbye first, then end
@@ -1860,11 +1870,11 @@ async function processTranscript(session, transcript) {
     const _ragStart = Date.now();
     const ragPromise = (session.agent?.knowledgeBaseIds && session.agent.knowledgeBaseIds.length > 0)
       ? ragService.getContextForQuery(transcript, session.agent.knowledgeBaseIds)
-          .then(ctx => {
-            if (ctx) console.log(`[RAG] Retrieved context for session ${session.id} (${Date.now() - _ragStart}ms)`);
-            return ctx || '';
-          })
-          .catch(e => { console.error('[RAG] Context retrieval error:', e.message); return ''; })
+        .then(ctx => {
+          if (ctx) console.log(`[RAG] Retrieved context for session ${session.id} (${Date.now() - _ragStart}ms)`);
+          return ctx || '';
+        })
+        .catch(e => { console.error('[RAG] Context retrieval error:', e.message); return ''; })
       : Promise.resolve('');
 
     // 🔄 HUMAN HANDOFF CHECK
@@ -1878,10 +1888,10 @@ async function processTranscript(session, transcript) {
       const transferCheck = isFastEscalation
         ? { shouldTransfer: true, reason: 'Fast Frustration Intercept' }
         : voicePipeline.shouldTransfer({
-            transcript: session.history,
-            sentimentHistory: session.sentimentHistory || [],
-            agent: session.agent,
-          });
+          transcript: session.history,
+          sentimentHistory: session.sentimentHistory || [],
+          agent: session.agent,
+        });
 
       if (transferCheck.shouldTransfer) {
         console.log(`[🔄 Transfer] Session ${session.id} → ${session.agent.transferNumber} (${transferCheck.reason})`);
@@ -1926,7 +1936,7 @@ async function processTranscript(session, transcript) {
           if (audioBuffer && audioBuffer.length > 0) {
             sendAudioBuffer(session, audioBuffer);
           }
-        } catch (e) {}
+        } catch (e) { }
 
         // End session after transfer message
         setTimeout(() => handleEndSession(session, 'transferred'), 3000);
@@ -1973,7 +1983,7 @@ async function processTranscript(session, transcript) {
     }
 
     let fullResponseText = '';
-    
+
     for await (const chunk of stream) {
       // If a new generation has started, stop this one immediately
       if (session.currentGenerationId !== generationId) {
@@ -2013,16 +2023,16 @@ async function processTranscript(session, transcript) {
 
         let audioToPlay = chunk.audio;
         if (!audioToPlay && session.callFlow && chunk.text) {
-           const ttsService = require('../services/ttsService');
-           try {
-              audioToPlay = await ttsService.textToSpeech({
-                 text: chunk.text,
-                 voiceId: session.agent.voice?.voiceId || 'en-US-JennyNeural',
-                 provider: session.agent.voice?.provider || 'edge-tts',
-              });
-           } catch (e) {
-              console.error('[Flow TTS Error]', e);
-           }
+          const ttsService = require('../services/ttsService');
+          try {
+            audioToPlay = await ttsService.textToSpeech({
+              text: chunk.text,
+              voiceId: session.agent.voice?.voiceId || 'en-US-JennyNeural',
+              provider: session.agent.voice?.provider || 'edge-tts',
+            });
+          } catch (e) {
+            console.error('[Flow TTS Error]', e);
+          }
         }
 
         // Final interrupt check before sending audio
@@ -2033,7 +2043,7 @@ async function processTranscript(session, transcript) {
         }
 
         if (audioToPlay && audioToPlay.length > 0) {
-           sendAudioBuffer(session, audioToPlay, false); // false = don't send audio_end yet
+          sendAudioBuffer(session, audioToPlay, false); // false = don't send audio_end yet
         }
       } else if (chunk.type === 'final') {
         fullResponseText = chunk.fullText;
@@ -2072,7 +2082,7 @@ async function processTranscript(session, transcript) {
               provider: session.agent.voice?.provider || 'edge-tts',
             });
             if (audioBuffer && audioBuffer.length > 0) sendAudioBuffer(session, audioBuffer);
-          } catch (e) {}
+          } catch (e) { }
 
           // Race: get summary within 800ms or proceed without it.
           let handoffSummary = '';
@@ -2244,7 +2254,7 @@ async function handleEndSession(session, reason = 'user_hangup') {
       if (audioBuffer && audioBuffer.length > 0) {
         sendAudioBuffer(session, audioBuffer);
       }
-    } catch (e) {}
+    } catch (e) { }
   }
 
   // Call recording is disabled — no audio is written to disk and no
@@ -2458,31 +2468,31 @@ async function cleanupSession(session) {
   // burning Groq/Gemini quota (the 429 we saw in production logs came
   // from an idle-timer firing AFTER the WS had disconnected).
   if (session._currentAbortController) {
-    try { session._currentAbortController.abort(); } catch (_) {}
+    try { session._currentAbortController.abort(); } catch (_) { }
     session._currentAbortController = null;
   }
   // Stop the idle re-engagement timer — without this it would still fire
   // 10s later and trigger processTranscript on a dead session.
-  if (session._idleTimer)          { clearTimeout(session._idleTimer);          session._idleTimer = null; }
-  if (session._silenceTimer)       { clearTimeout(session._silenceTimer);       session._silenceTimer = null; }
+  if (session._idleTimer) { clearTimeout(session._idleTimer); session._idleTimer = null; }
+  if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
   if (session._agentSpeakingTimer) { clearTimeout(session._agentSpeakingTimer); session._agentSpeakingTimer = null; }
-  if (session._dtmfFlushTimer)     { clearTimeout(session._dtmfFlushTimer);     session._dtmfFlushTimer = null; }
-  if (session._softCommitTimer)    { clearTimeout(session._softCommitTimer);    session._softCommitTimer = null; }
-  if (session._logFlushInterval)   { clearInterval(session._logFlushInterval);  session._logFlushInterval = null; }
+  if (session._dtmfFlushTimer) { clearTimeout(session._dtmfFlushTimer); session._dtmfFlushTimer = null; }
+  if (session._softCommitTimer) { clearTimeout(session._softCommitTimer); session._softCommitTimer = null; }
+  if (session._logFlushInterval) { clearInterval(session._logFlushInterval); session._logFlushInterval = null; }
   session._softCommitBuffer = '';
 
   // Flush any pending transcript writes BEFORE we close so the last few
   // turns don't get dropped on an abrupt disconnect.
-  await flushCallLogWriteQueue(session).catch(() => {});
+  await flushCallLogWriteQueue(session).catch(() => { });
 
   if (session.deepgramConn) {
-    try { session.deepgramConn.finish(); } catch (e) {}
+    try { session.deepgramConn.finish(); } catch (e) { }
     session.deepgramConn = null;
   }
   // Drop the cached rolling summary for this session so it doesn't leak.
-  try { voicePipeline.clearSummaryCache(session.id); } catch (_) {}
+  try { voicePipeline.clearSummaryCache(session.id); } catch (_) { }
   if (session.status !== 'ended') {
-    await handleEndSession(session, 'connection_closed').catch(() => {});
+    await handleEndSession(session, 'connection_closed').catch(() => { });
   }
 }
 
@@ -2600,10 +2610,10 @@ function sendAudioBuffer(session, buffer, isFinal = true) {
     // Use env vars so ops can tune without a code deploy if bitrate changes.
     const bytesPerSec =
       provider === 'eleven-labs' ? Number(process.env.ELEVENLABS_BYTES_PER_SEC || 16000)  // 128kbps mp3
-    : provider === 'edge-tts'    ? Number(process.env.EDGE_TTS_BYTES_PER_SEC    ||  8000)  // 64kbps mp3
-    : provider === 'sarvam'      ? Number(process.env.SARVAM_BYTES_PER_SEC      ||  8000)  // ~64kbps mp3
-    : provider === 'cartesia'    ? Number(process.env.CARTESIA_BYTES_PER_SEC    || 16000)  // 128kbps
-    :                              Number(process.env.TTS_DEFAULT_BYTES_PER_SEC  ||  8000); // safe default
+        : provider === 'edge-tts' ? Number(process.env.EDGE_TTS_BYTES_PER_SEC || 8000)  // 64kbps mp3
+          : provider === 'sarvam' ? Number(process.env.SARVAM_BYTES_PER_SEC || 8000)  // ~64kbps mp3
+            : provider === 'cartesia' ? Number(process.env.CARTESIA_BYTES_PER_SEC || 16000)  // 128kbps
+              : Number(process.env.TTS_DEFAULT_BYTES_PER_SEC || 8000); // safe default
     const chunkDurationMs = Math.round((buffer.length / bytesPerSec) * 1000);
     session._audioQueueDurationMs += Math.max(150, chunkDurationMs);
   }
@@ -2720,37 +2730,37 @@ function queueCallLogUpdate(session, update, label = 'call_log_update') {
   if (!session._pendingLogUpdates) {
     session._pendingLogUpdates = [];
   }
-  
+
   if (update.$push && update.$push.transcript) {
     session._pendingLogUpdates.push(update.$push.transcript);
   } else {
     // Non-transcript updates (like metrics/flags) happen immediately
-    CallLog.findByIdAndUpdate(session.callLogId, update).catch(() => {});
+    CallLog.findByIdAndUpdate(session.callLogId, update).catch(() => { });
     return;
   }
 
   // Setup flush interval (runs every 5 seconds to bulk write)
   if (!session._logFlushInterval) {
     session._logFlushInterval = setInterval(() => {
-       flushCallLogWriteQueue(session);
+      flushCallLogWriteQueue(session);
     }, 5000);
   }
 }
 
 async function flushCallLogWriteQueue(session) {
   if (!session?.callLogId || !session._pendingLogUpdates || session._pendingLogUpdates.length === 0) return;
-  
+
   const transcriptsToPush = [...session._pendingLogUpdates];
   session._pendingLogUpdates = [];
 
   try {
-     await CallLog.findByIdAndUpdate(session.callLogId, {
-        $push: { transcript: { $each: transcriptsToPush } }
-     });
+    await CallLog.findByIdAndUpdate(session.callLogId, {
+      $push: { transcript: { $each: transcriptsToPush } }
+    });
   } catch (err) {
-     console.error(`[CallLog Bulk Update Error]:`, err.message);
-     // Put them back at the front of the queue to retry next interval
-     session._pendingLogUpdates = [...transcriptsToPush, ...(session._pendingLogUpdates || [])];
+    console.error(`[CallLog Bulk Update Error]:`, err.message);
+    // Put them back at the front of the queue to retry next interval
+    session._pendingLogUpdates = [...transcriptsToPush, ...(session._pendingLogUpdates || [])];
   }
 }
 
@@ -2801,9 +2811,9 @@ function trySttFallbackReconnect(session, deepgramKey) {
 
   try {
     if (session.deepgramConn) {
-      try { session.deepgramConn.finish(); } catch (_) {}
+      try { session.deepgramConn.finish(); } catch (_) { }
     }
-  } catch (_) {}
+  } catch (_) { }
 
   console.log(`[STT Fallback] Retrying with language: ${fallbackLanguage} (was: ${currentLanguage})`);
 

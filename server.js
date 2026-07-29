@@ -38,6 +38,7 @@ const callFlowsRoutes = require('./routes/callFlows');
 const testSuiteRoutes = require('./routes/testSuites');
 const voicesRoutes    = require('./routes/voices');
 const promptOptimizerRoutes = require('./routes/promptOptimizer');
+const teamMemberRoutes = require('./routes/teamMembers');
 
 // ─── WebSocket Handlers ─────────────────────────────────────────────────────
 const { setupVoiceSession, canAcceptNewSession, getActiveSessionCount } = require('./websocket/voiceSession');
@@ -230,6 +231,7 @@ app.use('/api/call-flows', callFlowsRoutes);
 app.use('/api/test-suites', testSuiteRoutes);
 app.use('/api/voices', voicesRoutes);
 app.use('/api/optimize-prompt', promptOptimizerRoutes);
+app.use('/api/team-members', teamMemberRoutes);
 
 // ─── 404 Handler ────────────────────────────────────────────────────────────
 app.use('*', (req, res) => {

@@ -4,7 +4,7 @@ const jwt = require('jsonwebtoken');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 const Visitor = require('../models/Visitor');
-const { protect } = require('../middleware/auth');
+const { protect, checkPermission } = require('../middleware/auth');
 
 // Setup Nodemailer Transporter
 // If SMTP credentials aren't provided, we will just log the OTP for testing purposes
@@ -136,7 +136,7 @@ router.post('/verify-otp', async (req, res, next) => {
 
 // @route   GET /api/visitors
 // Protected route for Admins only
-router.get('/', protect, async (req, res, next) => {
+router.get('/', protect, checkPermission('visitors_view'), async (req, res, next) => {
   try {
     const visitors = await Visitor.find({ isVerified: true }).sort({ createdAt: -1 });
     res.json({ success: true, visitors });

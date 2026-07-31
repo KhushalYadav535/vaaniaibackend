@@ -19,7 +19,7 @@ const agentSchema = new mongoose.Schema({
   systemPrompt: {
     type: String,
     required: [true, 'System prompt is required'],
-    maxlength: [20000, 'System prompt cannot exceed 20000 characters'],
+    maxlength: [50000, 'System prompt cannot exceed 50000 characters'],
   },
   firstMessage: {
     type: String,

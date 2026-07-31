@@ -41,6 +41,8 @@ class ToolExecutor {
       'book_appointment': this.bookAppointment.bind(this),
       'schedule_visit': this.scheduleVisit.bind(this),
       'capture_lead': this.captureLead.bind(this),
+      'create_sales_lead': this.captureLead.bind(this),
+      'create_banking_ticket': this.createTicket.bind(this),
       'update_customer_info': this.updateCustomerInfo.bind(this),
 
       // Lookup / action helpers (best-effort; prefer a custom serverUrl)

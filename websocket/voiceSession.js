@@ -78,8 +78,10 @@ setInterval(() => {
       if (sess._agentSpeakingTimer) { clearTimeout(sess._agentSpeakingTimer); sess._agentSpeakingTimer = null; }
       if (sess._dtmfFlushTimer) { clearTimeout(sess._dtmfFlushTimer); sess._dtmfFlushTimer = null; }
       if (sess._softCommitTimer) { clearTimeout(sess._softCommitTimer); sess._softCommitTimer = null; }
+      if (sess._vadFinalizationTimer) { clearTimeout(sess._vadFinalizationTimer); sess._vadFinalizationTimer = null; }
       if (sess._logFlushInterval) { clearInterval(sess._logFlushInterval); sess._logFlushInterval = null; }
       sess._softCommitBuffer = '';
+      sess._pendingSpeechFinal = '';
       // 3. Flush any pending transcript writes so we don't lose turns
       flushCallLogWriteQueue(sess).catch(() => { });
       // 4. Close Deepgram + WS politely
@@ -131,9 +133,9 @@ function touchSession(session) {
  * Otherwise we use the snappy default so normal turns stay fast.
  */
 function getSoftCommitWindowMs(text) {
-  const base = Number(process.env.UTTERANCE_SOFT_COMMIT_MS || 800);
+  const base = Number(process.env.UTTERANCE_SOFT_COMMIT_MS || 1200);
   const numericMs = Number(process.env.UTTERANCE_SOFT_COMMIT_NUMERIC_MS || 2400);
-  const connectorMs = Number(process.env.UTTERANCE_SOFT_COMMIT_CONNECTOR_MS || 1500);
+  const connectorMs = Number(process.env.UTTERANCE_SOFT_COMMIT_CONNECTOR_MS || 2200);
   const completeMs = Number(process.env.UTTERANCE_SOFT_COMMIT_COMPLETE_MS || 450);
   const t = String(text || '').trim();
   if (!t) return base;
@@ -150,6 +152,15 @@ function getSoftCommitWindowMs(text) {
     return numericMs;
   }
 
+  // ── 1b. Dictation (Emails, Addresses, IDs) ──────────────────────────
+  // When spelling out an email or ID, users pause frequently to think or dictate.
+  const dictationKeywords = ['email', 'gmail', 'address', 'id', '@', 'dot com', '.com', 'yahoo', 'hotmail'];
+  const hasDictationKeyword = dictationKeywords.some(k => lower.includes(k));
+  const endsWithDictationConnector = ['is', 'mera', 'my', 'the', 'at'].includes(lastWord);
+  if ((hasDictationKeyword || endsWithDictationConnector) && !/[.?!।]$/.test(t)) {
+    return numericMs; 
+  }
+
   // ── 2. Hesitation / filler endings → user is THINKING, not done ─────────
   // Retell calls this "filler-word panic" — jumping in on "um/uh/matlab".
   // These almost always precede more speech, so wait longer.
@@ -164,7 +175,16 @@ function getSoftCommitWindowMs(text) {
     'me', 'mein', 'में', 'liye', 'लिए', 'kyunki', 'क्योंकि', 'matlab', 'मतलब', 'phir',
     'फिर', 'toh', 'तो', 'ya', 'या', 'and', 'but', 'so', 'because', 'jaise', 'जैसे',
     'that', 'with', 'for', 'to', 'ek', 'एक', 'par', 'पर', 'wala', 'wali', 'vala',
+    // Extended: common Hinglish continuation words
+    'bhi', 'भी', 'hai', 'hain', 'tha', 'the', 'thi', 'ho', 'jo', 'जो', 'ab', 'अब',
+    'bas', 'toh', 'sab', 'agar', 'अगर', 'jab', 'जब', 'kab', 'कब', 'kyun', 'क्यों',
+    'kaise', 'कैसे', 'kaun', 'कौन', 'kya', 'क्या', 'kitna', 'कितना',
+    // मैं/ji/haan — almost always incomplete ("ji main..." “मैं salaried...”)
+    'मैं', 'mai', 'main', 'ji', 'जी', 'haan', 'हां', 'ha', 'han',
   ]);
+  // Special rule: if 1-2 words starting with जी/haan/main, always wait longer
+  const isAckPrefix = words.length <= 2 && ['ji', 'जी', 'haan', 'हां', 'main', 'mai', 'मैं', 'ha'].includes(words[0] || '');
+  if (isAckPrefix) return connectorMs;
   // last two words joined too (catches "ke liye", "ki taraf")
   const lastTwo = words.slice(-2).join(' ');
   if (connectorWords.has(lastWord) || /[,;:-]$/.test(t)
@@ -274,13 +294,38 @@ function mergeUtterance(buffer, text) {
 }
 
 
+/**
+ * Upgrade the soft-commit buffer when a longer/better interim arrives while
+ * we are still waiting to flush. Without this, an early speech_final (e.g.
+ * "credit") gets locked in and later interims ("Credit score 670 hai.") only
+ * update the UI — the LLM still receives the first word.
+ */
+function upgradeSoftCommitBuffer(session, text, source = 'interim') {
+  const incoming = (text || '').trim();
+  if (!incoming || incoming.length < 2) return false;
+  if (!session._softCommitBuffer) return false;
+
+  const before = session._softCommitBuffer;
+  const after = mergeUtterance(before, incoming);
+  if (after === before) return false;
+
+  console.log(`[STT] Buffer upgrade (${source}) before append: "${before}"`);
+  session._softCommitBuffer = after;
+  console.log(`[STT] Buffer upgrade (${source}) after append: "${after}"`);
+  return true;
+}
+
 function commitTranscript(session, transcript, { immediate = false } = {}) {
   const text = (transcript || '').trim();
   if (!text || text.length < 2) return;
 
+  const bufferBefore = session._softCommitBuffer || '';
+  console.log(`[STT] commitTranscript before append: "${bufferBefore}" (+ "${text}")`);
+
   // Smart-merge so re-fired / extended transcripts (especially numbers)
   // don't duplicate or garble the buffer.
   session._softCommitBuffer = mergeUtterance(session._softCommitBuffer, text);
+  console.log(`[STT] commitTranscript after append: "${session._softCommitBuffer}"`);
 
   // Bypass for interrupt path — fire immediately so the agent doesn't keep
   // talking over a user who's clearly trying to interrupt.
@@ -317,9 +362,17 @@ function bumpSoftCommitTimer(session) {
 function flushSoftCommit(session) {
   if (session._softCommitTimer) { clearTimeout(session._softCommitTimer); session._softCommitTimer = null; }
   const merged = (session._softCommitBuffer || '').trim();
+  console.log(`[STT] flushSoftCommit buffer before LLM: "${merged}"`);
   session._softCommitBuffer = '';
+  console.log(`[STT] flushSoftCommit buffer after clear: ""`);
   if (!merged || merged.length < 2) return;
-  if (session.isProcessing) return;
+  if (session.isProcessing) {
+    // A partial turn is already in flight — hold the fuller merged text so we
+    // can evaluate an upgrade once the current turn finishes.
+    session._pendingSpeechFinal = mergeUtterance(session._pendingSpeechFinal, merged);
+    console.log(`[STT] flushSoftCommit deferred (isProcessing); queued: "${session._pendingSpeechFinal}"`);
+    return;
+  }
   if (session.status === 'ended') return;
 
   // Reset per-turn STT scratch state. processTranscript now owns the
@@ -328,7 +381,7 @@ function flushSoftCommit(session) {
   session._userSpeechStartTime = null;
   session._backchannelTriggered = false;
   session._lastSttTranscript = '';
-  console.log(`[STT] soft-commit flush → "${merged}"`);
+  console.log(`[STT] soft-commit flush → LLM: "${merged}"`);
   processTranscript(session, merged).catch(e => {
     console.error('Error processing soft-commit transcript:', e);
   });
@@ -344,9 +397,30 @@ function flushSoftCommit(session) {
  * One handler factory keeps them in sync forever.
  */
 function buildSessionOnTranscript(session) {
-  return async ({ transcript, isFinal, speechFinal }) => {
+  return async ({
+    transcript,
+    isFinal,
+    speechFinal,
+    fromFinalize = false,
+    start = null,
+    duration = null,
+    confidence = null,
+  }) => {
     const agent = session.agent;
     if (!agent) return;
+
+    console.log('[STT] Deepgram event', JSON.stringify({
+      transcript: (transcript || '').slice(0, 120),
+      is_final: isFinal,
+      speech_final: speechFinal,
+      from_finalize: fromFinalize,
+      start,
+      duration,
+      confidence,
+      buffer: (session._softCommitBuffer || '').slice(0, 120),
+      lastInterim: (session._lastSttTranscript || '').slice(0, 120),
+      isProcessing: !!session.isProcessing,
+    }));
 
     // ── Interruption detection: user speaks while agent is talking ──
     if (session.agentSpeaking) {
@@ -551,7 +625,6 @@ function buildSessionOnTranscript(session) {
     // process ONE merged turn, not three fragments.
     if (isFinal && speechFinal && transcript.trim().length > 0) {
       if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
-      if (session.isProcessing) return;
 
       let finalToCommit = transcript;
       const prevInterim = (session._lastSttTranscript || '').trim();
@@ -571,24 +644,63 @@ function buildSessionOnTranscript(session) {
       const isSuspiciousDropoff =
         (prevInterim.length >= 10 && transcript.length <= 6) ||
         (prevInterimWords >= 3 && finalWords <= 1) ||
-        (prevInterim.length >= 20 && transcript.length < prevInterim.length * 0.25);
+        (prevInterimWords >= 4 && finalWords <= 2) || // Catch 2-word dropoffs from longer sentences
+        (prevInterim.length >= 15 && transcript.length < prevInterim.length * 0.40); // 60%+ character dropoff
 
-      if (isSuspiciousDropoff) {
-        console.warn(`[STT] Deepgram hallucination detected! Interim: "${prevInterim}" (${prevInterimWords}w/${prevInterim.length}c) → Final: "${transcript}" (${finalWords}w/${transcript.length}c). Preferring interim.`);
+      // ── Extended: Word-substitution hallucination ─────────────────────────
+      // Deepgram sometimes replaces words with phonetically similar but wrong ones
+      // (e.g. "salary slip" → "selfie sleep", "साढ़े सात सौ" → "छह सात सौ पचास")
+      // The length and word count are SIMILAR, but the actual words differ.
+      // Detect this using both character-level AND word-level similarity.
+      const computeCharSimilarity = (a, b) => {
+        if (!a || !b) return 0;
+        const aChars = new Set(a.toLowerCase().replace(/\s+/g, ''));
+        const bChars = new Set(b.toLowerCase().replace(/\s+/g, ''));
+        let shared = 0;
+        for (const c of aChars) { if (bChars.has(c)) shared++; }
+        return shared / Math.max(aChars.size, bChars.size);
+      };
+      const computeWordJaccard = (a, b) => {
+        if (!a || !b) return 0;
+        const aWords = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
+        const bWords = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
+        let shared = 0;
+        for (const w of aWords) { if (bWords.has(w)) shared++; }
+        return shared / (aWords.size + bWords.size - shared);
+      };
+      const charSim = computeCharSimilarity(prevInterim, transcript);
+      const wordSim = computeWordJaccard(prevInterim, transcript);
+      const isWordSubstitution =
+        !isSuspiciousDropoff &&
+        prevInterim.length >= 6 &&
+        transcript.length >= 4 &&
+        Math.abs(prevInterimWords - finalWords) <= 2 &&
+        charSim < 0.62 &&   // characters don't match well
+        wordSim < 0.35;     // AND actual words don't match well
+
+      if (isSuspiciousDropoff || isWordSubstitution) {
+        const reason = isSuspiciousDropoff ? 'length-dropoff' : `word-substitution(char=${charSim.toFixed(2)},word=${wordSim.toFixed(2)})`;
+        console.warn(`[STT] Deepgram hallucination (${reason})! Interim: "${prevInterim}" → Final: "${transcript}". Preferring interim.`);
         finalToCommit = prevInterim;
       }
 
       console.log(`[STT] speech_final buffered: "${finalToCommit}"`);
-      commitTranscript(session, finalToCommit);
+      if (session.isProcessing) {
+        session._pendingSpeechFinal = mergeUtterance(session._pendingSpeechFinal, finalToCommit);
+        console.log(`[STT] speech_final queued during isProcessing: "${session._pendingSpeechFinal}"`);
+      } else {
+        commitTranscript(session, finalToCommit);
+      }
       session._lastSttTranscript = ''; // clear to prevent double-commit by silence fallback
       return;
     }
 
     // Path 2: Client-side silence-timer fallback. If we have a soft-commit
-    // buffer in flight, just bump its timer — the user is still on the
-    // same turn. Otherwise fall back to the legacy 900ms timer for the
-    // case where Deepgram never fires speech_final.
+    // buffer in flight, upgrade it with any richer interim and bump the timer.
     if (session._softCommitBuffer && session._softCommitTimer) {
+      if (transcript.trim().length > 0 && !(isFinal && speechFinal)) {
+        upgradeSoftCommitBuffer(session, transcript, 'interim');
+      }
       bumpSoftCommitTimer(session);
       return;
     }
@@ -651,11 +763,17 @@ const UNIVERSAL_HINGLISH_SEED = [
   'car', 'car loan', 'home loan', 'personal loan', 'business loan', 'gold loan',
   // Hindi income/loan vocabulary — these are frequently misrecognized by Deepgram
   // without boosting (e.g. "सालाना" → "सलीना", "मासिक" → garbled)
-  'salary', 'income', 'monthly', 'annual', 'yearly',
+  'salary', 'salary slip', 'income', 'monthly', 'annual', 'yearly',
   'सालाना', 'मासिक', 'वेतन', 'आय', 'तनख्वाह',
   'लाख', 'हज़ार', 'करोड़', 'रुपए', 'रुपये',
   'होम लोन', 'गोल्ड लोन', 'कार लोन', 'पर्सनल लोन', 'बिजनेस लोन',
   'सिबिल', 'CIBIL', 'ITR', 'सैलरी स्लिप',
+  // Hindi fractional/compound numbers — often misheard (e.g. "साढ़े" → "छह", "डेढ़" → "दाद")
+  'साढ़े', 'सवा', 'डेढ़', 'ढाई', 'पौने', 'साठ', 'सत्तर', 'अस्सी', 'नब्बे',
+  // Credit score / CIBIL terms
+  'क्रेडिट स्कोर', 'सिबिल स्कोर', 'साढ़े सात सौ', 'सात सौ पचास', 'आठ सौ',
+  // Document terms
+  'आधार', 'पैन', 'पासपोर्ट', 'ड्राइविंग लाइसेंस',
 ];
 
 /**
@@ -985,8 +1103,8 @@ async function handleMessage(session, message) {
         // Also clear _lastSttTranscript and _silenceTimer so the 900ms silence
         // fallback timer doesn't re-commit the stale text after the turn ends.
         if (session._softCommitBuffer && session._softCommitTimer) {
-          console.log(`[VAD] user_speech_end → soft-commit already in flight, bumping timer: "${pendingTranscript}"`);
-          session._lastSttTranscript = '';
+          console.log(`[VAD] user_speech_end → soft-commit already in flight, upgrading buffer: "${pendingTranscript}"`);
+          upgradeSoftCommitBuffer(session, pendingTranscript, 'vad_end');
           if (session._silenceTimer) { clearTimeout(session._silenceTimer); session._silenceTimer = null; }
           bumpSoftCommitTimer(session);
           break;
@@ -1017,11 +1135,6 @@ async function handleMessage(session, message) {
           console.warn(`[VAD] Interim fallback commit enabled; buffering: "${pending}"`);
           commitTranscript(session, pending);
         }, delayMs);
-
-        const finalTranscript = session._lastSttTranscript;
-        session._lastSttTranscript = '';
-        console.log(`[VAD] user_speech_end → soft-commit window: "${finalTranscript}"`);
-        commitTranscript(session, finalTranscript);
       }
       break;
 
@@ -1159,6 +1272,14 @@ async function handleInit(session, message) {
   session.streamProtocol = !!streamProtocol;
   session.skipPostCallAnalysis = !!skipPostCallAnalysis;
   session.status = 'ready';
+  
+  // Vapi/Retell style Server-Side State Machine initialization
+  session.callState = {
+    contactCollected: false,
+    turns: 0,
+    choicesOffered: false,
+    topicsDiscussed: []
+  };
 
   if (agent.workflowId) {
     session.callFlow = await CallFlow.findById(agent.workflowId);
@@ -1641,6 +1762,7 @@ async function processTranscript(session, transcript) {
     return;
   }
 
+
   // ── Duplicate-transcript dedup guard ──────────────────────────────────
   // Catches three patterns of duplicate commits for the same utterance:
   //
@@ -1666,8 +1788,12 @@ async function processTranscript(session, transcript) {
     const _msSinceLast = Date.now() - session._lastProcessedAt;
     const _prev = session._lastProcessedTranscript;
     const _isExactDupe = _cleanedTranscript === _prev;
-    // Continuation: new transcript starts with what we already answered
-    const _isContinuation = _cleanedTranscript.startsWith(_prev) && _prev.length >= 6;
+    // Continuation: new transcript starts with what we already answered — but
+    // ONLY when it is not a substantially longer completion of a partial turn
+    // (e.g. prev="credit", new="credit score 670 hai" must NOT be skipped).
+    const _addedChars = _cleanedTranscript.length - _prev.length;
+    const _isContinuation = _cleanedTranscript.startsWith(_prev) && _prev.length >= 6
+      && _addedChars < Math.max(12, Math.round(_prev.length * 0.35));
     // Partial: a late partial of something already fully answered
     const _isLatePart = _prev.startsWith(_cleanedTranscript) && _cleanedTranscript.length >= 6;
     if (_msSinceLast < _DEDUP_WINDOW_MS && (_isExactDupe || _isContinuation || _isLatePart)) {
@@ -1679,7 +1805,10 @@ async function processTranscript(session, transcript) {
   // ── 1. Phantom Speech & Backchannel Filter (Edge Case 1) ───────────────
   // If the agent is currently speaking, and the user just says a 1-2 word utterance
   // (like "hmm", "yeah", "ok", "haan"), it's likely a backchannel or background noise.
-  // We DROP it instead of interrupting the agent and sending "hmm" to the LLM.
+  // [DISABLED: We cannot drop transcripts silently here because if the frontend VAD 
+  // already stopped the TTS audio locally, dropping the transcript creates a deadlock 
+  // where the bot stays silent forever. We must let it hit the LLM to resume the turn.]
+  /*
   if (!transcript.startsWith('[SYSTEM_EVENT') && session.agentSpeaking) {
     const wordCount = _cleanedTranscript.split(/\s+/).filter(w => w.length > 0).length;
     if (wordCount <= 2) {
@@ -1687,6 +1816,7 @@ async function processTranscript(session, transcript) {
       return;
     }
   }
+  */
 
   session._lastProcessedTranscript = _cleanedTranscript;
   session._lastProcessedAt = Date.now();
@@ -1800,6 +1930,66 @@ async function processTranscript(session, transcript) {
 
     // Add user message to history (skip if step 1 above already pushed it)
     if (!session.pendingEndCallConfirmation) {
+      
+      // Update Server-Side State Machine
+      if (session.callState) {
+        session.callState.turns++;
+        
+        // 1. Contact Info Extraction (Regex)
+        const hasEmail = /\S+@\S+\.\S+/.test(transcript);
+        const hasPhone = /(?:\+91|0)?[6-9]\d{9}/.test(transcript.replace(/\s+/g, ''));
+        if (hasEmail || hasPhone) {
+          session.callState.contactCollected = true;
+          console.log(`[State Tracking] Contact details detected in user transcript. Marking as collected.`);
+        }
+        
+        // 2. Ambiguous Answer Interception
+        const lowerTrans = transcript.trim().toLowerCase();
+        const isAmbiguousYes = /^(yes|yeah|yep|haan|haa|of course|sure)\.?$/.test(lowerTrans);
+        
+        if (isAmbiguousYes) {
+          const lastAssistantMsg = session.history.slice().reverse().find(m => m.role === 'assistant');
+          if (lastAssistantMsg && lastAssistantMsg.content) {
+            const lastContent = lastAssistantMsg.content.toLowerCase();
+            // Look for choice patterns: " or ", " ya "
+            if (lastContent.includes(" or ") || lastContent.includes(" ya ")) {
+              console.log(`[State Tracking] Ambiguous "Yes" detected to a choice question. Injecting clarification hint.`);
+              session.history.push({
+                role: 'system',
+                content: `[SYSTEM ENFORCEMENT: The user answered "yes" to a choice question. You MUST ask them to clarify which specific option they meant (e.g. "Did you mean A or B?"). Do NOT guess.]`,
+                timestamp: new Date(),
+              });
+            }
+          }
+        }
+      }
+
+      // ── Incomplete Transcript Guard ────────────────────────────────────────
+      // If transcript is very short (≤3 words) AND ends without terminal punctuation
+      // AND ends in a connector/fragment word, the STT likely cut off mid-sentence.
+      // Inject a system note so the LLM asks for clarification instead of hallucinating.
+      const tWords = transcript.trim().split(/\s+/).filter(Boolean);
+      const hasTerminalPunct = /[.?!।]$/.test(transcript.trim());
+      const incompleteEndings = new Set([
+        'मैं', 'mai', 'main', 'जी', 'ji', 'मेरी', 'meri', 'मेरा', 'mera', 'हमारी', 'hamari',
+        'salary', 'सैलरी', 'income', 'आय', 'loan', 'लोन', 'का', 'ki', 'ke', 'ko', 'se',
+        'है', 'हैं', 'tha', 'the', 'और', 'aur', 'भी', 'bhi', 'नहीं', 'nahi',
+        'हज़ार', 'lakh', 'लाख', 'crore', 'करोड़',
+      ]);
+      const lastTWord = (tWords[tWords.length - 1] || '').toLowerCase();
+      const looksIncomplete = tWords.length <= 3 && !hasTerminalPunct && (
+        incompleteEndings.has(transcript.trim().toLowerCase()) ||
+        incompleteEndings.has(lastTWord) ||
+        tWords.length <= 1
+      );
+      if (looksIncomplete) {
+        console.log(`[Incomplete Transcript Guard] "${transcript}" looks cut off — injecting clarification hint`);
+        session.history.push({
+          role: 'system',
+          content: `[STT_INCOMPLETE: The user's last message "${transcript}" appears to be cut off or incomplete. Do NOT assume, guess, or hallucinate any numbers, salary, or facts. ONLY respond with a gentle clarification: "क्षमा करें, आपकी बात पूरी तरह नहीं सुनाई दी। क्या आप दोबारा बता सकते हैं?"]`,
+          timestamp: new Date(),
+        });
+      }
       session.history.push({ role: 'user', content: transcript, timestamp: new Date() });
     }
 
@@ -1949,6 +2139,7 @@ async function processTranscript(session, transcript) {
 
     safeSend(session.ws, { type: 'status', message: '💭 AI is thinking...' });
     session.latency.llmStartedAt = Date.now();
+    console.log(`[STT] processTranscript → LLM request: "${transcript.slice(0, 200)}"`);
     console.log(`[⏱️ LATENCY] STT→Pipeline: ${session.latency.llmStartedAt - session.latency.turnStartedAt}ms`);
 
     // RAG was kicked off in parallel with sentiment above. Now await it
@@ -1978,6 +2169,7 @@ async function processTranscript(session, transcript) {
         callContext: {
           callLogId: session.callLogId,
           callerPhone: session.callParams?.from || '',
+          state: session.callState,
         },
       });
     }
@@ -2164,6 +2356,29 @@ async function processTranscript(session, transcript) {
     // Add AI response to history
     session.history.push({ role: 'assistant', content: fullResponseText, timestamp: new Date() });
 
+    // Also run contact extraction on Assistant's formatted response, because STT sometimes inserts spaces in user transcripts
+    if (session.callState && !session.callState.contactCollected) {
+      const hasEmailAssis = /\S+@\S+\.\S+/.test(fullResponseText);
+      const hasPhoneAssis = /(?:\+91|0)?[6-9]\d{9}/.test(fullResponseText.replace(/\s+/g, ''));
+      if (hasEmailAssis || hasPhoneAssis) {
+        session.callState.contactCollected = true;
+        console.log(`[State Tracking] Contact details verified in Assistant transcript. Marking as collected.`);
+      }
+    }
+
+    // Dynamic Topic Tracking
+    if (session.callState && session.callState.topicsDiscussed) {
+      const lowerResp = fullResponseText.toLowerCase();
+      // Application Process
+      if ((lowerResp.includes("jagritiyatra.com") || lowerResp.includes("199") || lowerResp.includes("essay-based")) && !session.callState.topicsDiscussed.includes("Application Process")) {
+        session.callState.topicsDiscussed.push("Application Process");
+      }
+      // Eligibility
+      if ((lowerResp.includes("21 to 27") || lowerResp.includes("28 years") || lowerResp.includes("facilitator")) && !session.callState.topicsDiscussed.includes("Eligibility Criteria")) {
+        session.callState.topicsDiscussed.push("Eligibility Criteria");
+      }
+    }
+
     // Update call log
     queueCallLogUpdate(session, {
       $push: { transcript: { role: 'assistant', content: fullResponseText } }
@@ -2229,6 +2444,25 @@ async function processTranscript(session, transcript) {
     session.isProcessing = false;
     if (session._currentAbortController) {
       session._currentAbortController = null;
+    }
+
+    // If a fuller speech_final arrived while the partial turn was in flight,
+    // process the upgrade now so the LLM gets the complete utterance.
+    const pendingUpgrade = (session._pendingSpeechFinal || '').trim();
+    session._pendingSpeechFinal = '';
+    if (pendingUpgrade.length >= 2 && session.status !== 'ended') {
+      const lastProcessed = session._lastProcessedTranscript || '';
+      const pendingLower = pendingUpgrade.toLowerCase();
+      const isSubstantialUpgrade = pendingLower.startsWith(lastProcessed)
+        && pendingUpgrade.length > lastProcessed.length + 8;
+      if (isSubstantialUpgrade) {
+        console.log(`[STT] Processing deferred fuller transcript after partial turn: "${pendingUpgrade}"`);
+        setImmediate(() => {
+          processTranscript(session, pendingUpgrade).catch(e =>
+            console.error('Error processing deferred speech_final upgrade:', e)
+          );
+        });
+      }
     }
   }
 }
@@ -2478,8 +2712,10 @@ async function cleanupSession(session) {
   if (session._agentSpeakingTimer) { clearTimeout(session._agentSpeakingTimer); session._agentSpeakingTimer = null; }
   if (session._dtmfFlushTimer) { clearTimeout(session._dtmfFlushTimer); session._dtmfFlushTimer = null; }
   if (session._softCommitTimer) { clearTimeout(session._softCommitTimer); session._softCommitTimer = null; }
+  if (session._vadFinalizationTimer) { clearTimeout(session._vadFinalizationTimer); session._vadFinalizationTimer = null; }
   if (session._logFlushInterval) { clearInterval(session._logFlushInterval); session._logFlushInterval = null; }
   session._softCommitBuffer = '';
+  session._pendingSpeechFinal = '';
 
   // Flush any pending transcript writes BEFORE we close so the last few
   // turns don't get dropped on an abrupt disconnect.

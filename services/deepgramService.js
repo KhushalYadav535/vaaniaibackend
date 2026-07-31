@@ -265,14 +265,40 @@ class DeepgramService {
 
         if (msg.type !== 'Results') return;
 
-        const transcript = msg.channel?.alternatives?.[0]?.transcript;
-        const isFinal    = msg.is_final === true;
+        const alt = msg.channel?.alternatives?.[0];
+        const transcript = alt?.transcript;
+        const isFinal = msg.is_final === true;
         const speechFinal = msg.speech_final === true;
+        const fromFinalize = msg.from_finalize === true;
+        const start = typeof msg.start === 'number' ? msg.start : null;
+        const duration = typeof msg.duration === 'number' ? msg.duration : null;
+        const confidence = typeof alt?.confidence === 'number' ? alt.confidence : null;
+
+        console.log('[Deepgram] Results', JSON.stringify({
+          transcript: (transcript || '').slice(0, 120),
+          is_final: isFinal,
+          speech_final: speechFinal,
+          from_finalize: fromFinalize,
+          start,
+          duration,
+          confidence,
+        }));
 
         if (transcript && onTranscript) {
           const trimmed = transcript.trim();
-          if (isFinal && speechFinal && trimmed.length < minFinalChars) return;
-          onTranscript({ transcript, isFinal, speechFinal });
+          if (isFinal && speechFinal && trimmed.length < minFinalChars) {
+            console.log(`[Deepgram] Dropped short speech_final (${trimmed.length} chars < min ${minFinalChars}): "${trimmed}"`);
+            return;
+          }
+          onTranscript({
+            transcript,
+            isFinal,
+            speechFinal,
+            fromFinalize,
+            start,
+            duration,
+            confidence,
+          });
         }
       } catch (e) {
         // ignore parse errors

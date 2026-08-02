@@ -178,6 +178,12 @@ app.use((req, res, next) => {
 // ─── Global Rate Limiter ──────────────────────────────────────────────────────
 // Protects every API route from abuse/brute-force. /health is skipped inside
 // the limiter config. Auth routes get a stricter limiter wired below.
+app.use('/api', (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+  next();
+});
 app.use('/api', globalLimiter);
 
 // ─── Health Checks ──────────────────────────────────────────────────────────

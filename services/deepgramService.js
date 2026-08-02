@@ -164,33 +164,38 @@ class DeepgramService {
 
     const params = new URLSearchParams({
       model: finalModel,
-      language: sttLanguage,
-      interim_results: 'true',
-      endpointing: String(endpointingMs),
-      // FIX Bug #4: utterance_end_ms was computed and logged but never added to
-      // the query string — so Deepgram never activated UtteranceEnd events.
-      // Without this, turn-taking relied solely on speech_final with no safety net.
-      utterance_end_ms: String(utteranceEndMs),
     });
-    if (smartFormat) {
-      params.set('smart_format', 'true');
+
+    if (finalModel.startsWith('flux')) {
+      if (finalModel === 'flux-general-multi') {
+        params.append('language_hint', 'en');
+        params.append('language_hint', 'hi'); 
+      }
     } else {
-      // Keep readable punctuation, convert number-words to digits, but DON'T
-      // let Deepgram reformat digit runs into 09:05-style times/dates.
-      params.set('punctuate', 'true');
-      if (useNumerals) params.set('numerals', 'true');
+      params.set('interim_results', 'true');
+      params.append('endpointing', String(endpointingMs));
+      params.append('utterance_end_ms', String(utteranceEndMs));
+      params.set('language', sttLanguage);
+      
+      if (smartFormat) {
+        params.set('smart_format', 'true');
+      } else {
+        params.set('punctuate', 'true');
+        if (useNumerals) params.set('numerals', 'true');
+      }
+      
+      if (backgroundDenoising === 'high') {
+        params.set('diarize', 'true');
+        params.set('filler_words', 'true');
+      }
     }
 
     if (audioInputMode !== 'webm') {
-      // raw mode: use specified encoding
       params.set('encoding', encoding);
       params.set('sample_rate', String(sampleRate));
-      params.set('channels', String(channels));
-    }
-
-    if (backgroundDenoising === 'high') {
-      params.set('diarize', 'true');
-      params.set('filler_words', 'true');
+      if (!finalModel.startsWith('flux')) {
+        params.set('channels', String(channels));
+      }
     }
 
     // Keyword boosting: improves recognition of domain-specific terms
@@ -209,6 +214,8 @@ class DeepgramService {
           // doesn't support duplicate keys well across all Node versions.
           cleanTerms.forEach(term => params.append('keyterm', term));
           console.log(`[Deepgram] Keyterm boosting (nova-3): ${cleanTerms.length} terms`);
+        } else if (finalModel.startsWith('flux')) {
+          console.log(`[Deepgram] Keyword boosting disabled for Flux (avoids HTTP 400)`);
         } else {
           // nova-2 and older: standard comma-separated keywords
           params.set('keywords', validKeywords.join(','));
@@ -218,9 +225,12 @@ class DeepgramService {
     }
 
     // Enable VAD events for smarter turn-taking
-    params.set('vad_events', 'true');
+    if (!finalModel.startsWith('flux')) {
+      params.set('vad_events', 'true');
+    }
 
-    const url = `wss://api.deepgram.com/v1/listen?${params.toString()}`;
+    const endpointVersion = finalModel.startsWith('flux') ? 'v2' : 'v1';
+    const url = `wss://api.deepgram.com/${endpointVersion}/listen?${params.toString()}`;
 
     const ws = new WebSocket(url, {
       headers: { Authorization: 'Token ' + key },
@@ -234,13 +244,15 @@ class DeepgramService {
 
     ws.on('open', () => {
       console.log('🎙️ Deepgram connection opened');
-      keepaliveInterval = setInterval(() => {
-        if (ws.readyState === WebSocket.OPEN) {
-          try {
-            ws.send(JSON.stringify({ type: 'KeepAlive' }));
-          } catch (_) { /* ignore if connection is closing */ }
-        }
-      }, 10000);
+      if (!finalModel.startsWith('flux')) {
+        keepaliveInterval = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.send(JSON.stringify({ type: 'KeepAlive' }));
+            } catch (_) { /* ignore if connection is closing */ }
+          }
+        }, 10000);
+      }
     });
 
     ws.on('message', (data) => {
@@ -263,16 +275,34 @@ class DeepgramService {
           return;
         }
 
-        if (msg.type !== 'Results') return;
+        if (msg.type === 'EndOfTurn' || msg.type === 'TurnCompleted') {
+          console.log(`[Deepgram] Flux EOT event:`, msg.type);
+          if (onVADEvent) onVADEvent({ type: 'utterance_end' });
+          return;
+        }
 
-        const alt = msg.channel?.alternatives?.[0];
-        const transcript = alt?.transcript;
-        const isFinal = msg.is_final === true;
-        const speechFinal = msg.speech_final === true;
-        const fromFinalize = msg.from_finalize === true;
-        const start = typeof msg.start === 'number' ? msg.start : null;
-        const duration = typeof msg.duration === 'number' ? msg.duration : null;
-        const confidence = typeof alt?.confidence === 'number' ? alt.confidence : null;
+        if (msg.type !== 'Results' && msg.type !== 'TurnInfo') return;
+
+        let transcript, isFinal, speechFinal;
+        let start = null, duration = null, confidence = null, fromFinalize = false;
+
+        if (msg.type === 'TurnInfo') {
+          transcript = msg.transcript;
+          // Flux v2 marks interim results with event "Update"
+          isFinal = msg.event !== 'Update';
+          speechFinal = msg.event === 'Finalize' || msg.event === 'Commit' || msg.event === 'EndOfTurn' || msg.end_of_turn === true;
+          start = msg.audio_window_start;
+          duration = msg.audio_window_end ? (msg.audio_window_end - msg.audio_window_start) : null;
+        } else {
+          const alt = msg.channel?.alternatives?.[0];
+          transcript = alt?.transcript;
+          isFinal = msg.is_final === true;
+          speechFinal = msg.speech_final === true;
+          fromFinalize = msg.from_finalize === true;
+          start = typeof msg.start === 'number' ? msg.start : null;
+          duration = typeof msg.duration === 'number' ? msg.duration : null;
+          confidence = typeof alt?.confidence === 'number' ? alt.confidence : null;
+        }
 
         console.log('[Deepgram] Results', JSON.stringify({
           transcript: (transcript || '').slice(0, 120),

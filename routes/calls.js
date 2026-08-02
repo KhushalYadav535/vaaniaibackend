@@ -3,6 +3,18 @@ const router = express.Router();
 const CallLog = require('../models/CallLog');
 const { protect } = require('../middleware/auth');
 
+// @route   GET /api/calls/debug
+router.get('/debug', async (req, res) => {
+  try {
+    const counts = await CallLog.aggregate([
+      { $group: { _id: "$userId", count: { $sum: 1 } } }
+    ]);
+    res.json(counts);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.use(protect);
 
 const alacQuery = (user, type = 'agentId') => {
@@ -12,9 +24,7 @@ const alacQuery = (user, type = 'agentId') => {
   return {};
 };
 
-
 // ─── FULL-TEXT SEARCH across all transcripts ────────────────────────────────
-// GET /api/calls/search?q=refund&agentId=xxx&limit=20
 router.get('/search', async (req, res, next) => {
   try {
     const { q, agentId, limit = 20, status, direction } = req.query;

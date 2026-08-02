@@ -1392,7 +1392,7 @@ async function handleInit(session, message) {
 
   // Create initial call log
   const callLog = await CallLog.create({
-    userId: user?._id ?? null,
+    userId: agent.userId,
     visitorEmail: session.visitorEmail || '',
     agentId: agent._id,
     agentName: agent.name,

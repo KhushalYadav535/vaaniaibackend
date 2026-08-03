@@ -50,6 +50,10 @@ const campaignWorker = require('./services/campaignWorker');
 
 // ─── App & HTTP Server ──────────────────────────────────────────────────────
 const app = express();
+// Enable trust proxy for Traefik/NGINX. Critical for express-rate-limit 
+// to see client IP instead of proxy IP, preventing fatal crashes on webhooks.
+app.set('trust proxy', 1);
+
 const server = http.createServer(app);
 
 // ─── WebSocket Setup ────────────────────────────────────────────────────────

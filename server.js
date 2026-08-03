@@ -26,7 +26,7 @@ const callRoutes = require('./routes/calls');
 const analyticsRoutes = require('./routes/analytics');
 const settingsRoutes = require('./routes/settings');
 const webhookRoutes = require('./routes/webhooks');
-const twilioRoutes = require('./routes/twilio');
+const plivoRoutes  = require('./routes/plivo');
 const voicePreviewRoutes = require('./routes/voicePreview');
 const campaignRoutes = require('./routes/campaigns');
 const storageRoutes = require('./routes/storage');
@@ -43,6 +43,7 @@ const teamMemberRoutes = require('./routes/teamMembers');
 // ─── WebSocket Handlers ─────────────────────────────────────────────────────
 const { setupVoiceSession, canAcceptNewSession, getActiveSessionCount } = require('./websocket/voiceSession');
 const { createWebRTCServer } = require('./websocket/webrtcSession');
+const { handlePlivoStreamConnection } = require('./websocket/plivoStream');
 
 // ─── Worker ─────────────────────────────────────────────────────────────────
 const campaignWorker = require('./services/campaignWorker');
@@ -56,6 +57,11 @@ const wss = new WebSocket.Server({ noServer: true });
 
 // Register the voice session connection handler
 setupVoiceSession(wss);
+
+// Plivo bi-directional stream WebSocket server (Zoronal/Retell/Vapi style)
+// Each telephony call gets its own isolated WebSocket — no shared state with browser sessions.
+const plivo_wss = new WebSocket.Server({ noServer: true });
+plivo_wss.on('connection', (ws) => handlePlivoStreamConnection(ws));
 
 // WebRTC: currently a stub (mock SDP, no real RTCPeerConnection on Node).
 // Proper implementation needs `wrtc` (heavy native build) or `mediasoup`.
@@ -92,6 +98,12 @@ server.on('upgrade', (request, socket, head) => {
       wss.handleUpgrade(request, socket, head, (ws) => {
         console.log('🔥 Voice WS Connected');
         wss.emit('connection', ws, request);
+      });
+    } else if (url === '/ws/plivo-stream') {
+      // Plivo bi-directional telephony audio stream
+      plivo_wss.handleUpgrade(request, socket, head, (ws) => {
+        console.log('📞 Plivo Stream WS Connected');
+        plivo_wss.emit('connection', ws, request);
       });
     } else if (url === '/webrtc') {
       // Handled by createWebRTCServer when WEBRTC_EXPERIMENTAL=true.
@@ -200,7 +212,8 @@ app.get('/', (req, res) => {
       analytics: '/api/analytics',
       settings: '/api/settings',
       webhooks: '/api/webhooks',
-      twilio: '/api/twilio',
+      twilio: '/api/twilio (deprecated — use /api/plivo)',
+      plivo: '/api/plivo',
       voicePreview: '/api/voice-preview',
       websocket: 'ws://localhost:' + (process.env.PORT || 5000) + '/ws/voice',
     },
@@ -225,7 +238,7 @@ app.use('/api/calls', callRoutes);
 app.use('/api/analytics', analyticsRoutes);
 app.use('/api/settings', settingsRoutes);
 app.use('/api/webhooks', webhookRoutes);
-app.use('/api/twilio', twilioRoutes);
+app.use('/api/plivo', plivoRoutes);
 app.use('/api/voice-preview', voicePreviewRoutes);
 app.use('/api/campaigns', campaignRoutes);
 app.use('/api/recordings', storageRoutes);

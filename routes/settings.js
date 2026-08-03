@@ -19,6 +19,8 @@ router.put('/', async (req, res, next) => {
       'elevenLabsKey', 'twilioAccountSid', 'twilioAuthToken',
       'twilioPhoneNumber', 'twilioWhatsAppNumber', 'preferredLlm', 'preferredTts',
       'postCallWebhookUrl', 'webhookSecret',
+      // Plivo
+      'plivoAuthId', 'plivoAuthToken', 'plivoPhoneNumber',
     ];
 
     const updates = {};

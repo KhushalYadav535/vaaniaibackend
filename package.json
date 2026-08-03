@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@deepgram/sdk": "^3.3.0",
+    "audio-decode": "^3.11.4",
     "aws-sdk": "^2.1617.0",
     "bcryptjs": "^2.4.3",
     "buffer": "^6.0.3",
@@ -32,6 +33,7 @@
     "openai": "^6.44.0",
     "pdf-parse": "^1.1.4",
     "pdfjs-dist": "^3.11.174",
+    "plivo": "^4.79.0",
     "rate-limit-redis": "^4.3.1",
     "redis": "^4.7.1",
     "twilio": "^5.0.4",

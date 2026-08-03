@@ -141,6 +141,10 @@ const userSchema = new mongoose.Schema({
     twilioAuthToken: { type: String, default: '' },
     twilioPhoneNumber: { type: String, default: '' },
     twilioWhatsAppNumber: { type: String, default: '' }, // e.g. 'whatsapp:+14155238886'
+    // Plivo credentials (user-level — overrides env vars)
+    plivoAuthId: { type: String, default: '' },
+    plivoAuthToken: { type: String, default: '' },
+    plivoPhoneNumber: { type: String, default: '' }, // default outbound number
     preferredLlm: { type: String, default: 'groq' },
     preferredTts: { type: String, default: 'edge-tts' }, // free by default
     // Webhook / n8n Integration

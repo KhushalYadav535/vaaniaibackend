@@ -21,10 +21,11 @@ const phoneNumberSchema = new mongoose.Schema({
   },
   provider: {
     type: String,
-    enum: ['twilio', 'telnyx', 'vonage', 'manual'],
-    default: 'twilio',
+    enum: ['twilio', 'plivo', 'telnyx', 'vonage', 'manual'],
+    default: 'plivo',
   },
-  providerSid: { type: String, default: '' }, // Twilio SID etc.
+  providerSid: { type: String, default: '' }, // Plivo App ID / Twilio SID etc.
+  plivoAppId: { type: String, default: '' }, // Plivo Application ID (for webhook config)
   assignedAgent: {
     type: mongoose.Schema.Types.ObjectId,
     ref: 'Agent',
@@ -35,7 +36,7 @@ const phoneNumberSchema = new mongoose.Schema({
     enum: ['active', 'inactive', 'pending'],
     default: 'active',
   },
-  monthlyCost: { type: Number, default: 100 }, // in cents
+  monthlyCost: { type: Number, default: 0 }, // in cents, legacy from twilio
   capabilities: {
     voice: { type: Boolean, default: true },
     sms: { type: Boolean, default: false },

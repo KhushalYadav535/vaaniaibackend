@@ -16,7 +16,7 @@
 
 const Campaign = require('../models/Campaign');
 const CallLog = require('../models/CallLog');
-const twilio = require('twilio');
+const plivoService = require('./plivoService');
 
 const TICK_MS = Number(process.env.CAMPAIGN_TICK_MS || 5000);
 const GLOBAL_MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_CALLS || 25);
@@ -41,11 +41,8 @@ class CampaignWorker {
     console.log('🛑 Campaign Worker stopped.');
   }
 
-  getTwilioClient(user) {
-    const sid = user?.settings?.twilioAccountSid || process.env.TWILIO_ACCOUNT_SID;
-    const token = user?.settings?.twilioAuthToken || process.env.TWILIO_AUTH_TOKEN;
-    if (!sid || !token) throw new Error('Twilio credentials not configured');
-    return twilio(sid, token);
+  getPlivoClient(user) {
+    return plivoService.getPlivoClient(user);
   }
 
   /**
@@ -199,16 +196,17 @@ class CampaignWorker {
     const agent = campaign.agentId;
 
     try {
-      const fromNumber = this.pickFromNumber(campaign, user?.settings?.twilioPhoneNumber || process.env.TWILIO_PHONE_NUMBER);
-      if (!fromNumber) throw new Error('No Twilio phone number configured');
+      const fromNumber = this.pickFromNumber(campaign,
+        user?.settings?.plivoPhoneNumber || process.env.PLIVO_PHONE_NUMBER
+      );
+      if (!fromNumber) throw new Error('No Plivo phone number configured. Purchase a number from the Numbers section.');
 
-      const client = this.getTwilioClient(user);
       const to = numberRecord.phone;
 
       this.activeCallCount++;
       console.log(`📞 Dispatching ${to} from ${fromNumber} (attempt ${numberRecord.attempts}, ${this.activeCallCount}/${GLOBAL_MAX_CONCURRENT} active)`);
 
-      // Variables for personalisation (consumed by the voice pipeline via callParams).
+      // Variables for personalisation
       const callVars = {
         ...(numberRecord.variables || {}),
         campaignId: campaign._id.toString(),
@@ -223,45 +221,43 @@ class CampaignWorker {
         vars:       Buffer.from(JSON.stringify(callVars)).toString('base64'),
       }).toString();
 
-      const call = await client.calls.create({
-        to,
+      // Make the call via Plivo
+      const callResult = await plivoService.makeCall({
+        user,
         from: fromNumber,
-        url: `${baseUrl}/api/twilio/outbound-connect?${qs}`,
-        statusCallback: `${baseUrl}/api/twilio/status`,
-        statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
-        machineDetection: 'Enable',
-        machineDetectionTimeout: 5000,
-        asyncAmd: 'true',
-        asyncAmdStatusCallback: `${baseUrl}/api/twilio/amd-callback`,
-        asyncAmdStatusCallbackMethod: 'POST',
-        record: process.env.RECORD_CALLS === 'true',
-        recordingChannels: 'mono',
-        recordingStatusCallback: `${baseUrl}/api/twilio/recording`,
+        to,
+        answerUrl: `${baseUrl}/api/plivo/outbound-connect?${qs}`,
+        statusUrl: `${baseUrl}/api/plivo/status`,
+        machineDetection: true,
       });
+
+      const callUuid = callResult.requestUuid || callResult.message || Date.now().toString();
 
       const callLog = await CallLog.create({
         userId: user._id,
         agentId: agent._id,
         agentName: agent.name,
-        callSid: call.sid,
+        callSid: callUuid,
         fromNumber,
         toNumber: to,
         direction: 'outbound',
         status: 'ongoing',
         startTime: new Date(),
+        provider: 'plivo',
+        campaign: campaign._id,
       });
 
       campaign.numbers[index].status = 'in-progress';
-      campaign.numbers[index].callSid = call.sid;
+      campaign.numbers[index].callSid = callUuid;
       campaign.numbers[index].callLogId = callLog._id;
       campaign.numbers[index].fromNumber = fromNumber;
       campaign.numbers[index].startTime = new Date();
       await campaign.save();
 
-      console.log(`✅ Dispatched ${to} (SID: ${call.sid}, attempts: ${numberRecord.attempts})`);
+      console.log(`✅ Dispatched ${to} via Plivo (UUID: ${callUuid}, attempts: ${numberRecord.attempts})`);
     } catch (callError) {
       this.activeCallCount = Math.max(0, this.activeCallCount - 1);
-      console.error(`❌ Call failed to ${numberRecord.phone}:`, callError.message);
+      console.error(`❌ Plivo call failed to ${numberRecord.phone}:`, callError.message);
       await this.handleNumberFailure(campaign, index, callError);
     }
   }
@@ -291,7 +287,7 @@ class CampaignWorker {
         userId: campaign.userId._id,
         agentId: campaign.agentId._id,
         agentName: campaign.agentId.name,
-        fromNumber: numberRecord.fromNumber || process.env.TWILIO_PHONE_NUMBER,
+        fromNumber: numberRecord.fromNumber || process.env.PLIVO_PHONE_NUMBER,
         toNumber: numberRecord.phone,
         direction: 'outbound',
         status: 'failed',

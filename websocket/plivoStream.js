@@ -236,7 +236,7 @@ function stopInterrupt(session) {
   session.currentGenerationId = uuidv4();
 
   // Tell Plivo to stop playing buffered audio immediately
-  clearAudioToPlivo(session);
+  clearAudioOnPlivo(session);
 }
 
 // ─── Core: process finalized user transcript through LLM → TTS → Plivo ──────
@@ -547,16 +547,21 @@ function buildOnTranscript(session) {
     if (!transcript || !transcript.trim()) return;
     if (session.status === 'ended') return;
 
-    // User speaking while agent is talking → interrupt detection
-    if (session.agentSpeaking && transcript.trim().length > 6) {
-      console.log(`[PlivoStream][${session.callUuid}] ⚡ Barge-in detected: "${transcript.trim().slice(0, 40)}"`);
+    const trimmed = transcript.trim();
+
+    // ── Barge-in: interrupt agent immediately when user starts speaking ─────
+    // Trigger on ANY non-empty transcript (even non-final) while agent is playing.
+    // This gives instant interruption feel instead of waiting for speechFinal.
+    if (session.agentSpeaking && trimmed.length > 3) {
+      console.log(`[PlivoStream][${session.callUuid}] ⚡ Barge-in! Stopping agent. User: "${trimmed.slice(0, 40)}"`);
+      stopInterrupt(session);
     }
 
     if (isFinal && speechFinal) {
       // Merge into buffer
       softCommitBuffer = softCommitBuffer
-        ? softCommitBuffer + ' ' + transcript.trim()
-        : transcript.trim();
+        ? softCommitBuffer + ' ' + trimmed
+        : trimmed;
 
       clearTimeout(softCommitTimer);
       softCommitTimer = setTimeout(flush, COMMIT_MS);

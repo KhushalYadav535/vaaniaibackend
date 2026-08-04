@@ -353,7 +353,32 @@ async function speakAndPlay(session, text, generationId) {
 // ─── Session lifecycle ────────────────────────────────────────────────────────
 
 async function initSession(session, startEvent) {
-  const params   = startEvent.start?.customParameters || {};
+  // Plivo sends customParameters as a flat object {key: "value"}.
+  // Our XML may encode it as a JSON string OR as flat key=value pairs.
+  // Handle both cases:
+  const rawParams = startEvent.start?.customParameters || {};
+
+  // If Plivo sent it as a flat object with a "agentId" key directly (flat XML attrs)
+  // OR as a single JSON blob under one key — parse defensively.
+  let params = rawParams;
+  // Check if it looks like a JSON-wrapped object (single key that is valid JSON)
+  const keys = Object.keys(rawParams);
+  if (keys.length === 1) {
+    try {
+      const parsed = JSON.parse(keys[0]);
+      if (parsed && typeof parsed === 'object') params = parsed;
+    } catch (_) {}
+  }
+  // Also try: maybe value is the JSON blob
+  if (!params.agentId) {
+    for (const v of Object.values(rawParams)) {
+      try {
+        const parsed = JSON.parse(v);
+        if (parsed?.agentId) { params = parsed; break; }
+      } catch (_) {}
+    }
+  }
+
   const agentId  = params.agentId;
   const callUuid = params.callUuid || startEvent.start?.callId || '';
   const fromNum  = params.from     || '';
@@ -364,20 +389,27 @@ async function initSession(session, startEvent) {
   session.fromNum   = fromNum;
   session.toNum     = toNum;
 
-  console.log(`[PlivoStream][${callUuid}] 📞 Call started. AgentId=${agentId || 'lookup'}`);
+  console.log(`[PlivoStream][${callUuid}] 📞 Call started. AgentId=${agentId || 'lookup'} To=${toNum} From=${fromNum}`);
+  console.log(`[PlivoStream] Raw customParameters:`, JSON.stringify(rawParams));
 
   // --- Resolve agent ---
   let agent;
-  if (agentId) {
-    agent = await Agent.findById(agentId);
-  } else if (toNum) {
-    // Fallback: look up by phone number
-    const phoneRecord = await PhoneNumber.findOne({ number: toNum }).populate('assignedAgent');
-    agent = phoneRecord?.assignedAgent;
+  if (agentId && agentId !== 'undefined') {
+    agent = await Agent.findById(agentId).catch(() => null);
+  }
+  
+  if (!agent && toNum) {
+    // Fallback: look up by phone number (normalize +/without +)
+    const normalizedTo = toNum.replace(/^\+/, '');
+    const phoneRecord = await PhoneNumber.findOne({
+      number: { $in: [normalizedTo, `+${normalizedTo}`] }
+    }).populate('assignedAgent');
+    agent = phoneRecord?.assignedAgent || null;
+    if (agent) console.log(`[PlivoStream][${callUuid}] Agent found via PhoneNumber lookup: ${agent.name}`);
   }
 
   if (!agent) {
-    console.warn(`[PlivoStream][${callUuid}] ⚠ No agent found. Hanging up.`);
+    console.warn(`[PlivoStream][${callUuid}] ⚠ No agent found. agentId=${agentId} toNum=${toNum}. Hanging up.`);
     sendToPlivo(session.ws, { event: 'disconnect' });
     return false;
   }

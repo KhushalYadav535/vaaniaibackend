@@ -187,12 +187,16 @@ router.post('/inbound', async (req, res) => {
     });
     const wsUrl = `${wsBase}/ws/plivo-stream?${qp.toString()}`;
 
+    // XML requires & to be escaped as &amp; in text content.
+    // Without this, Plivo's XML parser fails silently → USER_BUSY (0s).
+    const xmlSafeWsUrl = wsUrl.replace(/&/g, '&amp;');
+
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Stream keepCallAlive="true" bidirectional="true" streamTimeout="86400"
           contentType="audio/x-mulaw;rate=8000"
           audioTrack="inbound">
-    ${wsUrl}
+    ${xmlSafeWsUrl}
   </Stream>
 </Response>`;
 

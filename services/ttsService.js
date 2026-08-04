@@ -54,15 +54,16 @@ class TTSCache {
     this.misses = 0;
   }
 
-  _key(text, voiceId, speed, provider, style = null) {
-    // style is part of the key so an "empathetic" render and a neutral
-    // render of the same text don't collide in the cache.
-    const styleTag = style ? `:${style}` : '';
-    return crypto.createHash('md5').update(`${provider}:${voiceId}:${speed}${styleTag}:${text}`).digest('hex');
+  _key(text, voiceId, speed, provider, style = null, outputFormat = null) {
+    // style + outputFormat are part of the key — different formats must NOT collide
+    // (e.g. MP3 cache must not be served when ulaw_8000 is requested, and vice versa).
+    const styleTag  = style        ? `:${style}`        : '';
+    const fmtTag    = outputFormat ? `:${outputFormat}` : '';
+    return crypto.createHash('md5').update(`${provider}:${voiceId}:${speed}${styleTag}${fmtTag}:${text}`).digest('hex');
   }
 
-  get(text, voiceId, speed, provider, style = null) {
-    const key = this._key(text, voiceId, speed, provider, style);
+  get(text, voiceId, speed, provider, style = null, outputFormat = null) {
+    const key = this._key(text, voiceId, speed, provider, style, outputFormat);
     const entry = this.cache.get(key);
     if (entry) {
       this.hits++;
@@ -76,9 +77,9 @@ class TTSCache {
     return null;
   }
 
-  set(text, voiceId, speed, provider, buffer, style = null) {
+  set(text, voiceId, speed, provider, buffer, style = null, outputFormat = null) {
     if (!buffer || buffer.length === 0) return;
-    const key = this._key(text, voiceId, speed, provider, style);
+    const key = this._key(text, voiceId, speed, provider, style, outputFormat);
 
     // Don't cache very large audio (> 512KB)
     if (buffer.length > 512 * 1024) return;
@@ -241,7 +242,7 @@ class TtsService {
 
     // ── Check cache first ─────────────────────────────────────────────
     if (this._cacheEnabled) {
-      const cached = this.cache.get(text, voiceId, speed, provider, style);
+      const cached = this.cache.get(text, voiceId, speed, provider, style, outputFormat);
       if (cached) return cached;
     }
 
@@ -292,7 +293,7 @@ class TtsService {
 
     // ── Store in cache ────────────────────────────────────────────────
     if (this._cacheEnabled && audioBuffer && audioBuffer.length > 0) {
-      this.cache.set(text, voiceId, speed, provider, audioBuffer, style);
+      this.cache.set(text, voiceId, speed, provider, audioBuffer, style, outputFormat);
     }
 
     // Instrumentation: definitively show which provider synthesized + how long

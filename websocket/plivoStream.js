@@ -353,36 +353,25 @@ async function speakAndPlay(session, text, generationId) {
 // ─── Session lifecycle ────────────────────────────────────────────────────────
 
 async function initSession(session, startEvent) {
-  // Plivo sends customParameters as a flat object {key: "value"}.
-  // Our XML may encode it as a JSON string OR as flat key=value pairs.
-  // Handle both cases:
+  // PRIMARY: URL query params (e.g. ?agentId=xxx&callUuid=yyy&from=zzz&to=www)
+  // These are set by the inbound route when building the Stream WebSocket URL.
+  // FALLBACK: Plivo's start event customParameters (unreliable — often empty)
+  const urlP    = session.urlParams || {};
   const rawParams = startEvent.start?.customParameters || {};
 
-  // If Plivo sent it as a flat object with a "agentId" key directly (flat XML attrs)
-  // OR as a single JSON blob under one key — parse defensively.
-  let params = rawParams;
-  // Check if it looks like a JSON-wrapped object (single key that is valid JSON)
-  const keys = Object.keys(rawParams);
-  if (keys.length === 1) {
-    try {
-      const parsed = JSON.parse(keys[0]);
-      if (parsed && typeof parsed === 'object') params = parsed;
-    } catch (_) {}
-  }
-  // Also try: maybe value is the JSON blob
-  if (!params.agentId) {
+  // Try to parse customParameters in case it was JSON-encoded
+  let cpParams = rawParams;
+  if (!cpParams.agentId) {
     for (const v of Object.values(rawParams)) {
-      try {
-        const parsed = JSON.parse(v);
-        if (parsed?.agentId) { params = parsed; break; }
-      } catch (_) {}
+      try { const p = JSON.parse(v); if (p?.agentId) { cpParams = p; break; } } catch (_) {}
     }
   }
 
-  const agentId  = params.agentId;
-  const callUuid = params.callUuid || startEvent.start?.callId || '';
-  const fromNum  = params.from     || '';
-  const toNum    = params.to       || '';
+  // Merge: URL params take priority
+  const agentId  = urlP.agentId  || cpParams.agentId;
+  const callUuid = urlP.callUuid || cpParams.callUuid || startEvent.start?.callId || '';
+  const fromNum  = urlP.from     || cpParams.from     || '';
+  const toNum    = urlP.to       || cpParams.to       || '';
 
   session.callUuid  = callUuid;
   session.streamId  = startEvent.start?.streamId || '';
@@ -390,7 +379,7 @@ async function initSession(session, startEvent) {
   session.toNum     = toNum;
 
   console.log(`[PlivoStream][${callUuid}] 📞 Call started. AgentId=${agentId || 'lookup'} To=${toNum} From=${fromNum}`);
-  console.log(`[PlivoStream] Raw customParameters:`, JSON.stringify(rawParams));
+  console.log(`[PlivoStream] urlParams:`, JSON.stringify(urlP));
 
   // --- Resolve agent ---
   let agent;
@@ -572,11 +561,21 @@ async function endSession(session, reason = 'call_ended') {
 /**
  * Called from server.js when a WebSocket upgrade is for /ws/plivo-stream.
  */
-function handlePlivoStreamConnection(ws) {
+function handlePlivoStreamConnection(ws, request) {
+  // Parse URL query params — this is how we pass agentId, callUuid etc.
+  // e.g. /ws/plivo-stream?agentId=xxx&callUuid=yyy&from=zzz&to=www
+  const urlParams = {};
+  try {
+    const fullUrl = `http://localhost${request?.url || ''}`;
+    const parsed  = new URL(fullUrl);
+    for (const [k, v] of parsed.searchParams.entries()) urlParams[k] = v;
+  } catch (_) {}
+
   const sessionId = uuidv4();
   const session   = {
     id:       sessionId,
     ws,
+    urlParams, // available to initSession
     callUuid: null,
     streamId: null,
     status:   'connecting',

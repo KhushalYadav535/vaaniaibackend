@@ -174,27 +174,25 @@ router.post('/inbound', async (req, res) => {
 
     const agent    = phoneRecord.assignedAgent;
     const baseUrl  = process.env.BACKEND_URL || 'http://localhost:5000';
-    const wsUrl    = baseUrl.replace(/^http/, 'ws'); // https → wss, http → ws
+    const wsBase   = baseUrl.replace(/^http/, 'ws'); // https → wss, http → ws
 
-    // ── Realtime Bi-directional Stream (Zoronal/Vapi/Retell style) ──────────
-    // Instead of: GetInput (wait 3s) → gather-response → LLM (2-4s latency)
-    // We now do: Stream mulaw/8000 → Deepgram live → LLM streaming → mulaw back
-    // Target latency: <800ms
-    const customParams = JSON.stringify({
+    // Pass params as URL query strings — Plivo ignores customParameters XML attribute
+    // but DOES forward URL query params through the WebSocket connection URL.
+    const qp = new URLSearchParams({
       agentId:   String(agent._id),
       callUuid:  CallUUID,
       from:      From,
       to:        To,
       direction: 'inbound',
     });
+    const wsUrl = `${wsBase}/ws/plivo-stream?${qp.toString()}`;
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Stream keepCallAlive="true" bidirectional="true" streamTimeout="86400"
           contentType="audio/x-mulaw;rate=8000"
-          audioTrack="inbound"
-          customParameters='${customParams.replace(/'/g, "&apos;")}'>
-    ${wsUrl}/ws/plivo-stream
+          audioTrack="inbound">
+    ${wsUrl}
   </Stream>
 </Response>`;
 

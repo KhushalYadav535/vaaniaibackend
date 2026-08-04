@@ -65,7 +65,8 @@ setupVoiceSession(wss);
 // Plivo bi-directional stream WebSocket server (Zoronal/Retell/Vapi style)
 // Each telephony call gets its own isolated WebSocket — no shared state with browser sessions.
 const plivo_wss = new WebSocket.Server({ noServer: true });
-plivo_wss.on('connection', (ws) => handlePlivoStreamConnection(ws));
+plivo_wss.on('connection', (ws, request) => handlePlivoStreamConnection(ws, request));
+
 
 // WebRTC: currently a stub (mock SDP, no real RTCPeerConnection on Node).
 // Proper implementation needs `wrtc` (heavy native build) or `mediasoup`.

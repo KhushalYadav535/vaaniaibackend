@@ -415,7 +415,7 @@ async function initSession(session, startEvent) {
   session.status       = 'active';
 
   // --- Create call log ---
-  const direction = params.direction || 'inbound';
+  const direction = urlP.direction || cpParams.direction || 'inbound';
   const callLog   = await CallLog.create({
     userId:     agent.userId,
     agentId:    agent._id,

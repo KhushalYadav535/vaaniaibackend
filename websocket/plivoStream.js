@@ -365,17 +365,26 @@ async function speakAndPlay(session, text, generationId) {
       outputFormat: provider === 'eleven-labs' ? 'ulaw_8000' : null,
     });
 
-    if (session.currentGenerationId !== generationId || session.status === 'ended') return;
-
-    // ElevenLabs returns ulaw_8000 directly — send as-is (no transcoding).
-    // Other providers (edge-tts, etc.) return MP3 — need ffmpeg transcoding.
+    // Detect actual audio format from magic bytes.
+    // When ElevenLabs hits quota and falls back to Edge TTS internally,
+    // provider='eleven-labs' but the buffer is MP3 — we must transcode it.
+    // MP3: 0xFF 0xEx/0xFx, or starts with ID3 header (0x49 0x44 0x33)
+    // WAV: starts with RIFF (0x52 0x49 0x46 0x46)
+    // raw mulaw: no standard header, first bytes are audio data
     let mulawBuf;
-    if (provider === 'eleven-labs') {
-      mulawBuf = audioBuffer;
-      console.log(`[PlivoStream][${session.callUuid}] 🔊 TTS ulaw_8000 direct (${Date.now() - ttsStart}ms, ${mulawBuf.length} bytes)`);
-    } else {
+    const b0 = audioBuffer[0], b1 = audioBuffer[1];
+    const isMp3 = (b0 === 0xFF && (b1 & 0xE0) === 0xE0) ||  // MPEG sync
+                  (b0 === 0x49 && b1 === 0x44);               // ID3 tag
+    const isWav = b0 === 0x52 && b1 === 0x49;                 // RIFF
+
+    if (isMp3 || isWav) {
+      console.log(`[PlivoStream][${session.callUuid}] 🔄 Detected MP3/WAV, transcoding via ffmpeg...`);
       mulawBuf = await mp3ToMulaw8k(audioBuffer);
       console.log(`[PlivoStream][${session.callUuid}] 🔊 TTS transcoded (${Date.now() - ttsStart}ms, ${mulawBuf.length} bytes mulaw)`);
+    } else {
+      // Raw mulaw (ElevenLabs ulaw_8000 direct output)
+      mulawBuf = audioBuffer;
+      console.log(`[PlivoStream][${session.callUuid}] 🔊 TTS ulaw_8000 direct (${Date.now() - ttsStart}ms, ${mulawBuf.length} bytes)`);
     }
 
     if (session.currentGenerationId !== generationId || session.status === 'ended') return;
@@ -383,6 +392,7 @@ async function speakAndPlay(session, text, generationId) {
     session.agentSpeaking = true;
     sendAudioToPlivo(session, mulawBuf);
     session.agentSpeaking = false;
+
 
   } catch (err) {
     console.error(`[PlivoStream][${session.callUuid}] TTS error:`, err.message);

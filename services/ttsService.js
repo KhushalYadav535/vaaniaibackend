@@ -503,7 +503,9 @@ class TtsService {
 
     return new Promise((resolve, reject) => {
       const modelId = process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5';
-      const outputFormat = 'mp3_44100_128'; // MP3, consistent with REST output
+      // Request mulaw/8000 directly — Plivo needs exactly this format.
+      // No ffmpeg/audio-decode transcoding needed, zero quality loss.
+      const outputFormat = 'ulaw_8000';
       const url = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${modelId}&output_format=${outputFormat}`;
 
       const ws = new WebSocket(url, {
@@ -579,10 +581,11 @@ class TtsService {
    * Used when WebSocket connection fails
    */
   async _elevenLabsREST(text, voiceId, apiKey) {
-    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`, {
+    // Request mulaw/8000 directly — Plivo-ready, no transcoding needed.
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`, {
       method: 'POST',
       headers: {
-        'Accept': 'audio/mpeg',
+        'Accept': 'audio/basic',   // mulaw MIME type
         'Content-Type': 'application/json',
         'xi-api-key': apiKey,
       },

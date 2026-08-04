@@ -343,27 +343,37 @@ async function processUserTranscript(session, text) {
 }
 
 /**
- * Generate TTS audio, transcode to mulaw/8000, send to Plivo.
+ * Generate TTS audio, transcode to mulaw/8000 if needed, send to Plivo.
+ * ElevenLabs now returns ulaw_8000 directly → no transcoding needed.
+ * Other providers (edge-tts) return MP3 → transcode via ffmpeg.
  */
 async function speakAndPlay(session, text, generationId) {
   if (!text || session.status === 'ended') return;
   try {
     const ttsStart  = Date.now();
     const agent     = session.agent;
-    const mp3Buffer = await ttsService.textToSpeech({
+    const provider  = agent.voice?.provider || 'edge-tts';
+
+    const audioBuffer = await ttsService.textToSpeech({
       text,
       voiceId:  agent.voice?.voiceId  || 'en-IN-NeerjaNeural',
-      provider: agent.voice?.provider || 'edge-tts',
+      provider,
       speed:    agent.voice?.speed    || 1.0,
       apiKey:   session.userSettings?.elevenLabsKey || process.env.ELEVENLABS_API_KEY,
     });
 
     if (session.currentGenerationId !== generationId || session.status === 'ended') return;
 
-    const mulawBuf = await mp3ToMulaw8k(mp3Buffer);
-    const ttsMs    = Date.now() - ttsStart;
-
-    console.log(`[PlivoStream][${session.callUuid}] 🔊 TTS (${ttsMs}ms, ${mulawBuf.length} bytes mulaw)`);
+    // ElevenLabs returns ulaw_8000 directly — send as-is (no transcoding).
+    // Other providers (edge-tts, etc.) return MP3 — need ffmpeg transcoding.
+    let mulawBuf;
+    if (provider === 'eleven-labs') {
+      mulawBuf = audioBuffer;
+      console.log(`[PlivoStream][${session.callUuid}] 🔊 TTS ulaw_8000 direct (${Date.now() - ttsStart}ms, ${mulawBuf.length} bytes)`);
+    } else {
+      mulawBuf = await mp3ToMulaw8k(audioBuffer);
+      console.log(`[PlivoStream][${session.callUuid}] 🔊 TTS transcoded (${Date.now() - ttsStart}ms, ${mulawBuf.length} bytes mulaw)`);
+    }
 
     if (session.currentGenerationId !== generationId || session.status === 'ended') return;
 
@@ -375,6 +385,7 @@ async function speakAndPlay(session, text, generationId) {
     console.error(`[PlivoStream][${session.callUuid}] TTS error:`, err.message);
   }
 }
+
 
 // ─── Session lifecycle ────────────────────────────────────────────────────────
 

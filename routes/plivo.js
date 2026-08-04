@@ -196,7 +196,7 @@ router.post('/inbound', async (req, res) => {
   </Stream>
 </Response>`;
 
-    console.log(`✅ Inbound call ${CallUUID}: returning Stream XML → ${wsUrl}/ws/plivo-stream`);
+    console.log(`✅ Inbound call ${CallUUID}: returning Stream XML → ${wsUrl}`);
     res.type('text/xml').send(xml);
 
   } catch (error) {

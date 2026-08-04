@@ -424,7 +424,7 @@ async function initSession(session, startEvent) {
     fromNumber: fromNum,
     toNumber:   toNum,
     direction,
-    status:     'answered',
+    status:     'ongoing',
     startTime:  new Date(),
     transcript: [],
     provider:   'plivo',

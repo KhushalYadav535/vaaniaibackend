@@ -117,49 +117,75 @@ try {
   audioDecode = require('audio-decode');
 } catch (e) {
   audioDecode = null;
-  console.warn('[PlivoStream] audio-decode not installed — MP3→mulaw transcoding unavailable, using fallback.');
+  console.warn('[PlivoStream] audio-decode not installed — will use ffmpeg for MP3→mulaw transcoding.');
 }
 
 /**
  * Convert an MP3 Buffer (from ElevenLabs/Edge-TTS) to mulaw 8000 Hz Buffer.
- * Falls back to sending raw TTS as-is (Plivo will try to play it anyway) if
- * audio-decode is unavailable.
+ * Primary: audio-decode (pure JS).
+ * Fallback: ffmpeg (available on Linux VPS).
  *
  * @param {Buffer} mp3Buffer
  * @returns {Promise<Buffer>} mulaw buffer at 8000 Hz
  */
 async function mp3ToMulaw8k(mp3Buffer) {
-  if (!audioDecode || !mp3Buffer || mp3Buffer.length === 0) return mp3Buffer;
+  if (!mp3Buffer || mp3Buffer.length === 0) return mp3Buffer;
 
-  try {
-    const decoded = await audioDecode(mp3Buffer);
-    const sampleRate   = decoded.sampleRate   || 44100;
-    const channelCount = decoded.channelCount  || 1;
-    const numSamples   = decoded.length;
+  // --- Option A: audio-decode (pure JS, no native deps) ---
+  if (audioDecode) {
+    try {
+      const decoded = await audioDecode(mp3Buffer);
+      const sampleRate   = decoded.sampleRate   || 44100;
+      const channelCount = decoded.channelCount  || 1;
+      const numSamples   = decoded.length;
 
-    // Mix down to mono (average channels)
-    const monoFloat32 = new Float32Array(numSamples);
-    for (let i = 0; i < numSamples; i++) {
-      let sum = 0;
-      for (let c = 0; c < channelCount; c++) {
-        const ch = decoded.getChannelData(c);
-        sum += ch[i];
+      const monoFloat32 = new Float32Array(numSamples);
+      for (let i = 0; i < numSamples; i++) {
+        let sum = 0;
+        for (let c = 0; c < channelCount; c++) sum += decoded.getChannelData(c)[i];
+        monoFloat32[i] = sum / channelCount;
       }
-      monoFloat32[i] = sum / channelCount;
-    }
 
-    // Float32 [-1,+1] → Int16 signed PCM
-    const pcm16Buf = Buffer.allocUnsafe(numSamples * 2);
-    for (let i = 0; i < numSamples; i++) {
-      const clamped = Math.max(-1, Math.min(1, monoFloat32[i]));
-      pcm16Buf.writeInt16LE(Math.round(clamped * 32767), i * 2);
+      const pcm16Buf = Buffer.allocUnsafe(numSamples * 2);
+      for (let i = 0; i < numSamples; i++) {
+        const clamped = Math.max(-1, Math.min(1, monoFloat32[i]));
+        pcm16Buf.writeInt16LE(Math.round(clamped * 32767), i * 2);
+      }
+      return pcm16BufferToMulaw8k(pcm16Buf, sampleRate);
+    } catch (err) {
+      console.error('[PlivoStream] audio-decode transcoding failed:', err.message);
     }
-
-    return pcm16BufferToMulaw8k(pcm16Buf, sampleRate);
-  } catch (err) {
-    console.error('[PlivoStream] MP3→mulaw transcoding failed:', err.message);
-    return mp3Buffer; // fallback
   }
+
+  // --- Option B: ffmpeg (system binary, available on most Linux servers) ---
+  try {
+    const { execFile } = require('child_process');
+    const mulawBuf = await new Promise((resolve, reject) => {
+      const args = [
+        '-f', 'mp3',       // input format
+        '-i', 'pipe:0',    // read from stdin
+        '-ar', '8000',     // sample rate 8kHz
+        '-ac', '1',        // mono
+        '-acodec', 'pcm_mulaw', // mulaw codec
+        '-f', 'mulaw',     // output format
+        'pipe:1',          // write to stdout
+      ];
+      const proc = execFile('ffmpeg', args, { encoding: 'buffer', maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+        if (err) return reject(err);
+        resolve(stdout);
+      });
+      proc.stdin.write(mp3Buffer);
+      proc.stdin.end();
+    });
+    console.log(`[PlivoStream] ffmpeg transcoded ${mp3Buffer.length}B MP3 → ${mulawBuf.length}B mulaw`);
+    return mulawBuf;
+  } catch (ffmpegErr) {
+    console.error('[PlivoStream] ffmpeg transcoding failed:', ffmpegErr.message);
+  }
+
+  // --- Option C: raw fallback (will sound as noise, but at least won't crash) ---
+  console.warn('[PlivoStream] Both audio-decode and ffmpeg failed — sending raw buffer (expect silence/noise)');
+  return mp3Buffer;
 }
 
 // ─── Session helpers ─────────────────────────────────────────────────────────
@@ -457,8 +483,11 @@ async function initSession(session, startEvent) {
     $push: { transcript: { role: 'assistant', content: greetingText, timestamp: new Date() } },
   }).catch(() => {});
 
-  // Generate greeting asynchronously so the call doesn't block
-  speakAndPlay(session, greetingText, uuidv4()).catch(e => {
+  // Generate greeting — set currentGenerationId first so the guard in speakAndPlay
+  // doesn't reject it (guard: session.currentGenerationId !== generationId).
+  const greetingGenId = uuidv4();
+  session.currentGenerationId = greetingGenId;
+  speakAndPlay(session, greetingText, greetingGenId).catch(e => {
     console.error(`[PlivoStream][${callUuid}] Greeting TTS error:`, e.message);
   });
 

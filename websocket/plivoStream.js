@@ -356,10 +356,13 @@ async function speakAndPlay(session, text, generationId) {
 
     const audioBuffer = await ttsService.textToSpeech({
       text,
-      voiceId:  agent.voice?.voiceId  || 'en-IN-NeerjaNeural',
+      voiceId:      agent.voice?.voiceId  || 'en-IN-NeerjaNeural',
       provider,
-      speed:    agent.voice?.speed    || 1.0,
-      apiKey:   session.userSettings?.elevenLabsKey || process.env.ELEVENLABS_API_KEY,
+      speed:        agent.voice?.speed    || 1.0,
+      apiKey:       session.userSettings?.elevenLabsKey || process.env.ELEVENLABS_API_KEY,
+      // Always request ulaw_8000 from ElevenLabs for Plivo (zero transcoding needed).
+      // Web calls don't use plivoStream, so they safely default to MP3.
+      outputFormat: provider === 'eleven-labs' ? 'ulaw_8000' : null,
     });
 
     if (session.currentGenerationId !== generationId || session.status === 'ended') return;

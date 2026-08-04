@@ -221,7 +221,7 @@ class TtsService {
     return result;
   }
 
-  async textToSpeech({ text, voiceId = 'en-US-JennyNeural', speed = 1.0, pitch = 0, apiKey = null, provider = 'edge-tts', style = null, styleDegree = null }) {
+  async textToSpeech({ text, voiceId = 'en-US-JennyNeural', speed = 1.0, pitch = 0, apiKey = null, provider = 'edge-tts', style = null, styleDegree = null, outputFormat = null }) {
     if (!text || text.trim().length === 0) return Buffer.alloc(0);
 
     // Normalize numbers for Hindi TTS providers to avoid mispronunciation
@@ -251,7 +251,7 @@ class TtsService {
     // Respect selected provider. Use ElevenLabs only when explicitly requested.
     if (provider === 'eleven-labs' && (apiKey || process.env.ELEVENLABS_API_KEY)) {
       try {
-        audioBuffer = await this.elevenLabsTTS(text, voiceId, apiKey || process.env.ELEVENLABS_API_KEY);
+        audioBuffer = await this.elevenLabsTTS(text, voiceId, apiKey || process.env.ELEVENLABS_API_KEY, outputFormat);
         if (audioBuffer && audioBuffer.length > 0) usedProvider = 'eleven-labs';
       } catch (e) {
         console.error('ElevenLabs TTS failed, falling back to Edge:', e.message);
@@ -437,7 +437,7 @@ class TtsService {
    * first-audio latency from ~400ms to ~150ms. Uses eleven_flash_v2_5
    * for lowest latency. Falls back to REST if WS fails.
    */
-  async elevenLabsTTS(text, voiceId, apiKey) {
+  async elevenLabsTTS(text, voiceId, apiKey, outputFormat = null) {
     // If voiceId is an Edge voice (config mismatch: provider=eleven-labs but an
     // Edge voiceId is still set), fall back to a default ElevenLabs voice.
     // The default is env-configurable so each deployment can point at a
@@ -449,10 +449,10 @@ class TtsService {
     const elVoiceId = voiceId.includes('Neural') ? defaultVoiceId : voiceId;
 
     try {
-      return await this._elevenLabsWebSocket(text, elVoiceId, apiKey);
+      return await this._elevenLabsWebSocket(text, elVoiceId, apiKey, outputFormat);
     } catch (wsErr) {
       console.warn('[ElevenLabs] WebSocket TTS failed, falling back to REST:', wsErr.message);
-      return await this._elevenLabsREST(text, elVoiceId, apiKey);
+      return await this._elevenLabsREST(text, elVoiceId, apiKey, outputFormat);
     }
   }
 
@@ -498,15 +498,15 @@ class TtsService {
    *   Server → { audio: "<base64>", ... }                 (audio chunks as they generate)
    *   Server → close                                      (done)
    */
-  _elevenLabsWebSocket(text, voiceId, apiKey) {
+  _elevenLabsWebSocket(text, voiceId, apiKey, outputFormat = null) {
     const WebSocket = require('ws');
 
     return new Promise((resolve, reject) => {
       const modelId = process.env.ELEVENLABS_MODEL || 'eleven_flash_v2_5';
-      // Request mulaw/8000 directly — Plivo needs exactly this format.
-      // No ffmpeg/audio-decode transcoding needed, zero quality loss.
-      const outputFormat = 'ulaw_8000';
-      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${modelId}&output_format=${outputFormat}`;
+      // Use caller-specified format or default to MP3 (for web/browser compatibility).
+      // Plivo phone calls pass 'ulaw_8000' for direct mulaw output.
+      const fmt = outputFormat || 'mp3_44100_128';
+      const url = `wss://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream-input?model_id=${modelId}&output_format=${fmt}`;
 
       const ws = new WebSocket(url, {
         headers: { 'xi-api-key': apiKey },
@@ -580,12 +580,14 @@ class TtsService {
    * ElevenLabs REST fallback (original implementation)
    * Used when WebSocket connection fails
    */
-  async _elevenLabsREST(text, voiceId, apiKey) {
-    // Request mulaw/8000 directly — Plivo-ready, no transcoding needed.
-    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=ulaw_8000`, {
+  async _elevenLabsREST(text, voiceId, apiKey, outputFormat = null) {
+    // Use caller-specified format or default to MP3 (for web/browser compatibility).
+    const fmt = outputFormat || 'mp3_44100_128';
+    const accept = fmt === 'ulaw_8000' ? 'audio/basic' : 'audio/mpeg';
+    const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream?output_format=${fmt}`, {
       method: 'POST',
       headers: {
-        'Accept': 'audio/basic',   // mulaw MIME type
+        'Accept': accept,
         'Content-Type': 'application/json',
         'xi-api-key': apiKey,
       },

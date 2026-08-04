@@ -153,11 +153,17 @@ router.post('/inbound', async (req, res) => {
     const { To, From, CallUUID } = req.body;
     console.log(`📞 Plivo inbound call: ${From} → ${To} (UUID: ${CallUUID})`);
 
+    // Normalize: Plivo may send To as "+912269851801" or "912269851801"
+    // DB stores it without leading + (e.g. "912269851801")
+    const normalizedTo = To ? To.replace(/^\+/, '') : To;
+
     // Find the phone number record with assigned agent
-    const phoneRecord = await PhoneNumber.findOne({ number: To }).populate('assignedAgent');
+    const phoneRecord = await PhoneNumber.findOne({
+      number: { $in: [normalizedTo, `+${normalizedTo}`] }
+    }).populate('assignedAgent');
 
     if (!phoneRecord || !phoneRecord.assignedAgent) {
-      console.warn(`⚠️  No agent assigned to ${To}`);
+      console.warn(`⚠️  No agent assigned to ${To} (normalized: ${normalizedTo})`);
       const fallback = plivoResponse();
       fallback.addSpeak(
         'Sorry, this number is not configured with an AI agent. Please try again later.',

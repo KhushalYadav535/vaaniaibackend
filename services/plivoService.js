@@ -136,6 +136,15 @@ async function releaseNumber(user, number) {
 async function makeCall({ user, from, to, answerUrl, statusUrl, machineDetection = false }) {
   const client = getPlivoClient(user);
 
+  // Ensure E.164 format (+XXXXXXXXXXX). If number is missing '+', add it.
+  const normalizeE164 = (num) => {
+    if (!num) return num;
+    const s = String(num).trim();
+    return s.startsWith('+') ? s : '+' + s;
+  };
+  const fromE164 = normalizeE164(from);
+  const toE164   = normalizeE164(to);
+
   const params = {
     answer_url:    answerUrl,
     answer_method: 'POST',
@@ -148,10 +157,12 @@ async function makeCall({ user, from, to, answerUrl, statusUrl, machineDetection
 
   if (machineDetection) {
     params.machine_detection      = 'hangup';
-    params.machine_detection_time = 45;
+    // Plivo requires machine_detection_time in MILLISECONDS (2000–10000).
+    params.machine_detection_time = 4500;
   }
 
-  const response = await client.calls.create(from, to, answerUrl, params);
+  console.log(`[plivoService] makeCall ${fromE164} → ${toE164}`);
+  const response = await client.calls.create(fromE164, toE164, answerUrl, params);
   return response;
 }
 

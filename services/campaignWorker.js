@@ -300,7 +300,7 @@ class CampaignWorker {
   }
 
   /**
-   * Hook called by Twilio status callback when a call completes/fails.
+   * Hook called by Plivo status callback when a call completes/fails.
    * Routes terminal-but-retryable statuses (busy, no-answer) into the
    * retry pipeline if the campaign's retryOnStatuses includes them.
    */

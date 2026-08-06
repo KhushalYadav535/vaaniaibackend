@@ -404,10 +404,13 @@ router.post('/outbound-connect', async (req, res) => {
     }
 
     const baseUrl = process.env.BACKEND_URL || 'http://localhost:5000';
-    const wsUrl   = baseUrl.replace(/^http/, 'ws');
+    const wsBase  = baseUrl.replace(/^http/, 'ws');
 
     // ── Realtime Bi-directional Stream (outbound) ──────────────────────────
-    const customParams = JSON.stringify({
+    // Pass ALL params as URL query strings — same as inbound.
+    // plivoStream.js reads URL params first (urlParams), so this is the
+    // reliable path. customParameters is kept as backup only.
+    const qp = new URLSearchParams({
       agentId:    String(agent._id),
       userId:     String(userId || agent.userId),
       callUuid:   CallUUID,
@@ -415,18 +418,19 @@ router.post('/outbound-connect', async (req, res) => {
       direction:  'outbound',
       vars:       vars || '',
     });
+    const streamUrl    = `${wsBase}/ws/plivo-stream?${qp.toString()}`;
+    const xmlSafeUrl   = streamUrl.replace(/&/g, '&amp;');
 
     const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Stream keepCallAlive="true" bidirectional="true" streamTimeout="86400"
           contentType="audio/x-mulaw;rate=8000"
-          audioTrack="inbound"
-          customParameters='${customParams.replace(/'/g, "&apos;")}'>
-    ${wsUrl}/ws/plivo-stream
+          audioTrack="inbound">
+    ${xmlSafeUrl}
   </Stream>
 </Response>`;
 
-    console.log(`✅ Outbound call ${CallUUID}: returning Stream XML → ${wsUrl}/ws/plivo-stream`);
+    console.log(`✅ Outbound call ${CallUUID}: returning Stream XML → ${streamUrl}`);
     res.type('text/xml').send(xml);
 
   } catch (error) {
@@ -473,12 +477,18 @@ router.post('/status', async (req, res) => {
     );
 
     // Campaign update on completion
+    const isTerminal = ['completed', 'failed', 'canceled', 'busy', 'no-answer'].includes(CallStatus);
     if (callLog?.campaign) {
       await campaignWorker.handleCallCompletion({
         callSid:  CallUUID,
         status:   statusMap[CallStatus] || CallStatus,
         duration: parseInt(Duration) || 0,
       });
+    } else if (isTerminal && callLog?.direction === 'outbound') {
+      // callLog exists but campaign ref is missing (e.g. race condition).
+      // Still decrement activeCallCount so campaign worker doesn't freeze.
+      campaignWorker.activeCallCount = Math.max(0, campaignWorker.activeCallCount - 1);
+      console.log(`[CampaignWorker] ⚠️ Decremented activeCallCount (no campaign ref) → ${campaignWorker.activeCallCount}`);
     }
 
     // Post-call analysis on completion

@@ -14,8 +14,9 @@
  *    personalised outreach (e.g. "Hi {{name}}, calling about {{product}}")
  */
 
-const Campaign = require('../models/Campaign');
-const CallLog = require('../models/CallLog');
+const Campaign    = require('../models/Campaign');
+const CallLog     = require('../models/CallLog');
+const PhoneNumber = require('../models/PhoneNumber');
 const plivoService = require('./plivoService');
 
 const TICK_MS = Number(process.env.CAMPAIGN_TICK_MS || 5000);
@@ -196,9 +197,25 @@ class CampaignWorker {
     const agent = campaign.agentId;
 
     try {
-      const fromNumber = this.pickFromNumber(campaign,
+      // Resolve from number: campaign pool → user settings → env → DB lookup
+      let fromNumber = this.pickFromNumber(campaign,
         user?.settings?.plivoPhoneNumber || process.env.PLIVO_PHONE_NUMBER
       );
+
+      // Last resort: query PhoneNumber DB for user's first active Plivo number.
+      // This means campaigns work even when fromNumbers isn't explicitly set.
+      if (!fromNumber) {
+        const dbNumber = await PhoneNumber.findOne({
+          userId:   user._id,
+          provider: 'plivo',
+          status:   'active',
+        }).select('number').lean();
+        if (dbNumber) {
+          fromNumber = dbNumber.number;
+          console.log(`[CampaignWorker] Auto-resolved fromNumber from DB: ${fromNumber}`);
+        }
+      }
+
       if (!fromNumber) throw new Error('No Plivo phone number configured. Purchase a number from the Numbers section.');
 
       const to = numberRecord.phone;

@@ -243,7 +243,10 @@ class TtsService {
     // ── Check cache first ─────────────────────────────────────────────
     if (this._cacheEnabled) {
       const cached = this.cache.get(text, voiceId, speed, provider, style, outputFormat);
-      if (cached) return cached;
+      if (cached) {
+        cached.isRawMulaw = (outputFormat === 'ulaw_8000');
+        return cached;
+      }
     }
 
     let audioBuffer;
@@ -300,6 +303,11 @@ class TtsService {
     // it took. `requested` is what the agent asked for; `used` is what actually
     // produced audio (reveals silent fallbacks). Helps split LLM vs TTS latency.
     console.log(`[TTS] requested=${provider} used=${usedProvider || 'none'} voiceId=${voiceId} synth=${Date.now() - _ttsStart}ms chars=${text.length}`);
+
+    if (audioBuffer) {
+      audioBuffer.usedProvider = usedProvider;
+      audioBuffer.isRawMulaw = (usedProvider === 'eleven-labs' && outputFormat === 'ulaw_8000');
+    }
 
     return audioBuffer || Buffer.alloc(0);
   }

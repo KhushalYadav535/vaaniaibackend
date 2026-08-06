@@ -197,26 +197,45 @@ class CampaignWorker {
     const agent = campaign.agentId;
 
     try {
-      // Resolve from number: campaign pool → user settings → env → DB lookup
+      // ── Resolve "from" number ──────────────────────────────────────────
+      // Priority order:
+      //  1. campaign.fromNumbers pool (explicit rotation)
+      //  2. Agent's assigned PhoneNumber (PhoneNumber.assignedAgent = agent._id)
+      //  3. user.settings.plivoPhoneNumber
+      //  4. PLIVO_PHONE_NUMBER env
+      //  5. Any active Plivo number belonging to this user (last resort)
       let fromNumber = this.pickFromNumber(campaign,
         user?.settings?.plivoPhoneNumber || process.env.PLIVO_PHONE_NUMBER
       );
 
-      // Last resort: query PhoneNumber DB for user's first active Plivo number.
-      // This means campaigns work even when fromNumbers isn't explicitly set.
       if (!fromNumber) {
-        const dbNumber = await PhoneNumber.findOne({
-          userId:   user._id,
+        // Check agent's directly assigned number first
+        const agentNumber = await PhoneNumber.findOne({
+          assignedAgent: agent._id,
           provider: 'plivo',
           status:   'active',
         }).select('number').lean();
-        if (dbNumber) {
-          fromNumber = dbNumber.number;
-          console.log(`[CampaignWorker] Auto-resolved fromNumber from DB: ${fromNumber}`);
+
+        if (agentNumber) {
+          fromNumber = agentNumber.number;
+          console.log(`[CampaignWorker] Using agent-assigned number: ${fromNumber}`);
+        } else {
+          // Fall back to any active number for this user
+          const userNumber = await PhoneNumber.findOne({
+            userId:   user._id,
+            provider: 'plivo',
+            status:   'active',
+          }).select('number').lean();
+
+          if (userNumber) {
+            fromNumber = userNumber.number;
+            console.log(`[CampaignWorker] Auto-resolved fromNumber from DB: ${fromNumber}`);
+          }
         }
       }
 
       if (!fromNumber) throw new Error('No Plivo phone number configured. Purchase a number from the Numbers section.');
+
 
       const to = numberRecord.phone;
 

@@ -380,12 +380,13 @@ router.post('/outbound-connect', async (req, res) => {
 
     console.log(`📤 Plivo outbound answered: ${CallUUID} (AnsweredBy: ${AnsweredBy})`);
 
-    // If machine detected, hang up
-    if (AnsweredBy === 'machine') {
-      console.log(`🤖 Machine detected for ${CallUUID}, hanging up`);
-      const hmr = plivoResponse();
-      hmr.addHangup();
-      return res.type('text/xml').send(hmr.toXML());
+    // If machine/voicemail detected — play a short message and hang up
+    if (AnsweredBy && AnsweredBy !== 'human' && AnsweredBy !== 'unknown') {
+      console.log(`🤖 Machine/voicemail detected for ${CallUUID} (${AnsweredBy}), playing message`);
+      const vmr = plivoResponse();
+      vmr.addSpeak('Hello, we tried to reach you. Please call us back at your earliest convenience. Thank you.');
+      vmr.addHangup();
+      return res.type('text/xml').send(vmr.toXML());
     }
 
     const agent = await Agent.findById(agentId);

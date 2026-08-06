@@ -156,7 +156,7 @@ async function makeCall({ user, from, to, answerUrl, statusUrl, machineDetection
   }
 
   if (machineDetection) {
-    params.machine_detection      = 'hangup';
+    params.machine_detection      = 'detect'; // 'detect' = always call answer_url; 'hangup' = never calls it for machines
     // Plivo requires machine_detection_time in MILLISECONDS (2000–10000).
     params.machine_detection_time = 4500;
   }

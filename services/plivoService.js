@@ -156,12 +156,13 @@ async function makeCall({ user, from, to, answerUrl, statusUrl, machineDetection
   }
 
   if (machineDetection) {
-    params.machine_detection      = true; // true = detect + always call answer_url; 'hangup' = skip answer_url for machines
-    // Plivo requires machine_detection_time in MILLISECONDS (2000–10000).
-    params.machine_detection_time = 4500;
+    // Note: machine_detection_time removed — was causing "is not valid" Plivo error.
+    // machine_detection: true means Plivo detects AMD and still calls answer_url.
+    params.machine_detection = true;
   }
 
   console.log(`[plivoService] makeCall ${fromE164} → ${toE164}`);
+  console.log(`[plivoService] params:`, JSON.stringify(params));
   const response = await client.calls.create(fromE164, toE164, answerUrl, params);
   return response;
 }

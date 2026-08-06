@@ -35,6 +35,8 @@ const deepgramService    = require('../services/deepgramService');
 const ttsService         = require('../services/ttsService');
 const toolExecutor       = require('../services/toolExecutor');
 const webhookDispatcher  = require('../services/webhookDispatcher');
+const ragService         = require('../services/ragService');
+const plivoService       = require('../services/plivoService');
 
 // ─── In-memory session store ────────────────────────────────────────────────
 const plivoStreamSessions = new Map();
@@ -213,10 +215,13 @@ function sendAudioToPlivo(session, mulawBuffer) {
 
 function clearAudioOnPlivo(session) {
   if (!session.ws || session.ws.readyState !== 1) return;
-  sendToPlivo(session.ws, {
-    event: 'clearAudio',
-    id:    session.streamId || '',
-  });
+  // Send clearAudio 3× with short gaps to aggressively flush Plivo's
+  // ~200-500ms playback buffer. A single event is often ignored if
+  // Plivo is mid-chunk; repeating it ensures the buffer drains fast.
+  const clearEvt = { event: 'clearAudio', id: session.streamId || '' };
+  sendToPlivo(session.ws, clearEvt);
+  setTimeout(() => { if (session.ws?.readyState === 1) sendToPlivo(session.ws, clearEvt); }, 80);
+  setTimeout(() => { if (session.ws?.readyState === 1) sendToPlivo(session.ws, clearEvt); }, 160);
 }
 
 function stopInterrupt(session) {
@@ -237,6 +242,46 @@ function stopInterrupt(session) {
 
   // Tell Plivo to stop playing buffered audio immediately
   clearAudioOnPlivo(session);
+}
+
+// ─── Silence watchdog helpers ────────────────────────────────────────────────
+// After the agent finishes speaking, if the user says nothing for SILENCE_WARN_MS,
+// the agent nudges once. If still silent after SILENCE_HANGUP_MS, call ends.
+
+const SILENCE_WARN_MS   = Number(process.env.PLIVO_SILENCE_WARN_MS   || 30000); // 30s
+const SILENCE_HANGUP_MS = Number(process.env.PLIVO_SILENCE_HANGUP_MS || 20000); // +20s after warn
+const MAX_CALL_MS       = Number(process.env.PLIVO_MAX_CALL_MS        || 10 * 60 * 1000); // 10 min hard cap
+
+function clearSilenceWatchdog(session) {
+  if (session._silenceWarnTimer)   { clearTimeout(session._silenceWarnTimer);   session._silenceWarnTimer   = null; }
+  if (session._silenceHangupTimer) { clearTimeout(session._silenceHangupTimer); session._silenceHangupTimer = null; }
+}
+
+function startSilenceWatchdog(session) {
+  clearSilenceWatchdog(session);
+  if (session.status === 'ended') return;
+
+  session._silenceWarnTimer = setTimeout(async () => {
+    if (session.status === 'ended') return;
+    console.log(`[PlivoStream][${session.callUuid}] 🔇 Silence warn — nudging user`);
+    const warnMsg = session.agent.silenceWarningMessage ||
+      'Are you still there? Is there anything else I can help you with?';
+    const genId = uuidv4();
+    session.currentGenerationId = genId;
+    await speakAndPlay(session, warnMsg, genId).catch(() => {});
+
+    // After the warning, give SILENCE_HANGUP_MS more before hanging up
+    session._silenceHangupTimer = setTimeout(async () => {
+      if (session.status === 'ended') return;
+      console.log(`[PlivoStream][${session.callUuid}] 🔇 Silence hangup — ending call`);
+      const byeMsg = session.agent.endCallMessage || 'Thank you for calling. Goodbye!';
+      const genId2 = uuidv4();
+      session.currentGenerationId = genId2;
+      await speakAndPlay(session, byeMsg, genId2).catch(() => {});
+      await endSession(session, 'silence_timeout');
+    }, SILENCE_HANGUP_MS);
+
+  }, SILENCE_WARN_MS);
 }
 
 // ─── Core: process finalized user transcript through LLM → TTS → Plivo ──────
@@ -279,6 +324,19 @@ async function processUserTranscript(session, text) {
       return;
     }
 
+    // --- RAG: fetch KB context in parallel before LLM ---
+    const _ragStart = Date.now();
+    const ragContext = await (
+      (session.agent?.knowledgeBaseIds?.length > 0)
+        ? ragService.getContextForQuery(text, session.agent.knowledgeBaseIds)
+            .then(ctx => {
+              if (ctx) console.log(`[PlivoStream][${session.callUuid}] RAG context retrieved (${Date.now() - _ragStart}ms)`);
+              return ctx || '';
+            })
+            .catch(e => { console.error('[PlivoStream] RAG error:', e.message); return ''; })
+        : Promise.resolve('')
+    );
+
     // --- LLM Call ---
     const llmStart = Date.now();
     const aiResult = await voicePipeline.processText({
@@ -287,6 +345,7 @@ async function processUserTranscript(session, text) {
       history:      session.history.slice(-12),
       userSettings: session.userSettings || {},
       abortSignal:  abortController.signal,
+      ragContext,
     });
 
     if (session.currentGenerationId !== generationId) {
@@ -317,6 +376,18 @@ async function processUserTranscript(session, text) {
     // --- TTS → Audio to Plivo ---
     if (assistantText && session.currentGenerationId === generationId) {
       await speakAndPlay(session, assistantText, generationId);
+      // Start silence watchdog — if user goes quiet after agent speaks,
+      // we'll nudge them and eventually hang up.
+      startSilenceWatchdog(session);
+    } else if (!assistantText) {
+      // LLM returned empty response — play a safe fallback so the caller
+      // doesn't experience dead silence and wonder if the call dropped.
+      console.warn(`[PlivoStream][${session.callUuid}] ⚠️ Empty LLM response — playing fallback`);
+      const fallback = 'I\'m sorry, could you please repeat that?';
+      const fbGenId = uuidv4();
+      session.currentGenerationId = fbGenId;
+      await speakAndPlay(session, fallback, fbGenId);
+      startSilenceWatchdog(session);
     }
 
     const totalMs = Date.now() - turnStartedAt;
@@ -516,6 +587,19 @@ async function initSession(session, startEvent) {
   });
 
   console.log(`[PlivoStream][${callUuid}] ✅ Session ready. Agent: ${agent.name}. STT lang: ${sttLang}`);
+
+  // Hard max-duration watchdog — terminates zombie calls that never end cleanly.
+  // Default 10 minutes, configurable via PLIVO_MAX_CALL_MS env.
+  session._maxDurationTimer = setTimeout(async () => {
+    if (session.status === 'ended') return;
+    console.warn(`[PlivoStream][${callUuid}] ⏰ Max call duration reached — force ending`);
+    const byeMsg = session.agent?.endCallMessage || 'Thank you for calling. Goodbye!';
+    const genId  = uuidv4();
+    session.currentGenerationId = genId;
+    await speakAndPlay(session, byeMsg, genId).catch(() => {});
+    await endSession(session, 'max_duration');
+  }, MAX_CALL_MS);
+
   return true;
 }
 
@@ -524,7 +608,7 @@ async function initSession(session, startEvent) {
 function buildOnTranscript(session) {
   let softCommitBuffer = '';
   let softCommitTimer  = null;
-  const COMMIT_MS      = 1000; // 1s silence = end of turn
+  const COMMIT_MS      = Number(process.env.PLIVO_COMMIT_MS || 750); // ms silence = end of turn (env-configurable)
 
   const flush = () => {
     clearTimeout(softCommitTimer);
@@ -533,9 +617,13 @@ function buildOnTranscript(session) {
     softCommitBuffer = '';
     if (text.length < 2) return;
 
-    // User is interrupting? Stop the current generation
-    if (session.agentSpeaking) {
-      stopInterrupt(session);
+    // If a barge-in fired very recently (< 300ms ago), the committed text
+    // likely overlaps with what the agent was saying — discard it to avoid
+    // the agent answering its own interrupted speech as if it were a user query.
+    const bargeInAge = session._lastBargeInAt ? Date.now() - session._lastBargeInAt : Infinity;
+    if (bargeInAge < 300) {
+      console.log(`[PlivoStream][${session.callUuid}] ⚡ Discarding stale post-barge-in text: "${text.slice(0, 40)}"`);
+      return;
     }
 
     processUserTranscript(session, text).catch(e => {
@@ -549,11 +637,15 @@ function buildOnTranscript(session) {
 
     const trimmed = transcript.trim();
 
+    // Reset silence watchdog — user spoke, so they're still active
+    clearSilenceWatchdog(session);
+
     // ── Barge-in: interrupt agent immediately when user starts speaking ─────
-    // Trigger on ANY non-empty transcript (even non-final) while agent is playing.
-    // This gives instant interruption feel instead of waiting for speechFinal.
-    if (session.agentSpeaking && trimmed.length > 3) {
+    // Threshold is >1 char (not >3) so even a short "ha"/"ok" fires instantly.
+    // _lastBargeInAt is set so flush() can discard the stale overlapping text.
+    if (session.agentSpeaking && trimmed.length > 1) {
       console.log(`[PlivoStream][${session.callUuid}] ⚡ Barge-in! Stopping agent. User: "${trimmed.slice(0, 40)}"`);
+      session._lastBargeInAt = Date.now();
       stopInterrupt(session);
     }
 
@@ -589,10 +681,28 @@ async function endSession(session, reason = 'call_ended') {
     session._currentAbortController = null;
   }
 
+  // Clear all watchdog timers so they don't fire on a dead session
+  clearSilenceWatchdog(session);
+  if (session._maxDurationTimer) { clearTimeout(session._maxDurationTimer); session._maxDurationTimer = null; }
+
   // Close Deepgram
   if (session.deepgramConn) {
     try { session.deepgramConn.finish(); } catch (_) {}
     session.deepgramConn = null;
+  }
+
+  // ── Server-side call termination ─────────────────────────────────────────
+  // When our server decides to end the call (user said bye, agent ended it,
+  // or session timed out), we terminate the live Plivo call via REST API.
+  // This is the equivalent of "hanging up" from our side.
+  // Skip if reason is 'ws_closed' or 'call_ended' — Plivo already hung up in that case.
+  const shouldHangup = session.callUuid &&
+    !['ws_closed', 'call_ended'].includes(reason);
+
+  if (shouldHangup) {
+    plivoService.hangupCall(session.user, session.callUuid)
+      .then(() => console.log(`[PlivoStream][${session.callUuid}] ✅ Plivo call terminated (${reason})`))
+      .catch(e  => console.warn(`[PlivoStream][${session.callUuid}] ⚠️ Hangup API failed (${reason}): ${e.message}`));
   }
 
   // Finalize call log

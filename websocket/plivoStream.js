@@ -218,7 +218,7 @@ function clearAudioOnPlivo(session) {
   // Send clearAudio 3× with short gaps to aggressively flush Plivo's
   // ~200-500ms playback buffer. A single event is often ignored if
   // Plivo is mid-chunk; repeating it ensures the buffer drains fast.
-  const clearEvt = { event: 'clearAudio', id: session.streamId || '' };
+  const clearEvt = { event: 'clearAudio', id: session.streamId || '', stream_id: session.streamId || '' };
   sendToPlivo(session.ws, clearEvt);
   setTimeout(() => { if (session.ws?.readyState === 1) sendToPlivo(session.ws, clearEvt); }, 80);
   setTimeout(() => { if (session.ws?.readyState === 1) sendToPlivo(session.ws, clearEvt); }, 160);
@@ -234,6 +234,11 @@ function stopInterrupt(session) {
   if (session._currentAbortController) {
     try { session._currentAbortController.abort(); } catch (_) {}
     session._currentAbortController = null;
+  }
+
+  if (session._agentSpeakingTimer) {
+    clearTimeout(session._agentSpeakingTimer);
+    session._agentSpeakingTimer = null;
   }
 
   session.agentSpeaking = false;
@@ -376,9 +381,6 @@ async function processUserTranscript(session, text) {
     // --- TTS → Audio to Plivo ---
     if (assistantText && session.currentGenerationId === generationId) {
       await speakAndPlay(session, assistantText, generationId);
-      // Start silence watchdog — if user goes quiet after agent speaks,
-      // we'll nudge them and eventually hang up.
-      startSilenceWatchdog(session);
     } else if (!assistantText) {
       // LLM returned empty response — play a safe fallback so the caller
       // doesn't experience dead silence and wonder if the call dropped.
@@ -387,7 +389,6 @@ async function processUserTranscript(session, text) {
       const fbGenId = uuidv4();
       session.currentGenerationId = fbGenId;
       await speakAndPlay(session, fallback, fbGenId);
-      startSilenceWatchdog(session);
     }
 
     const totalMs = Date.now() - turnStartedAt;
@@ -464,11 +465,22 @@ async function speakAndPlay(session, text, generationId) {
 
     session.agentSpeaking = true;
     sendAudioToPlivo(session, mulawBuf);
-    session.agentSpeaking = false;
+
+    // In mulaw 8000Hz (8000 samples/sec = 8000 bytes/sec), playback duration is exact: bytes / 8 ms.
+    const playbackMs = Math.max(1000, Math.round((mulawBuf?.length || 8000) / 8));
+    if (session._agentSpeakingTimer) clearTimeout(session._agentSpeakingTimer);
+    session._agentSpeakingTimer = setTimeout(() => {
+      session.agentSpeaking = false;
+      session._agentSpeakingTimer = null;
+      // Start silence watchdog only after the agent finishes speaking
+      startSilenceWatchdog(session);
+    }, playbackMs);
 
 
   } catch (err) {
     console.error(`[PlivoStream][${session.callUuid}] TTS error:`, err.message);
+    session.agentSpeaking = false;
+    startSilenceWatchdog(session);
   }
 }
 
@@ -686,6 +698,8 @@ async function endSession(session, reason = 'call_ended') {
   // Clear all watchdog timers so they don't fire on a dead session
   clearSilenceWatchdog(session);
   if (session._maxDurationTimer) { clearTimeout(session._maxDurationTimer); session._maxDurationTimer = null; }
+  if (session._agentSpeakingTimer) { clearTimeout(session._agentSpeakingTimer); session._agentSpeakingTimer = null; }
+  session.agentSpeaking = false;
 
   // Close Deepgram
   if (session.deepgramConn) {

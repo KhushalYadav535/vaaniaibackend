@@ -807,9 +807,33 @@ router.post('/make-call', async (req, res, next) => {
     }
 
     // Determine from number
-    const fromNumber = from
+    let fromNumber = from
       || user?.settings?.plivoPhoneNumber
       || process.env.PLIVO_PHONE_NUMBER;
+
+    if (!fromNumber) {
+      // Check agent's directly assigned number first
+      const agentNumber = await PhoneNumber.findOne({
+        assignedAgent: agent._id,
+        provider: 'plivo',
+        status:   'active',
+      }).select('number').lean();
+
+      if (agentNumber) {
+        fromNumber = agentNumber.number;
+      } else {
+        // Fall back to any active number for this user
+        const userNumber = await PhoneNumber.findOne({
+          userId:   req.effectiveUserId,
+          provider: 'plivo',
+          status:   'active',
+        }).select('number').lean();
+
+        if (userNumber) {
+          fromNumber = userNumber.number;
+        }
+      }
+    }
 
     if (!fromNumber) {
       return res.status(400).json({
